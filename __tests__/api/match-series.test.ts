@@ -157,6 +157,27 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         }));
     });
 
+    it.each([
+        { label: 'all moved siblings', files: ['/unmatched/X/001.cbz', '/unmatched/X/002.cbz'], conflicts: [], expected: ['issue_0', 'issue_1'] },
+        { label: 'a neighboring prefix folder', files: ['/unmatched/X/001.cbz', '/unmatched/X (2016)/002.cbz'], conflicts: [], expected: ['issue_0'] },
+        { label: 'a conflict file left at source', files: ['/unmatched/X/001.cbz', '/unmatched/X/002.cbz'], conflicts: ['/unmatched/X/002.cbz'], expected: ['issue_0'] },
+        { label: 'backslash paths', files: ['\\unmatched\\X\\001.cbz'], conflicts: [], expected: ['issue_0'] },
+    ])('repoints only physically moved files: $label', async ({ files, conflicts, expected }) => {
+        mocks.findManySettings.mockResolvedValue([{ key: 'folder_naming_pattern', value: '{Series} ({Year})' }]);
+        mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'X', year: 2016, publisher: 'Marvel', coverUrl: null });
+        mocks.findManyIssues.mockResolvedValue(files.map((filePath, i) => ({ id: `issue_${i}`, filePath })));
+        vi.mocked(fs.existsSync).mockImplementation((p) => {
+            const normalized = String(p).replace(/\\/g, '/');
+            if (normalized.startsWith('/unmatched/X/')) return conflicts.includes(normalized);
+            return true;
+        });
+        const res = await POST(createReq({ oldFolderPath: '/unmatched/X', metadataId: '987', metadataSource: 'METRON' }));
+        expect(res.status).toBe(200);
+        expect(mocks.updateIssue.mock.calls.map(([args]) => args.where.id)).toEqual(expected);
+        for (const [args] of mocks.updateIssue.mock.calls) expect(args.data.filePath).toMatch(/^\/comics\/X \(2016\)\//);
+        expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Array));
+    });
+
     it('should reject access if the oldFolderPath is outside of authorized libraries', async () => {
         // Attack attempt: Trying to rename a system file
         const res = await POST(createReq({ oldFolderPath: '/etc/shadow', metadataId: '123' }));

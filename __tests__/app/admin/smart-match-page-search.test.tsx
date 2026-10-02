@@ -7,7 +7,7 @@
 // number), Load more pagination, and the fallback ID path routing through the same resolver.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
-import { ok, stubFetchRouter } from '../../helpers/fetch';
+import { err, ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
@@ -54,6 +54,13 @@ const VOLUME_DETAILS = {
 let searchCalls: string[] = [];
 let detailCalls: string[] = [];
 
+// Collapse only the scan's pacing delay; Testing Library's timeout must stay real.
+const stubScanDelays = () => {
+    const original = globalThis.setTimeout;
+    vi.stubGlobal('setTimeout', (callback: () => void, delay: number, ...args: unknown[]) =>
+        original(callback, delay === 1500 ? 0 : delay, ...args));
+};
+
 const openSearchMatchDialog = async () => {
     render(<SmartMatchPage />);
     await screen.findByText('Conan & Dragonero 001');
@@ -67,6 +74,7 @@ describe('Smart Matcher — Search Match dialog', () => {
         detailCalls = [];
         toast.mockClear();
         localStorage.clear();
+        sessionStorage.clear();
         stubFetchRouter([
             ['/api/admin/unmatched', () => ok([RAW_ITEM])],
             ['/api/admin/config', () => ok({
@@ -200,5 +208,43 @@ describe('Smart Matcher — Search Match dialog', () => {
         fireEvent.click(screen.getByRole('button', { name: /^Search$/ }));
 
         await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'No results' })));
+    });
+
+    it('retries a failed auto-search instead of caching a 500 as NOT_FOUND', async () => {
+        stubScanDelays();
+        let attempts = 0;
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM])],
+            ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
+            ['/api/search', () => ++attempts === 1 ? err(500, { error: 'temporary' }) : ok({ results: [SEARCH_RESULT] })],
+        ]);
+        render(<SmartMatchPage />);
+        await screen.findByText(RAW_ITEM.name);
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan Complete' })));
+        toast.mockClear();
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({
+            title: 'Scan Complete', description: 'Found suggestions for 1 series.',
+        })));
+        expect(attempts).toBe(2);
+    });
+
+    it('does not repeat cached NOT_FOUND searches on every auto-scan', async () => {
+        stubScanDelays();
+        let attempts = 0;
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM])],
+            ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
+            ['/api/search', () => { attempts++; return ok({ results: [] }); }],
+        ]);
+        render(<SmartMatchPage />);
+        await screen.findByText(RAW_ITEM.name);
+        for (let run = 0; run < 2; run++) {
+            toast.mockClear();
+            fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+            await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan Complete' })));
+        }
+        expect(attempts).toBe(1);
     });
 });

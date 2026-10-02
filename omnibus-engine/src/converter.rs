@@ -527,6 +527,7 @@ fn find_images(dir: &Path) -> Result<Vec<PathBuf>> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if path.is_symlink() { continue; }
             // Skip macOS resource-fork junk that would otherwise become garbage pages.
             let name_lower = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
             if name_lower == "__macosx" || name_lower.starts_with("._") {
@@ -1827,6 +1828,7 @@ fn collect_comic_files(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
+            if p.is_symlink() { continue; }
             if p.is_dir() {
                 collect_comic_files(&p, out);
             } else if is_comic_name(&p.to_string_lossy()) {
@@ -1840,6 +1842,21 @@ fn collect_comic_files(dir: &Path, out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_collectors_do_not_follow_parent_symlink_loops() {
+        let root = std::env::temp_dir().join(format!("omnibus_walk_loop_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/book.cbz"), b"comic").unwrap();
+        std::fs::write(root.join("nested/page.jpg"), b"image").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("nested/parent")).unwrap();
+        let mut comics = Vec::new();
+        collect_comic_files(&root, &mut comics);
+        assert_eq!(comics, vec![root.join("nested/book.cbz")]);
+        assert_eq!(find_images(&root).unwrap(), vec![root.join("nested/page.jpg")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // ==== Issue #189: page removal (rewrite-minus-entries) ====
 

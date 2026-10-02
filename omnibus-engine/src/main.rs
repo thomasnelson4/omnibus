@@ -392,8 +392,13 @@ fn main() -> anyhow::Result<()> {
         cfg.cpu_cap, cfg.blocking_threads, cfg.scan_workers, cfg.convert_workers, cfg.db_connections, cfg.memory_ceiling_mb
     );
 
-    // Size rayon's global pool (used for per-page WebP encoding in the converter) to the CPU cap.
-    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(cfg.cpu_cap).build_global() {
+    // Cover both Tokio's workers and rayon's directory/image workers. This is a stack-size
+    // mitigation, not a substitute for diagnosing an overflowing main thread or unbounded walk.
+    let thread_stack_size = std::env::var("RUST_MIN_STACK").ok()
+        .and_then(|s| s.parse::<usize>().ok()).filter(|s| *s > 0)
+        .unwrap_or(16 * 1024 * 1024);
+    if let Err(e) = rayon::ThreadPoolBuilder::new().num_threads(cfg.cpu_cap)
+        .stack_size(thread_stack_size).build_global() {
         log::warn!("[Config] Could not set the rayon global pool size: {}", e);
     }
 
@@ -401,6 +406,7 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(cfg.cpu_cap)
         .max_blocking_threads(cfg.blocking_threads)
+        .thread_stack_size(thread_stack_size)
         .enable_all()
         .build()?;
 

@@ -578,6 +578,8 @@ fn clean_empty_folders(dir: &Path, base_dir: &Path) -> Result<bool> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
+            // Treat symlinks as contents, never recurse through a link to a parent directory.
+            if path.is_symlink() { is_empty = false; continue; }
             if path.is_dir() {
                 if !clean_empty_folders(&path, base_dir)? { is_empty = false; }
             } else {

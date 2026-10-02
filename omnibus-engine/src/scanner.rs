@@ -350,7 +350,9 @@ fn parse_series_json(content: &str) -> Option<SeriesJsonInfo> {
         publisher: get_str("publisher"),
         year,
         description: get_str("description_text"),
-        booktype: get_str("booktype"),
+        booktype: if v["omnibus"]["booktype_guessed"].as_bool() == Some(true) {
+            None
+        } else { get_str("booktype") },
         status,
         attached_volumes,
     })
@@ -589,6 +591,11 @@ struct ComicInfoSeriesDefaults {
     imprint: Option<String>,
     tags_json: Option<String>,
     format: Option<String>,
+    /// bookType (Print/OneShot/TPB/GN) derived from `format` — see book_type_from_comicinfo_format.
+    /// A distinct field from `format` itself: `format` always carries the file's own raw Format
+    /// text unchanged (e.g. "Director's Cut" survives exactly as tagged, untouched by this).
+    /// Unknown Format words remain unclassified; they are not evidence of a periodical.
+    book_type: Option<&'static str>,
     language_iso: Option<String>,
     age_rating: Option<String>,
     community_rating: Option<f64>,
@@ -609,7 +616,7 @@ struct ComicInfoSeriesDefaults {
 
 impl ComicInfoSeriesDefaults {
     fn has_any(&self) -> bool {
-        self.imprint.is_some() || self.tags_json.is_some() || self.format.is_some()
+        self.imprint.is_some() || self.tags_json.is_some() || self.format.is_some() || self.book_type.is_some()
             || self.language_iso.is_some() || self.age_rating.is_some()
             || self.community_rating.is_some() || self.black_and_white.is_some()
             || self.gtin.is_some() || self.notes.is_some() || self.scan_information.is_some()
@@ -617,6 +624,19 @@ impl ComicInfoSeriesDefaults {
             || self.alternate_series.is_some() || self.alternate_number.is_some()
             || self.alternate_count.is_some() || self.story_arc_number.is_some()
             || self.inker_json.is_some() || self.editor_json.is_some() || self.translator_json.is_some()
+    }
+}
+
+/// Map only explicit edition words; preserve the original Format separately and leave unknown
+/// words unset so an authoritative provider type can still fill the blank later.
+fn book_type_from_comicinfo_format(format: &str) -> Option<&'static str> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "one-shot" | "oneshot" | "one shot" => Some("OneShot"),
+        "tpb" | "tp" | "trade paper back" | "trade paperback" | "hardcover" | "hc"
+            | "omnibus" | "deluxe" | "deluxe edition" => Some("TPB"),
+        "graphic novel" | "gn" => Some("GN"),
+        "print" | "single issue" | "annual" | "limited series" => Some("Print"),
+        _ => None,
     }
 }
 
@@ -636,6 +656,7 @@ fn comicinfo_series_defaults(info: &ScanComicInfo) -> ComicInfoSeriesDefaults {
         imprint: text(&info.imprint),
         tags_json: list(&info.tags),
         format: text(&info.format),
+        book_type: text(&info.format).as_deref().and_then(book_type_from_comicinfo_format),
         language_iso: text(&info.language_iso),
         age_rating: text(&info.age_rating),
         community_rating: text(&info.community_rating)
@@ -676,6 +697,7 @@ fn comicinfo_defaults_candidates_sql() -> &'static str {
              s.imprint IS NULL OR s.imprint = ''
           OR s.tags IS NULL OR s.tags = '' OR s.tags = '[]'
           OR s.format IS NULL OR s.format = ''
+          OR s."bookType" IS NULL OR s."bookType" = ''
           OR s."languageISO" IS NULL OR s."languageISO" = ''
           OR s."ageRating" IS NULL OR s."ageRating" = ''
           OR s."communityRating" IS NULL
@@ -704,6 +726,7 @@ fn comicinfo_defaults_fill_sql(bw_literal: &str) -> String {
            imprint = COALESCE(NULLIF(imprint, ''), $1, imprint),
            tags = COALESCE(NULLIF(NULLIF(tags, ''), '[]'), $2, tags),
            format = COALESCE(NULLIF(format, ''), $3, format),
+           "bookType" = COALESCE(NULLIF("bookType", ''), $19, "bookType"),
            "languageISO" = COALESCE(NULLIF("languageISO", ''), $4, "languageISO"),
            "ageRating" = COALESCE(NULLIF("ageRating", ''), $5, "ageRating"),
            "communityRating" = COALESCE("communityRating", $6),
@@ -720,7 +743,7 @@ fn comicinfo_defaults_fill_sql(bw_literal: &str) -> String {
            editor = COALESCE(NULLIF(NULLIF(editor, ''), '[]'), $17, editor),
            translator = COALESCE(NULLIF(NULLIF(translator, ''), '[]'), $18, translator),
            "blackAndWhite" = COALESCE("blackAndWhite", {bw})
-       WHERE id = $19"#,
+       WHERE id = $20"#,
         bw = bw_literal
     )
 }
@@ -2895,6 +2918,7 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
                     .bind(&d.inker_json)
                     .bind(&d.editor_json)
                     .bind(&d.translator_json)
+                    .bind(d.book_type)
                     .bind(sid)
                     .execute(&mut *tx)
                     .await
@@ -3272,7 +3296,44 @@ mod tests {
         assert_eq!(d.black_and_white, Some(true));
         assert_eq!(d.alternate_count, Some(6));
         assert_eq!(d.story_arc_number.as_deref(), Some("2"));
+        assert_eq!(d.format.as_deref(), Some("TPB"), "format keeps the file's raw tag text");
+        assert_eq!(d.book_type, Some("TPB"), "an explicit collected-edition Format also classifies bookType");
         assert!(d.has_any());
+    }
+
+    #[test]
+    fn book_type_from_comicinfo_format_classifies_only_known_types() {
+        assert_eq!(book_type_from_comicinfo_format("One-Shot"), Some("OneShot"));
+        assert_eq!(book_type_from_comicinfo_format("one shot"), Some("OneShot"));
+        assert_eq!(book_type_from_comicinfo_format("TPB"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Trade Paper Back"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Graphic Novel"), Some("GN"));
+        assert_eq!(book_type_from_comicinfo_format("Hardcover"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("HC"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Omnibus"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Deluxe"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("TP"), Some("TPB"));
+        assert_eq!(book_type_from_comicinfo_format("Director's Cut"), None);
+        assert_eq!(book_type_from_comicinfo_format("Limited Series"), Some("Print"));
+        assert_eq!(book_type_from_comicinfo_format("Annual"), Some("Print"));
+        // No tag at all is not evidence of anything -- stays unclassified rather than guessed.
+        assert_eq!(book_type_from_comicinfo_format(""), None);
+    }
+
+    #[test]
+    fn comicinfo_series_defaults_no_format_tag_leaves_book_type_unclassified() {
+        let xml = r#"<?xml version="1.0"?><ComicInfo><Series>X</Series><Imprint>Vertigo</Imprint></ComicInfo>"#;
+        let info: ScanComicInfo = quick_xml::de::from_str(xml).expect("parse");
+        let d = comicinfo_series_defaults(&info);
+        assert_eq!(d.format, None);
+        assert_eq!(d.book_type, None);
+    }
+
+    #[test]
+    fn series_json_ignores_only_explicitly_marked_booktype_guesses() {
+        let guessed = r#"{"metadata":{"name":"X","booktype":"Print"},"omnibus":{"booktype_guessed":true}}"#;
+        assert_eq!(parse_series_json(guessed).unwrap().booktype, None);
+        assert_eq!(parse_series_json(r#"{"metadata":{"booktype":"Print"}}"#).unwrap().booktype.as_deref(), Some("Print"));
     }
 
     #[test]
@@ -4199,6 +4260,29 @@ mod tests {
         ))
         .fetch_one(&db.pool).await.unwrap();
         assert_eq!(complete, 1, "the rebuilt series is excluded from the scheduled provider sweep");
+
+        // An unknown bookType export remains Komga-compatible but must not lock this row to
+        // Print. The full scan restores an explicit file Format, then preserves later curation.
+        // The rescan conservatively treated the preexisting series.json as external curation;
+        // this fixture owns it, so opt back into updating that file before the export.
+        sqlx::query(r#"UPDATE "Series" SET format='Hardcover', "bookType"=NULL, "seriesJsonWritten"=1 WHERE id=$1"#)
+            .bind(&series_id).execute(&db.pool).await.unwrap();
+        crate::metadata_writer::process_embed_job(db.clone(),
+            crate::metadata_writer::EmbedRequest { series_id: Some(series_id.clone()), issue_ids: None })
+            .await.unwrap();
+        sqlx::query(r#"UPDATE "Series" SET format=NULL WHERE id=$1"#)
+            .bind(&series_id).execute(&db.pool).await.unwrap();
+        scan_library(db.clone(), base.to_string_lossy().to_string(), "rt_lib".into(), None).await.unwrap();
+        let restored = sqlx::query(r#"SELECT format, "bookType" FROM "Series" WHERE id=$1"#)
+            .bind(&series_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(restored.get::<String, _>("format"), "Hardcover");
+        assert_eq!(restored.get::<String, _>("bookType"), "TPB");
+        sqlx::query(r#"UPDATE "Series" SET "bookType"='GN' WHERE id=$1"#)
+            .bind(&series_id).execute(&db.pool).await.unwrap();
+        scan_library(db.clone(), base.to_string_lossy().to_string(), "rt_lib".into(), None).await.unwrap();
+        let curated: String = sqlx::query_scalar(r#"SELECT "bookType" FROM "Series" WHERE id=$1"#)
+            .bind(&series_id).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(curated, "GN", "file-derived bookType only fills a blank");
 
         drop(db);
         let _ = std::fs::remove_dir_all(&base);

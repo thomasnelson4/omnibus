@@ -14,6 +14,7 @@ import { isSameIssue } from '@/lib/utils/issue-parser';
 import { resolveSyncedName, detailNameWrite } from '@/lib/utils/synced-name';
 import { findLocalCoverBasename, providerCoverBlocked } from '@/lib/utils/cover-plan';
 import { CV_VOLUME_CREDIT_FIELDS, parseVolumeCredits, persistSeriesCredits } from '@/lib/utils/volume-credits';
+import { guessBookTypeFromCvVolume, isCvRateLimited, isRealGenre, resolveSyncedReleaseDate } from './utils/metadata-policy';
 
 // Providers rarely report when a series ends, so Omnibus guesses: no new issue
 // within the admin-configured window (months) = Ended. Returns null when the
@@ -163,7 +164,8 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                     // shared resolver lets them fill blanks but never clobber a real story title
                     // (detail-fetched or ComicInfo-read), and honors lock + file priority.
                     name: resolveSyncedName(targetRecord?.name, issue.name, issueNumStr, isLocked, fillOnly),
-                    releaseDate: isLocked ? targetRecord!.releaseDate : issue.releaseDate,
+                    releaseDate: resolveSyncedReleaseDate(targetRecord?.releaseDate, issue.releaseDate,
+                        isLocked, fillOnly && !healId, !!targetRecord?.filePath?.trim()),
                     description: issue.description,
                     coverUrl: issue.coverUrl,
                     // Metron's issue_list carries no per-issue credits — the old unconditional
@@ -333,7 +335,10 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
             timeout: 15000
         });
     } catch (e: any) {
-        if (e.response?.status === 429) await markSystemFlag('cv_rate_limit_time');
+        if (isCvRateLimited(e.response?.status)) {
+            await markSystemFlag('cv_rate_limit_time');
+            throw new Error(`FATAL_RATE_LIMIT: ComicVine rate limited (${e.response.status})`);
+        }
         throw e;
     }
 
@@ -342,7 +347,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
     const imageUrl = volData.image?.medium_url || volData.image?.super_url;
 
-    const { genres: volGenres } = parseComicVineCredits(undefined, undefined, volData.concepts || undefined);
+    const volGenres = parseComicVineCredits(undefined, undefined, volData.concepts || undefined).genres.filter(isRealGenre);
     
     let cvFallbackCover = imageUrl || series.coverUrl;
 
@@ -384,13 +389,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
         }
     }
 
-    // ComicVine has no format field, so book type is a conservative guess: explicit
-    // format hints in the volume name, or a finished single-issue volume = one-shot
-    let guessedBookType: string | null = null;
-    const volName = volData.name || '';
-    if (/graphic novel|\bOGN\b/i.test(volName)) guessedBookType = 'GN';
-    else if (/\bTPB\b|trade paperback|\bHC\b|hardcover/i.test(volName)) guessedBookType = 'TPB';
-    else if (volData.count_of_issues === 1 && volData.end_year) guessedBookType = 'OneShot';
+    const guessedBookType = guessBookTypeFromCvVolume(volData);
 
     await prisma.series.update({
         where: { id: series.id },
@@ -454,7 +453,10 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
             });
             issuesCallsMade++;
         } catch (e: any) {
-            if (e.response?.status === 429) await markSystemFlag('cv_rate_limit_time');
+            if (isCvRateLimited(e.response?.status)) {
+                await markSystemFlag('cv_rate_limit_time');
+                throw new Error(`FATAL_RATE_LIMIT: ComicVine rate limited (${e.response.status})`);
+            }
             throw e;
         }
 
@@ -509,7 +511,8 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 // Shared resolver (#199 round 3): keeps lock + file-priority semantics and stops a
                 // null/generic provider name from wiping a real story title (engine parity).
                 name: resolveSyncedName(targetRecord?.name, cvIssue.name, issueNumStr, isLocked, fillOnly),
-                releaseDate: isLocked ? targetRecord!.releaseDate : (cvIssue.store_date || cvIssue.cover_date || null),
+                releaseDate: resolveSyncedReleaseDate(targetRecord?.releaseDate, cvIssue.store_date || cvIssue.cover_date || null,
+                    isLocked, fillOnly && !healId, !!targetRecord?.filePath?.trim()),
                 description: cvIssue.description || cvIssue.deck || null,
                 coverUrl: cvIssue.image?.medium_url || cvIssue.image?.small_url || null,
                 matchState: 'MATCHED'

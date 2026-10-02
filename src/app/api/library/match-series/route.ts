@@ -407,6 +407,33 @@ export async function POST(request: Request) {
         const { conflicts: folderConflicts } = await safeRelocateFolder(oldFolderPath, newFolderPath, srcRoot);
         conflicts += folderConflicts;
         activeFolderPath = newFolderPath;
+
+        // Repoint every moved issue, not just a clicked loose file. Require a directory boundary
+        // so /X never catches /X (2016), and leave conflict files at their actual source path.
+        if (existingRecord?.id) {
+            const staleIssues = await prisma.issue.findMany({
+                where: { seriesId: existingRecord.id, filePath: { not: null } }
+            });
+            const normalize = (p: string) => path.posix.normalize(p.replace(/\\/g, '/'));
+            const oldPrefix = normalize(oldFolderPath).replace(/\/$/, '') + '/';
+            const newPrefix = normalize(newFolderPath).replace(/\/$/, '') + '/';
+            const updates = [];
+            for (const issue of staleIssues) {
+                if (!issue.filePath) continue;
+                const oldFilePath = normalize(issue.filePath);
+                if (!oldFilePath.startsWith(oldPrefix)) continue;
+                const newFilePath = newPrefix + oldFilePath.slice(oldPrefix.length);
+                if (fs.existsSync(issue.filePath) || !fs.existsSync(newFilePath)) continue;
+                updates.push(prisma.issue.update({
+                    where: { id: issue.id },
+                    data: { filePath: newFilePath }
+                }));
+            }
+            if (updates.length > 0) {
+                await prisma.$transaction(updates);
+                Logger.log(`[Match Series] Repointed filePath for ${updates.length} issue(s) after folder relocate.`, 'info');
+            }
+        }
     }
 
     try {
@@ -709,15 +736,9 @@ export async function POST(request: Request) {
             }
         }
 
-        // When the admin supplied custom metadata, embed it (SeriesGroup/Universe/Description) into the
-        // files' ComicInfo.xml — unless they turned the per-edit toggle off, in which case fall back to
-        // the global default. Mirrors library/update's EMBED-on-write resolution.
-        if (lockMetadata && existingRecord?.id) {
-            const doWrite = writeToFile !== undefined ? writeToFile : (config.metadata_write_comicinfo !== 'false');
-            if (doWrite) {
-                await omnibusQueue.add('EMBED_METADATA', { type: 'EMBED_METADATA', seriesId: existingRecord.id }, { jobId: `EMBED_META_MATCH_${existingRecord.id}_${Date.now()}` });
-            }
-        }
+        // METADATA_SYNC embeds after fetching, so don't enqueue a concurrent writer using the
+        // same archive temp path. If fetching fails or a running sync suppresses this job,
+        // custom edits remain in the DB and reach files on the next successful embed.
     } catch (e: any) {
         Logger.log(`[Match Series] Failed to queue jobs: ${e.message}`, 'warn');
     }

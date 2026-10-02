@@ -422,10 +422,13 @@ export default function SmartMatchPage() {
         let matchCount = 0;
 
         for (const series of visibleUnmatched) {
-            if (suggestions[series.id]) continue;
             // An ignored series is visible only while the toggle is on; scanning it would put a
             // suggestion back on a row the admin has already dealt with.
             if (series.isIgnored) continue;
+            // Retry transient errors; successful suggestions and cached empty searches are done.
+            // The search API caches NOT_FOUND results for 12 hours, so retrying those just delays
+            // every untried row by another 1.5 seconds without fetching fresh provider data.
+            if (suggestions[series.id] && suggestions[series.id] !== 'ERROR') continue;
 
             try {
                 // The search term is the SERIES, not the file: a loose file arrives as its filename
@@ -443,6 +446,8 @@ export default function SmartMatchPage() {
                 if (res.status === 429) {
                     throw new Error("FATAL_RATE_LIMIT");
                 }
+
+                if (!res.ok) throw new Error(`Search failed (${res.status})`);
 
                 const data = await res.json();
 
@@ -750,7 +755,7 @@ export default function SmartMatchPage() {
         (async () => {
             try {
                 let vid = volId ? String(volId) : '';
-                let provider = volId ? volProvider : issueProvider;
+                const provider = volId ? volProvider : issueProvider;
                 if (!vid && issueId) {
                     // Only an issue id — one detail call resolves its volume, then the normal path runs.
                     const r = await fetch(`/api/issue-details?id=${issueId}&type=issue&provider=${issueProvider}`);

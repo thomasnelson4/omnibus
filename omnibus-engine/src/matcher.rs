@@ -107,11 +107,36 @@ pub async fn record_sweep_result(db: &Db, value: serde_json::Value) {
 /// said "I curated this by hand, stop offering to match it" — but such a series still has a null or
 /// placeholder metadataId, so without this clause the very next sweep would pick it up and
 /// auto-match it anyway, which is precisely the nagging the state exists to end.
+///
+/// Stable ordering plus a persisted keyset cursor gives unresolved rows behind the first 100
+/// a turn. Cursor values use the same text cast as ordering on both supported DB backends.
 pub(crate) fn unmatched_candidates_sql() -> &'static str {
-    r#"SELECT id, name, year, "folderPath" FROM "Series"
+    r#"SELECT id, name, year, "folderPath", CAST("updatedAt" AS TEXT) AS sweep_updated_at FROM "Series"
        WHERE ("matchState" IS NULL OR "matchState" <> 'IGNORED')
          AND ("matchState" = 'UNMATCHED' OR "metadataId" IS NULL OR "metadataId" LIKE 'unmatched%')
-       ORDER BY "updatedAt" ASC LIMIT 100"#
+       ORDER BY CAST("updatedAt" AS TEXT) ASC, "id" ASC LIMIT 100"#
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SweepCursor {
+    updated_at: String,
+    id: String,
+}
+
+async fn sweep_candidates(db: &Db) -> anyhow::Result<Vec<sqlx::any::AnyRow>> {
+    let cursor = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'unmatched_sweep_cursor'"#,
+    ).fetch_optional(&db.pool).await?.and_then(|s| serde_json::from_str::<SweepCursor>(&s).ok());
+    if let Some(cursor) = cursor {
+        let sql = unmatched_candidates_sql().replace("ORDER BY", r#"AND (
+            CAST("updatedAt" AS TEXT) > $1 OR
+            (CAST("updatedAt" AS TEXT) = $1 AND id > $2)) ORDER BY"#);
+        let rows = sqlx::query(&sql).bind(cursor.updated_at).bind(cursor.id)
+            .fetch_all(&db.pool).await?;
+        if !rows.is_empty() { return Ok(rows); }
+    }
+    // At the end (or after deletions), wrap so earlier unresolved/new rows are retried too.
+    Ok(sqlx::query(unmatched_candidates_sql()).fetch_all(&db.pool).await?)
 }
 
 pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
@@ -143,9 +168,7 @@ pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
     let cv_key = crate::secret_crypto::decrypt_setting(&db.pool, get_setting("cv_api_key").await).await
         .filter(|k| !k.trim().is_empty());
 
-    let rows = sqlx::query(unmatched_candidates_sql())
-    .fetch_all(&db.pool)
-    .await?;
+    let rows = sweep_candidates(&db).await?;
 
     let total = rows.len();
     if total == 0 {
@@ -167,9 +190,13 @@ pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
     let mut searches_this_run = 0usize;
     let mut audit: Vec<SweepAudit> = Vec::new(); // Tier-2 history, flushed after the pass
     let search_allowed = matches!(mode.as_str(), "trust" | "auto") && cv_key.is_some();
+    let mut last_attempted = None;
 
     for row in &rows {
         let sid: String = row.get("id");
+        last_attempted = Some(SweepCursor {
+            updated_at: row.get("sweep_updated_at"), id: sid.clone(),
+        });
         let name: String = row.get("name");
         let year: i32 = row.try_get("year").unwrap_or(0);
         let folder: String = row.try_get("folderPath").unwrap_or_default();
@@ -264,6 +291,13 @@ pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     }
 
+    // Advance only to the last row examined, never past rows skipped by a rate-limit break.
+    if let Some(cursor) = last_attempted {
+        sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ('unmatched_sweep_cursor', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#)
+            .bind(serde_json::to_string(&cursor)?).execute(&db.pool).await?;
+    }
+
     // Tier-2 history lands before the summary so Job History shows the per-series rows the
     // moment the run's own COMPLETED row appears.
     flush_sweep_audit(&db, &audit).await;
@@ -342,9 +376,9 @@ async fn cv_search_best(db: &Db, client: &reqwest::Client, api_key: &str, name: 
         None => {
             let resp = client.execute(req).await?;
             crate::api_usage::log(&db.pool, "comicvine", "https://comicvine.gamespot.com/api/search/").await;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            if crate::metadata::is_cv_rate_limited(resp.status()) {
                 crate::metadata::mark_flag(db, "cv_rate_limit_time").await;
-                anyhow::bail!("ComicVine rate limited (429) on matcher search");
+                anyhow::bail!("ComicVine rate limited (429/420) on matcher search");
             }
             let j: serde_json::Value = resp.json().await?;
             crate::metadata_cache::put(db, "comicvine", &full_url, &j).await;
@@ -437,6 +471,36 @@ pub(crate) fn budget_exhausted(calls_last_window: usize, limit: usize, reserve: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unresolved_sweep_advances_through_tied_backlog_and_wraps() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let db = Db { pool, dialect: crate::db::Dialect::Sqlite };
+        sqlx::query(r#"CREATE TABLE "SystemSetting" (key TEXT PRIMARY KEY, value TEXT NOT NULL)"#)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, year INTEGER,
+            "folderPath" TEXT, "matchState" TEXT, "metadataId" TEXT, "updatedAt" INTEGER)"#)
+            .execute(&db.pool).await.unwrap();
+        for i in 1..=150 {
+            sqlx::query(r#"INSERT INTO "Series" VALUES ($1, 'Unmatched', 2024, '', 'UNMATCHED', NULL, 1000)"#)
+                .bind(format!("s{i:03}")).execute(&db.pool).await.unwrap();
+        }
+        let first = run_unmatched_sweep(db.clone()).await.unwrap();
+        assert_eq!(first.matched, 0);
+        assert!(first.summary.contains("100 left for the Smart Matcher"));
+        let next = sweep_candidates(&db).await.unwrap();
+        assert_eq!(next.len(), 50);
+        assert_eq!(next[0].get::<String, _>("id"), "s101");
+        run_unmatched_sweep(db.clone()).await.unwrap();
+        let wrapped = sweep_candidates(&db).await.unwrap();
+        assert_eq!(wrapped[0].get::<String, _>("id"), "s001");
+        // A malformed cursor from an older build must not prevent a fresh pass.
+        sqlx::query(r#"UPDATE "SystemSetting" SET value = 'invalid' WHERE key = 'unmatched_sweep_cursor'"#)
+            .execute(&db.pool).await.unwrap();
+        assert_eq!(sweep_candidates(&db).await.unwrap().len(), 100);
+    }
 
     /// The sweep must leave IGNORED series alone — they still carry a null/placeholder metadataId,
     /// so the pre-IGNORED query would have re-offered them on every run (field report from

@@ -3,6 +3,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 pub struct RateLimiter {
     getcomics: Mutex<Instant>,
+    annas_archive: Mutex<Instant>,
     prowlarr: Mutex<Instant>,
     comicvine: Mutex<Instant>,
     metron: Mutex<Instant>,
@@ -15,6 +16,7 @@ impl RateLimiter {
         let past = Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now);
         Self {
             getcomics: Mutex::new(past),
+            annas_archive: Mutex::new(past),
             prowlarr: Mutex::new(past),
             comicvine: Mutex::new(past),
             metron: Mutex::new(past),
@@ -25,6 +27,7 @@ impl RateLimiter {
         // 1. Acquire the lock for the specific service
         let mut lock = match service {
             "getcomics" => self.getcomics.lock().await,
+            "annas_archive" => self.annas_archive.lock().await,
             "prowlarr" => self.prowlarr.lock().await,
             "comicvine" => self.comicvine.lock().await,
             "metron" => self.metron.lock().await,
@@ -58,6 +61,18 @@ mod tests {
         let t0 = Instant::now();
         rl.enforce("getcomics", 1000).await; // immediately after a reset → must wait ~1000ms
         assert!(t0.elapsed() >= Duration::from_millis(1000), "second call was not throttled");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn annas_archive_requests_are_throttled_independently() {
+        let rl = RateLimiter::new();
+        rl.enforce("annas_archive", 2500).await;
+        let t0 = Instant::now();
+        rl.enforce("annas_archive", 2500).await;
+        assert!(t0.elapsed() >= Duration::from_millis(2500));
+        let t0 = Instant::now();
+        rl.enforce("getcomics", 1000).await;
+        assert!(t0.elapsed() < Duration::from_millis(1));
     }
 
     #[tokio::test(start_paused = true)]

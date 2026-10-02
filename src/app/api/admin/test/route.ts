@@ -374,7 +374,7 @@ export async function POST(request: Request) {
         // The key lives in HosterAccount (encrypted), not SystemSetting.
         const account = await prisma.hosterAccount.findFirst({ where: { hoster: 'annas_archive', isActive: true } });
         const key = account?.apiKey ? await decryptSecret(account.apiKey) : "";
-        const result = await testAnnasArchiveKey(key, config.annas_archive_base_url);
+        const result = await testAnnasArchiveKey(key, config.annas_archive_base_url, config.annas_archive_mirrors);
         return NextResponse.json({ success: result.success, message: result.message });
     }
 

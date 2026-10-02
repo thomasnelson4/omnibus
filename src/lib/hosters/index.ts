@@ -57,9 +57,17 @@ export const HosterEngine = {
                 case 'terabox':
                     result = await resolveTerabox(url, account);
                     break;
-                case 'annas_archive':
-                    result = await resolveAnnasArchive(url, account);
+                case 'annas_archive': {
+                    const settings = await prisma.systemSetting.findMany({
+                        where: { key: { in: ['annas_archive_base_url', 'annas_archive_mirrors'] } }
+                    });
+                    const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
+                    result = await resolveAnnasArchive(url, account, {
+                        baseUrl: config.annas_archive_base_url,
+                        mirrors: config.annas_archive_mirrors,
+                    });
                     break;
+                }
                 default:
                     result = { success: false, error: `No resolver found for hoster: ${hoster}` };
             }

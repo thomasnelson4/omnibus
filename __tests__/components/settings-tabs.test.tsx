@@ -139,6 +139,19 @@ describe('Settings tabs (Phase 1 reorganization)', () => {
         expect(screen.queryByText(/Search Acronym Expansion/i)).not.toBeInTheDocument();
     });
 
+    it('DownloadsTab loads and edits the ordered Anna\'s Archive fallback mirrors', () => {
+        const mirrors = 'https://one.example\nhttps://two.example';
+        const bag = mkBag({ config: { annas_archive_base_url: 'https://primary.example', annas_archive_mirrors: mirrors } });
+        render(<DownloadsTab s={bag} />);
+        const input = screen.getByLabelText('Fallback Mirror URLs');
+        expect(input).toHaveValue(mirrors);
+        fireEvent.change(input, { target: { value: 'https://new.example\nhttps://two.example' } });
+        expect(bag.setConfig).toHaveBeenCalledWith({
+            annas_archive_base_url: 'https://primary.example',
+            annas_archive_mirrors: 'https://new.example\nhttps://two.example',
+        });
+    });
+
     it('NotificationsTab renders the provider cards', () => {
         render(<NotificationsTab s={mkBag()} />);
         expect(screen.getByText('Discord')).toBeInTheDocument();

@@ -6,7 +6,7 @@
 // rows, pick → volume resolution → Issue Mapping auto-fill (exact issue id from the file's
 // number), Load more pagination, and the fallback ID path routing through the same resolver.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { err, ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
@@ -66,6 +66,51 @@ const openSearchMatchDialog = async () => {
     await screen.findByText('Conan & Dragonero 001');
     fireEvent.click(screen.getByRole('button', { name: /Search Match/ }));
     await screen.findByPlaceholderText('e.g. The Amazing Spider-Man');
+};
+
+type BulkPayload = { oldFolderPath: string; [key: string]: unknown };
+type UnmatchedItem = typeof RAW_ITEM & { isIgnored?: boolean };
+
+const rawItems = (count: number): UnmatchedItem[] => Array.from({ length: count }, (_, idx) => ({
+    id: `raw_${idx + 1}`, name: `Conan & Dragonero ${String(idx + 1).padStart(3, '0')}`,
+    folderPath: `/unmatched/Conan & Dragonero ${idx + 1}.cbz`, isRawFile: true,
+}));
+
+const stubBulkFetch = (
+    items: UnmatchedItem[],
+    apply = (batch: BulkPayload[], _call: number) => ok({ results: batch.map(() => ({ ok: true })) }),
+    prefillFor: (path: string) => unknown = () => null,
+) => {
+    const batches: BulkPayload[][] = [];
+    stubFetchRouter([
+        ['/api/admin/unmatched', () => ok(items)],
+        ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
+        ['/api/admin/match-prefill', u => {
+            const prefill = prefillFor(new URL(u, 'http://localhost').searchParams.get('path') || '');
+            return ok({ hasContent: !!prefill, prefill });
+        }],
+        ['/api/search', u => { searchCalls.push(u); return ok({ results: [SEARCH_RESULT] }); }],
+        ['/api/issue-details/covers', () => ok({ covers: {} })],
+        ['/api/issue-details', u => { detailCalls.push(u); return ok(VOLUME_DETAILS); }],
+        ['/api/library/match-series/bulk', (_u, init) => {
+            const batch = JSON.parse(init.body).items;
+            batches.push(batch);
+            return apply(batch, batches.length);
+        }],
+    ]);
+    return batches;
+};
+
+const openBulkAssignment = async (items: UnmatchedItem[]) => {
+    render(<SmartMatchPage />);
+    await screen.findByText(items[0].name);
+    for (const item of items) fireEvent.click(screen.getByRole('checkbox', { name: `Select ${item.name}` }));
+    fireEvent.click(screen.getByRole('button', { name: 'Assign to Series' }));
+    const dialog = screen.getByRole('dialog', { name: 'Assign to Series' });
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Search$/ }));
+    fireEvent.click(await within(dialog).findByText(SEARCH_RESULT.name));
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: /Assign Selected/ }).hasAttribute('disabled')).toBe(false));
+    return dialog;
 };
 
 describe('Smart Matcher — Search Match dialog', () => {
@@ -246,5 +291,152 @@ describe('Smart Matcher — Search Match dialog', () => {
             await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan Complete' })));
         }
         expect(attempts).toBe(1);
+    });
+
+    it('assigns selected files with one search and distinct, editable issue mappings', async () => {
+        const items = rawItems(3);
+        const batches = stubBulkFetch(items);
+        const dialog = await openBulkAssignment(items.slice(0, 2));
+        expect(within(dialog).getByLabelText(`Issue ID for ${items[0].name}`).getAttribute('value')).toBe('171893');
+        expect(within(dialog).getByLabelText(`Issue ID for ${items[1].name}`).getAttribute('value')).toBe('171894');
+        fireEvent.change(within(dialog).getByLabelText(`Issue number for ${items[0].name}`), { target: { value: '7' } });
+        fireEvent.change(within(dialog).getByLabelText(`Issue ID for ${items[0].name}`), { target: { value: 'corrected-id' } });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+
+        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+        expect(batches).toHaveLength(1);
+        expect(batches[0]).toEqual([
+            expect.objectContaining({ oldFolderPath: items[0].folderPath, metadataId: 16180, metadataSource: 'METRON', name: SEARCH_RESULT.name, exactIssueNumber: '7', exactIssueId: 'corrected-id' }),
+            expect.objectContaining({ oldFolderPath: items[1].folderPath, metadataId: 16180, metadataSource: 'METRON', name: SEARCH_RESULT.name, exactIssueNumber: '2', exactIssueId: '171894' }),
+        ]);
+        expect(searchCalls).toHaveLength(1);
+        expect(detailCalls).toHaveLength(1);
+        expect(screen.queryByText(items[0].name)).toBeNull();
+        expect(screen.queryByText(items[1].name)).toBeNull();
+        expect(screen.getByText(items[2].name)).toBeTruthy();
+        expect(screen.getByRole('button', { name: 'Select Entries' })).toBeTruthy();
+    });
+
+    it('assigns large selections in chunks without repeating the search or volume lookup', async () => {
+        const items = rawItems(12);
+        const batches = stubBulkFetch(items);
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (12)' }));
+
+        await screen.findByText('All Caught Up!');
+        expect(batches.map(batch => batch.length)).toEqual([5, 5, 2]);
+        expect(batches.flat().map(item => item.oldFolderPath)).toEqual(items.map(item => item.folderPath));
+        expect(batches.flat().every(item => item.metadataId === 16180 && item.metadataSource === 'METRON')).toBe(true);
+        expect(searchCalls).toHaveLength(1);
+        expect(detailCalls).toHaveLength(1);
+    });
+
+    it('keeps failed entries selected and retries only those with the chosen series', async () => {
+        const items = rawItems(2);
+        const batches = stubBulkFetch(items, (batch, call) => ok({ results: call === 1
+            ? [{ ok: true }, { ok: false, error: 'Folder collision' }]
+            : batch.map(() => ({ ok: true })),
+        }));
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+
+        const retry = await within(dialog).findByRole('button', { name: 'Assign Selected (1)' });
+        await waitFor(() => expect(retry.hasAttribute('disabled')).toBe(false));
+        expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Assignment finished with errors', description: expect.stringContaining('Folder collision') }));
+        expect(within(dialog).queryByLabelText(`Issue ID for ${items[0].name}`)).toBeNull();
+        expect(within(dialog).getByLabelText(`Issue ID for ${items[1].name}`).getAttribute('value')).toBe('171894');
+        fireEvent.click(retry);
+
+        await screen.findByText('All Caught Up!');
+        expect(batches.map(batch => batch.map(item => item.oldFolderPath))).toEqual([
+            items.map(item => item.folderPath), [items[1].folderPath],
+        ]);
+        expect(searchCalls).toHaveLength(1);
+    });
+
+    it.each(['HTTP error', 'network error', 'missing results'])('retains the selection after a bulk %s', async failure => {
+        const items = rawItems(2);
+        const batches = stubBulkFetch(items, (batch, call) => {
+            if (call > 1) return ok({ results: batch.map(() => ({ ok: true })) });
+            if (failure === 'HTTP error') return err(500, { error: 'Provider unavailable' });
+            if (failure === 'network error') return Promise.reject(new Error('Network error'));
+            return ok({ results: [] });
+        });
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Assignment finished with errors' })));
+        const retry = within(dialog).getByRole('button', { name: 'Assign Selected (2)' });
+        expect(retry.hasAttribute('disabled')).toBe(false);
+        fireEvent.click(retry);
+        await screen.findByText('All Caught Up!');
+        expect(batches.map(batch => batch.length)).toEqual([2, 2]);
+    });
+
+    it('selects and deselects all available entries while excluding ignored series', async () => {
+        const items = [...rawItems(2), { id: 'ignored', name: 'Ignored series', folderPath: '/library/ignored', isRawFile: false, isIgnored: true }];
+        const batches = stubBulkFetch(items);
+        render(<SmartMatchPage />);
+        await screen.findByText(items[0].name);
+        fireEvent.click(screen.getByRole('button', { name: 'Show ignored (1)' }));
+        expect(screen.getByRole('checkbox', { name: 'Select Ignored series' }).hasAttribute('disabled')).toBe(true);
+        fireEvent.click(screen.getByRole('button', { name: 'Select Entries' }));
+        expect(screen.getByRole('button', { name: 'Assign to Series' }).hasAttribute('disabled')).toBe(true);
+        fireEvent.click(screen.getByRole('button', { name: 'Select All' }));
+        expect(screen.getByRole('status').textContent).toBe('2 Selected');
+        fireEvent.click(screen.getByRole('button', { name: 'Deselect All' }));
+        expect(screen.getByRole('status').textContent).toBe('0 Selected');
+        fireEvent.click(screen.getByRole('checkbox', { name: `Select ${items[0].name}` }));
+        fireEvent.click(screen.getByRole('button', { name: 'Cancel Selection' }));
+        expect(screen.getByRole('checkbox', { name: `Select ${items[0].name}` }).getAttribute('aria-checked')).toBe('false');
+        expect(batches).toHaveLength(0);
+    });
+
+    it('confirms combining folders before assigning them to one series', async () => {
+        const folders = rawItems(2).map(item => ({ ...item, folderPath: `/library/${item.id}`, isRawFile: false }));
+        const batches = stubBulkFetch(folders);
+        const dialog = await openBulkAssignment(folders);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        expect(batches).toHaveLength(0);
+        const confirmation = screen.getByRole('dialog', { name: 'Merge these folders into one series?' });
+        fireEvent.click(within(confirmation).getByRole('button', { name: 'Cancel' }));
+        expect(batches).toHaveLength(0);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Assign and Merge' }));
+        await screen.findByText('All Caught Up!');
+        expect(batches[0].map(item => item.oldFolderPath)).toEqual(folders.map(item => item.folderPath));
+    });
+
+    it('preserves file metadata when shared naming is supplied', async () => {
+        const items = rawItems(2);
+        const batches = stubBulkFetch(items, undefined, path => ({
+            fields: { description: { value: `Curated ${path}`, source: 'comicinfo' }, writer: { value: 'Local Writer', source: 'comicinfo' } },
+            issue: { title: `Title ${path}` },
+        }));
+        const dialog = await openBulkAssignment(items);
+        fireEvent.change(within(dialog).getByPlaceholderText('e.g. X-Men'), { target: { value: 'Crossover' } });
+        fireEvent.change(within(dialog).getByPlaceholderText('e.g. Earth-616'), { target: { value: 'Shared Universe' } });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        await screen.findByText('All Caught Up!');
+        expect(batches[0]).toEqual(items.map(item => expect.objectContaining({
+            oldFolderPath: item.folderPath, name: SEARCH_RESULT.name, description: `Curated ${item.folderPath}`, writer: 'Local Writer',
+            issueTitle: `Title ${item.folderPath}`, dataMode: 'keep', seriesGroup: 'Crossover', universe: 'Shared Universe', lockMetadata: true,
+        })));
+    });
+
+    it('locks assignment controls until the bulk request finishes', async () => {
+        const items = rawItems(2);
+        let finish!: (value: Awaited<ReturnType<typeof ok>>) => void;
+        const pending = new Promise<Awaited<ReturnType<typeof ok>>>(resolve => { finish = resolve; });
+        const batches = stubBulkFetch(items, () => pending);
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        await waitFor(() => expect(batches).toHaveLength(1));
+        expect(within(dialog).getByRole('button', { name: /Assigning 0\/2/ }).hasAttribute('disabled')).toBe(true);
+        expect(within(dialog).getByRole('button', { name: 'Cancel' }).hasAttribute('disabled')).toBe(true);
+        expect(within(dialog).getByPlaceholderText('e.g. The Amazing Spider-Man').closest('fieldset')?.disabled).toBe(true);
+        fireEvent.keyDown(dialog, { key: 'Escape' });
+        expect(screen.getByRole('dialog', { name: 'Assign to Series' })).toBeTruthy();
+        finish(await ok({ results: [{ ok: true }, { ok: true }] }));
+        await screen.findByText('All Caught Up!');
     });
 });

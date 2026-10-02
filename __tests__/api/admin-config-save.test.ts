@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
     auditLog: vi.fn(),
     syncSchedules: vi.fn(),
     log: vi.fn(),
+    keyTest: vi.fn(),
+    hosterFindFirst: vi.fn(),
 }));
 
 vi.mock('next-auth/next', () => ({ getServerSession: mocks.getServerSession }));
@@ -24,6 +26,7 @@ vi.mock('next-auth/next', () => ({ getServerSession: mocks.getServerSession }));
 vi.mock('@/lib/db', () => ({
     prisma: {
         systemSetting: { findUnique: mocks.settingFindUnique },
+        hosterAccount: { findFirst: mocks.hosterFindFirst },
         $transaction: mocks.transaction,
     }
 }));
@@ -34,7 +37,7 @@ vi.mock('@/lib/encryption', () => ({
     encryptSecret: vi.fn(async (v: string) => v),
     decryptSecret: vi.fn(async (v: string) => v),
 }));
-vi.mock('@/lib/annas-test', () => ({ testAnnasArchiveKey: vi.fn() }));
+vi.mock('@/lib/annas-test', () => ({ testAnnasArchiveKey: mocks.keyTest }));
 
 const mockReq = (body: any) => ({
     json: async () => body,
@@ -119,5 +122,29 @@ describe('Settings save: the response never waits on (or fails from) post-commit
             if (fields.password) expect(update).not.toHaveProperty('password');
             else expect(update.password).toBe('');
         }
+    });
+
+    it('saves normalized fallback mirrors and passes them to the automation connection test', async () => {
+        mocks.hosterFindFirst.mockResolvedValueOnce({ apiKey: 'test-key' });
+        mocks.keyTest.mockResolvedValueOnce({ success: true });
+        const res = await POST(mockReq({ settings: {
+            annas_archive_base_url: 'https://PRIMARY.example/',
+            annas_archive_mirrors: ' https://one.example/\r\nhttps://two.example,https://one.example',
+            search_source_priority: JSON.stringify([{ source: 'annas_archive', enabled: true }]),
+        } }));
+        expect(res.status).toBe(200);
+        expect(mocks.keyTest).toHaveBeenCalledWith('test-key', 'https://primary.example', 'https://one.example\nhttps://two.example');
+        expect(mocks.settingUpsert).toHaveBeenCalledWith(expect.objectContaining({
+            where: { key: 'annas_archive_mirrors' },
+            update: { value: 'https://one.example\nhttps://two.example' },
+        }));
+    });
+
+    it('rejects invalid mirror configuration before saving or making API calls', async () => {
+        const res = await POST(mockReq({ settings: { annas_archive_mirrors: 'ftp://invalid.example' } }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toContain("Invalid Anna's Archive mirror URL");
+        expect(mocks.transaction).not.toHaveBeenCalled();
+        expect(mocks.keyTest).not.toHaveBeenCalled();
     });
 });

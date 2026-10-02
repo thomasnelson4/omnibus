@@ -11,6 +11,7 @@ import { CACHE_DIR, LOGS_DIR, BACKUPS_DIR, WATCHED_DIR, UNMATCHED_DIR } from '@/
 import { encryptSecret, decryptSecret } from '@/lib/encryption';
 import { SECRET_SETTING_KEYS } from '@/lib/secret-keys';
 import { testAnnasArchiveKey } from '@/lib/annas-test';
+import { normalizeAnnasMirror, parseAnnasMirrors } from '@/lib/annas-mirrors';
 
 const SENSITIVE_KEYS = [
     'cv_api_key', 
@@ -132,6 +133,17 @@ export async function POST(request: Request) {
         searchAcronyms
     } = body;
 
+    try {
+        if (typeof settings?.annas_archive_base_url === 'string' && settings.annas_archive_base_url.trim()) {
+            settings.annas_archive_base_url = normalizeAnnasMirror(settings.annas_archive_base_url);
+        }
+        if (typeof settings?.annas_archive_mirrors === 'string') {
+            settings.annas_archive_mirrors = parseAnnasMirrors(settings.annas_archive_mirrors).join('\n');
+        }
+    } catch (error) {
+        return NextResponse.json({ error: getErrorMessage(error) }, { status: 400 });
+    }
+
     if (settings?.oidc_force_sso === 'true') {
         const adminWithPassword = await prisma.user.findFirst({
             where: {
@@ -201,7 +213,7 @@ export async function POST(request: Request) {
                         const dbAcct = await prisma.hosterAccount.findFirst({ where: { hoster: 'annas_archive', isActive: true } });
                         key = dbAcct?.apiKey ? await decryptSecret(dbAcct.apiKey) : "";
                     }
-                    const test = await testAnnasArchiveKey(key, settings.annas_archive_base_url);
+                    const test = await testAnnasArchiveKey(key, settings.annas_archive_base_url, settings.annas_archive_mirrors);
                     if (!test.success) {
                         ssp[annasIdx].enabled = false;
                         settings.search_source_priority = JSON.stringify(ssp);

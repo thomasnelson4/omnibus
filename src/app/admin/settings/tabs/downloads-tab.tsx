@@ -6,6 +6,7 @@
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
@@ -278,7 +279,20 @@ export function DownloadsTab({ s }: { s: SettingsBag }) {
                                 onChange={(e) => setConfig({ ...config, annas_archive_base_url: e.target.value })}
                                 className="h-12 sm:h-10 bg-background border-border text-foreground"
                             />
-                            <p className="text-[11px] text-muted-foreground mt-1">Anna's Archive rotates mirror domains frequently under takedown pressure (the old .org / .se / .li are gone; .gl is current as of mid-2026). If searches fail with a DNS / "no such host" error, set the current working mirror here — see the Anna's Archive Wikipedia page for the live list. Leave blank to use the default (annas-archive.gl).</p>
+                            <p className="text-[11px] text-muted-foreground mt-1">The primary mirror to try first. Leave blank to use the default (annas-archive.gl).</p>
+                        </div>
+
+                        <div className="space-y-2 bg-muted/30 p-4 rounded-lg border border-border">
+                            <Label htmlFor="annas_archive_mirrors" className="font-bold text-foreground">Fallback Mirror URLs</Label>
+                            <Textarea
+                                id="annas_archive_mirrors"
+                                value={config.annas_archive_mirrors || ""}
+                                placeholder={"https://mirror-one.example\nhttps://mirror-two.example"}
+                                onChange={(e) => setConfig({ ...config, annas_archive_mirrors: e.target.value })}
+                                rows={3}
+                                className="bg-background border-border text-foreground"
+                            />
+                            <p className="text-[11px] text-muted-foreground mt-1">Enter one HTTP or HTTPS mirror address per line, in the order you want them tried. Searches, API-key tests, and download resolution switch to these when a mirror is unavailable or blocked, then try the built-in mirrors. Downloads first try the mirror where the result was found.</p>
                         </div>
 
                         <div className="space-y-2 bg-muted/30 p-4 rounded-lg border border-border">

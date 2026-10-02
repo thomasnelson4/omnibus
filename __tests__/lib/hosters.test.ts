@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
     log: vi.fn(),
     decrypt: vi.fn(async value => value),
     resolveMega: vi.fn(),
+    findMirrorSettings: vi.fn().mockResolvedValue([]),
 }));
 
 // 2. Mock Axios and Database
@@ -16,7 +17,10 @@ vi.mock('axios');
 vi.mock('@/lib/encryption', () => ({ decryptSecret: mocks.decrypt }));
 vi.mock('@/lib/hosters/mega', () => ({ resolveMega: mocks.resolveMega }));
 vi.mock('@/lib/db', () => ({
-    prisma: { hosterAccount: { findFirst: mocks.findFirstHoster } }
+    prisma: {
+        hosterAccount: { findFirst: mocks.findFirstHoster },
+        systemSetting: { findMany: mocks.findMirrorSettings },
+    }
 }));
 
 describe('Download Pipeline: Hoster Engine', () => {
@@ -80,6 +84,7 @@ describe('Download Pipeline: Hoster Engine', () => {
         mocks.findFirstHoster.mockResolvedValueOnce({ apiKey: 'anna_key_123', isActive: true });
         
         vi.mocked(axios.get).mockResolvedValueOnce({
+            status: 200,
             data: { download_url: 'https://fast.annas-archive.org/file.cbz' }
         } as any);
 
@@ -87,5 +92,18 @@ describe('Download Pipeline: Hoster Engine', () => {
 
         expect(result.success).toBe(true);
         expect(result.directUrl).toBe('https://fast.annas-archive.org/file.cbz');
+    });
+
+    it('loads saved fallback mirrors when resolving an unavailable Anna\'s Archive link', async () => {
+        mocks.findFirstHoster.mockResolvedValueOnce({ apiKey: 'test-key', isActive: true });
+        mocks.findMirrorSettings.mockResolvedValueOnce([
+            { key: 'annas_archive_base_url', value: 'https://old.example' },
+            { key: 'annas_archive_mirrors', value: 'https://fallback.example' },
+        ]);
+        vi.mocked(axios.get).mockRejectedValueOnce(new Error('ENOTFOUND'))
+            .mockResolvedValueOnce({ status: 200, data: { download_url: 'https://files.example/book.cbz' } } as any);
+        const result = await HosterEngine.resolveLink('https://old.example/md5/0123456789abcdef0123456789abcdef', 'annas_archive');
+        expect(result).toEqual({ success: true, directUrl: 'https://files.example/book.cbz' });
+        expect(axios.get).toHaveBeenNthCalledWith(2, 'https://fallback.example/dyn/api/fast_download.json', expect.any(Object));
     });
 });

@@ -32,6 +32,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { InteractiveSearchModal } from "@/components/interactive-search-modal"
 import { FollowBell } from "@/components/follow-bell"
 import MetadataEditorModal from "@/components/metadata-editor-modal"
+import { AddByIdDialog } from "@/components/add-by-id-dialog"
 
 interface Comic {
   id: string; // Prisma ID
@@ -947,7 +948,20 @@ function LibraryContent() {
                 )}
             </div>
             
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2">
+                {(isAdmin || (session?.user as any)?.canRequest) && (
+                    <AddByIdDialog onAdded={() => {
+                        anchorRef.current = 0;
+                        setAnchorOffset(0);
+                        setActiveLetter(null);
+                        setPage(1);
+                        loadLibraryData(1, false, false);
+                        fetch('/api/library/follow')
+                            .then(res => res.ok ? res.json() : { seriesIds: [] })
+                            .then(data => setFollowedIds(new Set(data.seriesIds || [])))
+                            .catch(() => {});
+                    }} />
+                )}
                 <Button aria-label="Browse all individual issues by release date" variant="outline" size="sm" onClick={() => router.push('/library/issues')} className="h-10 sm:h-9 border-border">
                     <CalendarDays className="w-4 h-4 mr-2" /> All Issues
                 </Button>

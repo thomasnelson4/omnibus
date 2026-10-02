@@ -147,6 +147,15 @@ export async function POST(request: Request) {
         }
     }
 
+    if (Array.isArray(hosterAccounts) && hosterAccounts.some(account => {
+        if (account?.hoster !== 'mega' || account.isActive === false) return false;
+        if (account.username != null && typeof account.username !== 'string') return true;
+        if (account.password != null && typeof account.password !== 'string') return true;
+        return !!account.username?.trim() !== !!account.password;
+    })) {
+        return NextResponse.json({ error: 'Enter both a MEGA email and password, or clear both for anonymous downloads.' }, { status: 400 });
+    }
+
     // Encrypt credential fields at rest before persisting. '********' means "unchanged" (the GET
     // masks secrets), so it is left in place for syncTable to drop, preserving the stored value.
     const encryptRows = async (rows: any[] | undefined, fields: string[]): Promise<any> => {

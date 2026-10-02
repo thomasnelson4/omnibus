@@ -9,6 +9,7 @@ import { Mailer } from '@/lib/mailer';
 import { testAnnasArchiveKey } from '@/lib/annas-test';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
+import { MegaLoginError, testMegaAccount } from '@/lib/hosters/mega-session';
 
 export async function POST(request: Request) {
   let type = 'unknown';
@@ -27,6 +28,29 @@ export async function POST(request: Request) {
     const body = await request.json();
     type = body.type || 'unknown';
     const { config } = body;
+
+    if (type === 'mega') {
+        if (typeof config?.username !== 'string' || typeof config?.password !== 'string') {
+            return NextResponse.json({ success: false, message: 'Enter both a MEGA email and password.' }, { status: 400 });
+        }
+        try {
+            let password = config.password;
+            if (password === '********') {
+                const saved = typeof config.id === 'string' ? await prisma.hosterAccount.findFirst({
+                    where: { id: config.id, hoster: 'mega' },
+                }) : null;
+                if (!saved?.password) {
+                    return NextResponse.json({ success: false, message: 'Re-enter the MEGA password before testing.' }, { status: 400 });
+                }
+                password = await decryptSecret(saved.password) || '';
+            }
+            await testMegaAccount(config.username, password);
+            return NextResponse.json({ success: true, message: 'MEGA login successful. Downloads will use this account\'s transfer allowance.' });
+        } catch (error) {
+            return NextResponse.json({ success: false, message: error instanceof MegaLoginError
+                ? error.message : 'MEGA login failed. Check the account or re-enter its credentials.' });
+        }
+    }
 
     const headers: any = {
         'User-Agent': 'Omnibus/1.0',

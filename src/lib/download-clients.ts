@@ -8,7 +8,10 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import { DiscordNotifier } from './discord';
 import { getErrorMessage } from './utils/error';
-import { HosterEngine } from './hosters';
+import { HosterEngine, type HosterResolveResult } from './hosters';
+import { isMegaLink } from './hosters/mega';
+import { isMegaSessionError } from './hosters/mega-session';
+import { enabledHostersFromSetting } from './getcomics';
 import { decryptSecret } from './encryption';
 import { assertSafeFetchUrl, assertSafeRedirect, isTrustedConfiguredOrigin } from './utils/ssrf';
 import { looksLikeHtmlPage } from './utils/content-sniff';
@@ -326,15 +329,23 @@ export const DownloadService = {
       let partFilePath = `${filePath}.part`; 
 
       let finalDownloadUrl = url;
+      let resolvedHoster: HosterResolveResult | null = null;
 
       try {
+          // Cron and direct-link retries have no hoster argument. A public MEGA link must
+          // still go through the SDK resolver, including the saved account's session.
+          if (!hoster && isMegaLink(url)) hoster = 'mega';
+          if (hoster === 'mega') {
+              const preference = await prisma.systemSetting.findUnique({ where: { key: 'hoster_priority' } });
+              if (!enabledHostersFromSetting(preference?.value).includes('mega')) {
+                  throw new Error('MEGA downloads are disabled in Settings.');
+              }
+          }
           try {
               if (!fs.existsSync(getComicsFolder)) {
                   fs.mkdirSync(getComicsFolder, { recursive: true });
               }
           } catch (mkdirErr: any) {}
-
-          let resolvedHoster: any = null;
 
           // GetComics links (the direct CDN or the Cloudflare-gated main server) are streamed by the
           // engine, which handles the warm-up/solver; the HosterEngine only resolves third-party
@@ -442,46 +453,56 @@ export const DownloadService = {
           // Only Mega reaches here — every other hoster is streamed by the engine above (which returns
           // or throws before this point). The Mega SDK stream stays in Node because its JS-only SDK
           // can't be driven from the Rust engine.
-          const megaFileNode = resolvedHoster?.megaFileNode;
-          if (!megaFileNode) throw new Error("Mega stream requested but no file node was resolved.");
-
-          const megaStream = megaFileNode.download();
-          const writer = fs.createWriteStream(partFilePath);
-          const totalLength = megaFileNode.size || 0;
-
-          let downloadedBytes = 0;
-          let lastUpdate = 0;
-
-          let stallTimer: NodeJS.Timeout | null = null;
-          const resetStallTimer = () => {
-              if (stallTimer) clearTimeout(stallTimer);
-              stallTimer = setTimeout(() => {
-                  Logger.log(`[Internal DL] Data stream stalled for 45 seconds. Killing connection to trigger retry.`, 'error');
-                  megaStream.destroy(new Error("Download stalled"));
-              }, 45000);
-          };
-
-          resetStallTimer();
-
-          const dataStream = megaStream;
-
-          dataStream.on('data', (chunk: Buffer) => {
-              resetStallTimer(); 
-              downloadedBytes += chunk.length;
-              if (totalLength) {
-                  const percent = Math.round((downloadedBytes / totalLength) * 100);
-                  const now = Date.now();
-                  if (percent % 5 === 0 && now - lastUpdate > 2000) {
-                      lastUpdate = now;
-                      prisma.request.update({ where: { id: requestId }, data: { progress: percent } }).catch(() => {});
+          for (let attempt = 0; attempt < 2; attempt++) {
+              const megaFileNode = resolvedHoster?.megaFileNode;
+              if (!megaFileNode) throw new Error("Mega stream requested but no file node was resolved.");
+              const megaStream = megaFileNode.download({ forceHttps: true });
+              // Each attempt starts a fresh decrypted file; pipeline closes the previous writer.
+              const writer = fs.createWriteStream(partFilePath);
+              const totalLength = megaFileNode.size || 0;
+              let downloadedBytes = 0;
+              let lastUpdate = 0;
+              let stallTimer: NodeJS.Timeout | null = null;
+              const resetStallTimer = () => {
+                  if (stallTimer) clearTimeout(stallTimer);
+                  stallTimer = setTimeout(() => megaStream.destroy(new Error('Download stalled')), 45000);
+              };
+              resetStallTimer();
+              megaStream.on('data', (chunk: Buffer) => {
+                  resetStallTimer();
+                  downloadedBytes += chunk.length;
+                  if (totalLength) {
+                      const percent = Math.round((downloadedBytes / totalLength) * 100);
+                      const now = Date.now();
+                      if (percent % 5 === 0 && now - lastUpdate > 2000) {
+                          lastUpdate = now;
+                          prisma.request.update({ where: { id: requestId }, data: { progress: percent } }).catch(() => {});
+                      }
                   }
+              });
+              try {
+                  await pipeline(megaStream, writer);
+                  break;
+              } catch (error) {
+                  if (isMegaSessionError(error) && resolvedHoster?.invalidateMegaSession) {
+                      resolvedHoster.invalidateMegaSession();
+                      if (attempt === 0) {
+                          if (stallTimer) clearTimeout(stallTimer);
+                          resolvedHoster.release?.();
+                          Logger.log('[Mega] Download session expired; resolving with a fresh login.', 'warn');
+                          resolvedHoster = await HosterEngine.resolveLink(url, 'mega');
+                          if (!resolvedHoster.success) throw new Error(resolvedHoster.error || 'MEGA login failed.');
+                          continue;
+                      }
+                  }
+                  const message = error instanceof Error ? error.message : '';
+                  if (/Bandwidth limit|EOVERQUOTA|\(-17\)/i.test(message)) {
+                      throw new Error('MEGA transfer allowance exhausted. Try another hoster or retry after the allowance resets.');
+                  }
+                  throw new Error(isMegaSessionError(error) ? 'MEGA session expired again. Try the download later.' : 'MEGA download failed. Try again later.');
+              } finally {
+                  if (stallTimer) clearTimeout(stallTimer);
               }
-          });
-
-          try {
-              await pipeline(dataStream, writer);
-          } finally {
-              if (stallTimer) clearTimeout(stallTimer); 
           }
 
           const stats = fs.statSync(partFilePath);
@@ -527,6 +548,8 @@ export const DownloadService = {
           });
           
           throw error;
+      } finally {
+          resolvedHoster?.release?.();
       }
   },
 

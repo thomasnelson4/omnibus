@@ -3,7 +3,10 @@
 // Deletes the ORIGINAL usenet download from the client's category folder (issue #198). Every
 // external-client import COPIES into the library — that's seed preservation for torrents, but for
 // NZBGet/SABnzbd it just strands the source file and its job folder forever. This helper removes
-// exactly the path the importer read from, and nothing else.
+// exactly the job path the importer resolved, and nothing else. For SAB history.storage this
+// is the final job directory, including sidecars and extraction subdirectories — not just the
+// individual archive copied into the library. Never infer a job directory by walking upward
+// from a bare file: its parent might be a shared category folder.
 //
 // Torrent clients (qbit/deluge) must never reach this — deleting their payload breaks seeding.
 // Callers gate on client type; the type check here is defense in depth, not the primary gate.

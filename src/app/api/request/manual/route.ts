@@ -58,6 +58,8 @@ export async function POST(request: NextRequest) {
             data: {
                 status: initialStatus,
                 activeDownloadName: searchResult?.title || name,
+                clientDownloadId: null,
+                downloadClientId: null,
                 imageUrl: image || undefined,
                 retryCount: 0, // Reset retry count for fresh search
                 failedLinks: "[]" // Reset the blocklist for manual override selections
@@ -187,7 +189,7 @@ export async function POST(request: NextRequest) {
                          Logger.log(`[Manual Request] Batch torrent already downloading (${trackingHash}). Queuing for batch extraction.`, 'info');
                          await prisma.request.update({
                              where: { id: targetReqId },
-                             data: { status: 'DOWNLOADING', activeDownloadName: searchResult.title, downloadLink: trackingHash, indexer: searchResult.indexer }
+                             data: { status: 'DOWNLOADING', activeDownloadName: searchResult.title, downloadLink: trackingHash, clientDownloadId: duplicateDownload.clientDownloadId, downloadClientId: duplicateDownload.downloadClientId, indexer: searchResult.indexer }
                          });
                          return NextResponse.json({ success: true, message: "Added to existing batch download queue." });
                     }
@@ -195,10 +197,10 @@ export async function POST(request: NextRequest) {
 
                 // File manga under its own category/label in the client (manga → second configured category).
                 const mangaSeries = await prisma.series.findFirst({ where: { metadataId: String(cvId), metadataSource: targetMetadataSource }, select: { isManga: true } });
-                await DownloadService.addDownload(client, searchResult.downloadUrl, searchResult.title, searchResult.seedTime || 0, searchResult.seedRatio || 0, mangaSeries?.isManga ?? false);
+                const submission = await DownloadService.addDownload(client, searchResult.downloadUrl, searchResult.title, searchResult.seedTime || 0, searchResult.seedRatio || 0, mangaSeries?.isManga ?? false);
                 await prisma.request.update({
                   where: { id: targetReqId },
-                  data: { downloadLink: trackingHash, indexer: searchResult.indexer }
+                  data: { downloadLink: trackingHash, clientDownloadId: submission?.downloadId || null, downloadClientId: client.id, indexer: searchResult.indexer }
                 });
             }
         } 

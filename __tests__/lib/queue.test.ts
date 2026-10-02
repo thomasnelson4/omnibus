@@ -652,4 +652,24 @@ describe('Cron: BullMQ Worker Router', () => {
             }));
         });
     });
+
+    it('stores the SAB job identity separately from the indexer release used for deduplication', async () => {
+        initWorker();
+        mocks.requestFindUnique.mockResolvedValue({ id: 'req_sab', volumeId: '0', failedLinks: '[]' });
+        mocks.systemSettingFindMany.mockResolvedValue([]);
+        mocks.requestFindFirst.mockResolvedValue(null);
+        mocks.downloadClientFindMany.mockResolvedValue([{ id: 'sab_1', name: 'SAB', type: 'sab', protocol: 'usenet' }]);
+        mocks.addDownload.mockResolvedValueOnce({ success: true, downloadId: 'SABnzbd_nzo_42' });
+        mocks.engineFetch.mockResolvedValueOnce({
+            ok: true, status: 200,
+            json: async () => ({ success: true, best_match: { title: 'Batman 001', protocol: 'usenet', downloadUrl: 'https://indexer.example/file.nzb', guid: 'release-guid', indexer: 'Indexer' } })
+        });
+        await mocks.workerCb.current({
+            id: 'job_sab', data: { type: 'SEARCH_AND_DOWNLOAD', requestId: 'req_sab', name: 'Batman #1', year: '2016', isManga: false, skipIndexers: false }, updateProgress: vi.fn()
+        });
+        expect(mocks.requestUpdate).toHaveBeenCalledWith({
+            where: { id: 'req_sab' },
+            data: expect.objectContaining({ downloadLink: 'release-guid', clientDownloadId: 'SABnzbd_nzo_42', downloadClientId: 'sab_1', status: 'DOWNLOADING' })
+        });
+    });
 });

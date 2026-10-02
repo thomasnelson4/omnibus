@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { resolveRemotePath } from '../../../src/lib/utils/path-resolver';
+import { resolveRemotePath, resolveClientPath } from '../../../src/lib/utils/path-resolver';
 import path from 'path';
 
 // 1. Hoist the mocks
@@ -20,6 +20,17 @@ vi.mock('../../../src/lib/logger', () => ({
 }));
 
 describe('Utility: Path Resolver', () => {
+
+    it('applies the submitting client mapping to an API-reported sorted destination', async () => {
+        expect(await resolveClientPath('/sab/complete/comics/Renamed Job', { remotePath: '/sab/complete', localPath: '/downloads' }))
+            .toBe(path.normalize('/downloads/comics/Renamed Job'));
+    });
+
+    it('does not map similarly prefixed sibling directories', async () => {
+        mocks.findUnique.mockResolvedValue({ value: JSON.stringify([{ remote: '/downloads', local: '/local' }]) });
+        expect(await resolveRemotePath('/downloads-other/job')).toBe('/downloads-other/job');
+        expect(await resolveClientPath('/sab-other/job', { remotePath: '/sab', localPath: '/local' })).toBe('/sab-other/job');
+    });
 
     it('should return the original path if no mappings exist in the database', async () => {
         mocks.findUnique.mockResolvedValue(null);

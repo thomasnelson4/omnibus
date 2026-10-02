@@ -4,7 +4,7 @@ import path from 'path';
 import { prisma } from '@/lib/db';
 import { DownloadService } from './download-clients';
 import { Logger } from './logger';
-import { resolveRemotePath } from './utils/path-resolver'; 
+import { resolveRemotePath, resolveClientPath } from './utils/path-resolver';
 import axios from 'axios';
 import { SystemNotifier } from './notifications';
 import { syncSeriesMetadata } from './metadata-fetcher'; 
@@ -120,7 +120,7 @@ export const Importer = {
     let sourcePath = "";
     let isFromClient = false;
     const downloadRoot = config.download_path || './downloads';
-    const trackingHash = req.downloadLink && !req.downloadLink.startsWith('http') ? req.downloadLink : null;
+    const trackingHash = req.clientDownloadId || (req.downloadLink && !req.downloadLink.startsWith('http') ? req.downloadLink : null);
 
     // Issue #198: usenet downloads are COPIED into the library (the torrent seed-preservation
     // path), stranding the original in the client's category folder. When the toggle is on and
@@ -141,28 +141,48 @@ export const Importer = {
 
     if (!sourcePath && trackingHash) {
       try {
-          const allActive = await DownloadService.getAllActiveDownloads();
-          const downloadItem = allActive.find((t: any) => t.id === trackingHash || t.name === req.activeDownloadName);
+          const allActive = await DownloadService.getAllActiveDownloads([trackingHash]);
+          const fromClient = (t: any) => !req.downloadClientId || t.clientId === req.downloadClientId;
+          const hasSabJobId = trackingHash.startsWith('SABnzbd_nzo_');
+          const downloadItem = allActive.find((t: any) => fromClient(t) && t.id === trackingHash)
+              || (!hasSabJobId && !req.clientDownloadId ? allActive.find((t: any) => fromClient(t) && t.name === req.activeDownloadName) : undefined);
           if (downloadItem) {
+              if (downloadItem.clientType === 'sab' && !downloadItem.isComplete) {
+                  Logger.log(`[Importer] SABnzbd job ${trackingHash} is still ${downloadItem.status}; waiting for post-processing to complete.`, 'info');
+                  return false;
+              }
               isFromClient = true;
               
               // Fetch the specific client to check if it has a custom Local Path override
               const clientConfig = await prisma.downloadClient.findFirst({
-                  where: { name: downloadItem.clientName }
+                  where: downloadItem.clientId ? { id: downloadItem.clientId } : { name: downloadItem.clientName }
               });
               
               const clientRoot = clientConfig?.localPath || downloadRoot;
-              const rawPath = path.join(clientRoot, downloadItem.name);
-              sourcePath = await resolveRemotePath(rawPath);
+              if (downloadItem.clientType === 'sab' && !downloadItem.contentPath) {
+                  Logger.log(`[Importer] SABnzbd job ${trackingHash} has no final storage path; leaving its source untouched.`, 'warn');
+                  return false;
+              }
+              // SAB's history.storage is the final job directory (after category routing/sorting).
+              // Keep this directory as sourcePath for cleanup; actualSourceFile below is only the
+              // individual archive copied into the library.
+              sourcePath = downloadItem.contentPath
+                  ? await resolveClientPath(downloadItem.contentPath, clientConfig || {})
+                  : await resolveRemotePath(path.join(clientRoot, downloadItem.name));
               sourceClientType = clientConfig?.type || null;
               sourceClientRoot = clientRoot;
 
-              Logger.log(`[Importer Debug] Using client root path: ${clientRoot} for ${downloadItem.name}`, 'debug');
+              Logger.log(`[Importer Debug] Using client download path: ${sourcePath} for ${downloadItem.name}`, 'debug');
           } else {
+              if (hasSabJobId || req.clientDownloadId) {
+                  Logger.log(`[Importer] Tracked client job ${trackingHash} was not found; waiting for its API-reported destination.`, 'warn');
+                  return false;
+              }
               Logger.log("[Importer] Download not found in active client list. Falling back to folder search.", "warn");
           }
       } catch (e: any) {
           Logger.log(`[Importer] Failed to fetch client info: ${e.message}`, "error");
+          if (req.clientDownloadId || trackingHash.startsWith('SABnzbd_nzo_')) return false;
       }
     }
     

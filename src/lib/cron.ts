@@ -10,7 +10,7 @@ import { getErrorMessage } from './utils/error';
 import { extractIssueNumber } from '@/lib/utils/issue-parser';
 import { JUNK_WORDS as junkWords } from '@/lib/utils/search-terms';
 import { deleteUsenetSource } from '@/lib/utils/usenet-cleanup';
-import { resolveRemotePath } from '@/lib/utils/path-resolver';
+import { resolveRemotePath, resolveClientPath } from '@/lib/utils/path-resolver';
 import path from 'path';
 
 const globalForCron = globalThis as unknown as { _cronInitialized: boolean };
@@ -88,7 +88,7 @@ export function initCronJobs() {
       // they sit DOWNLOADING forever. Mark them STALLED too — and terminal, since re-downloading a pack
       // that already failed three times is pointless — so the whole pack reflects the failure consistently.
       const deadLeads = await prisma.request.findMany({
-        where: { status: 'STALLED', retryCount: { gte: 3 }, downloadLink: { startsWith: 'http' } },
+        where: { status: 'STALLED', retryCount: { gte: 3 }, downloadLink: { startsWith: 'http' }, clientDownloadId: null },
         select: { downloadLink: true }
       });
       const deadLinks = [...new Set(deadLeads.map(r => r.downloadLink).filter((l): l is string => !!l))];
@@ -107,7 +107,7 @@ export function initCronJobs() {
         const retryDelayMinutes = parseInt(retryDelaySetting?.value || "5");
 
         for (const req of stalledRequests) {
-          if (req.downloadLink && req.downloadLink.startsWith('http')) {
+          if (!req.clientDownloadId && req.downloadLink && req.downloadLink.startsWith('http')) {
             const timeSinceLastUpdate = Date.now() - req.updatedAt.getTime();
             Logger.log(`[Cron Debug] Evaluating stalled request ${req.id}. Time since last update: ${Math.round(timeSinceLastUpdate / 60000)}m (Threshold: ${retryDelayMinutes}m)`, 'debug');
             
@@ -149,6 +149,7 @@ export function initCronJobs() {
       const activeDbRequests = await prisma.request.findMany({
           where: { 
               status: 'DOWNLOADING', 
+              clientDownloadId: null,
               downloadLink: { not: null },
               NOT: [
                   { downloadLink: "" },
@@ -177,13 +178,13 @@ export function initCronJobs() {
       }
       // -----------------------------------------------
 
-      const activeDownloads = await DownloadService.getAllActiveDownloads();
+      const downloadingRequests = await prisma.request.findMany({
+          where: { status: 'DOWNLOADING' }
+      });
+      const trackedIds = downloadingRequests.map(r => r.clientDownloadId || r.downloadLink || '').filter(Boolean);
+      const activeDownloads = await DownloadService.getAllActiveDownloads(trackedIds);
 
       if (activeDownloads.length > 0) {
-          const downloadingRequests = await prisma.request.findMany({
-              where: { status: 'DOWNLOADING' }
-          });
-
           const reqMetadataIds = [...new Set(downloadingRequests.map(r => r.volumeId).filter(id => id !== "0"))];
           const relevantSeries = await prisma.series.findMany({
               where: { metadataId: { in: reqMetadataIds } },
@@ -192,13 +193,15 @@ export function initCronJobs() {
           const seriesYearMap = new Map(relevantSeries.map(s => [s.metadataId, s.year.toString()]));
 
           for (const torrent of activeDownloads) {
-              let match = downloadingRequests.find(r => r.downloadLink && r.downloadLink.toLowerCase() === torrent.id.toLowerCase());
+              const sameClient = (r: typeof downloadingRequests[number]) => !r.downloadClientId || r.downloadClientId === torrent.clientId;
+              const isUntracked = (r: typeof downloadingRequests[number]) => !r.clientDownloadId && !r.downloadLink?.startsWith('SABnzbd_nzo_');
+              let match = downloadingRequests.find(r => sameClient(r) && (r.clientDownloadId || r.downloadLink)?.toLowerCase() === torrent.id.toLowerCase());
               
-              if (!match) match = downloadingRequests.find(r => r.activeDownloadName === torrent.name);
+              if (!match) match = downloadingRequests.find(r => sameClient(r) && isUntracked(r) && r.activeDownloadName === torrent.name);
               
               if (!match) {
                   match = downloadingRequests.find(r => {
-                      if (!r.activeDownloadName) return false;
+                      if (!sameClient(r) || !isUntracked(r) || !r.activeDownloadName) return false;
                       
                       const reqNameLower = r.activeDownloadName.toLowerCase();
                       const torNameLower = torrent.name.toLowerCase();
@@ -257,7 +260,14 @@ export function initCronJobs() {
               }
               
               if (match) {
-                  if (match.downloadLink !== torrent.id || match.activeDownloadName !== torrent.name) {
+                  if (torrent.clientType === 'sab') {
+                      await prisma.request.update({
+                          where: { id: match.id },
+                          data: { clientDownloadId: torrent.id, downloadClientId: torrent.clientId, activeDownloadName: torrent.name }
+                      });
+                      match.clientDownloadId = torrent.id;
+                      match.downloadClientId = torrent.clientId;
+                  } else if (match.downloadLink !== torrent.id || match.activeDownloadName !== torrent.name) {
                       await prisma.request.update({
                           where: { id: match.id },
                           data: { activeDownloadName: torrent.name, downloadLink: torrent.id }
@@ -276,7 +286,7 @@ export function initCronJobs() {
                       Logger.log(`[Cron] Client reported download failure for: ${torrent.name}. Executing try-next-release fallback...`, 'warn');
                       
                       // 1. Wipe the failed job from the external client
-                      const clientConfig = await prisma.downloadClient.findFirst({ where: { name: torrent.clientName } });
+                      const clientConfig = await prisma.downloadClient.findFirst({ where: torrent.clientId ? { id: torrent.clientId } : { name: torrent.clientName } });
                       if (clientConfig) {
                           await DownloadService.removeDownload(clientConfig, torrent.id).catch(() => {});
 
@@ -290,7 +300,9 @@ export function initCronJobs() {
                                   const dlRoot = clientConfig.localPath
                                       || (await prisma.systemSetting.findUnique({ where: { key: 'download_path' } }))?.value
                                       || './downloads';
-                                  const failedSource = await resolveRemotePath(path.join(dlRoot, torrent.name));
+                                  const failedSource = torrent.contentPath
+                                      ? await resolveClientPath(torrent.contentPath, clientConfig)
+                                      : await resolveRemotePath(path.join(dlRoot, torrent.name));
                                   await deleteUsenetSource({ clientType: clientConfig.type, clientRoot: dlRoot, sourcePath: failedSource, reason: 'failed' });
                               } catch (cleanupErr) {
                                   Logger.log(`[Cron] Failed-download cleanup skipped: ${getErrorMessage(cleanupErr)}`, 'debug');
@@ -313,6 +325,8 @@ export function initCronJobs() {
                               data: {
                                   status: 'PENDING',
                                   downloadLink: null,
+                                  clientDownloadId: null,
+                                  downloadClientId: null,
                                   retryCount: (req.retryCount || 0) + 1,
                                   failedLinks: JSON.stringify(currentFailed)
                               } as any
@@ -361,7 +375,7 @@ export function initCronJobs() {
                       continue;
                   }
 
-                  if (parseFloat(torrent.progress) >= 100) {
+                  if (torrent.isComplete === true || (torrent.isComplete === undefined && parseFloat(torrent.progress) >= 100)) {
                       Logger.log(`[Cron] Client download completed: ${torrent.name}. Triggering importer...`, 'info');
                       
                       const index = downloadingRequests.findIndex(r => r.id === match!.id);

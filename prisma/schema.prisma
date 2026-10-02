@@ -92,6 +92,9 @@ model Request {
   retryCount         Int      @default(0)
   indexer            String?
   downloadLink       String?
+  // Client job identity stays separate from the indexer release link used for batch deduplication.
+  clientDownloadId   String?
+  downloadClientId   String?
   activeDownloadName String?
   failedLinks        String? @default("[]")
   // Set when an admin dismisses/snoozes the System Health warning for this request. Snoozed items are

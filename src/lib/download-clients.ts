@@ -92,6 +92,7 @@ export async function qbitAuthHeaders(
 
 export const DownloadService = {
   async addDownload(rawClient: any, downloadUrl: string, title: string, seedTimeLimit: number, seedRatio: number = 0, isManga: boolean = false) {
+    let downloadId: string | undefined;
     // Credentials are encrypted at rest; decrypt into a local copy before use.
     const client = { ...rawClient, pass: await decryptSecret(rawClient.pass), apiKey: await decryptSecret(rawClient.apiKey) };
     const cleanUrl = client.url.replace(/\/$/, '');
@@ -189,6 +190,14 @@ export const DownloadService = {
         }
       }
       else if (client.type === 'sab') {
+          const readJobId = (data: any): string => {
+              const id = data?.nzo_ids?.[0];
+              if (data?.status !== true || typeof id !== 'string' || !id.trim()) {
+                  throw new Error(`SABnzbd rejected the NZB: ${data?.error || 'no job ID returned'}`);
+              }
+              return id;
+          };
+          let result;
           if (fileBuffer) {
               const safeName = (title || "download").replace(/[\\/:*?"<>|]/g, "_").slice(0, 200);
               const form = new FormData();
@@ -200,17 +209,18 @@ export const DownloadService = {
               form.append("name", fileBuffer, { filename: `${safeName}.nzb`, contentType: 'application/x-nzb' });
 
               try {
-                  await axios.post(`${cleanUrl}/api`, form, {
+                  result = await axios.post(`${cleanUrl}/api`, form, {
                       ...baseConfig,
                       headers: { ...baseConfig.headers, ...form.getHeaders() }
                   });
               } catch (e) {
                   Logger.log(`[SABnzbd] addfile failed, falling back to addurl...`, 'warn');
-                  await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
+                  result = await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
               }
           } else {
-              await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
+              result = await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
           }
+          downloadId = readJobId(result.data);
       }
       else if (client.type === 'nzbget') {
           const auth = Buffer.from(`${client.user}:${client.pass}`).toString('base64');
@@ -228,7 +238,7 @@ export const DownloadService = {
       }
 
       Logger.log(`[${client.type.toUpperCase()}] SUCCESS: Added ${title}`, 'success');
-      return { success: true };
+      return { success: true, downloadId };
     } catch (error: unknown) {
       Logger.log(`[Download Service] Failed: ${getErrorMessage(error)}`, 'error');
       throw error;
@@ -298,6 +308,12 @@ export const DownloadService = {
       if (diskSetting?.value === 'true') {
           throw new Error("Download aborted: Disk Space is Critically Full (< 2GB).");
       }
+
+      // A fallback to a direct download must no longer resolve the previous SAB job.
+      await prisma.request.update({
+          where: { id: requestId },
+          data: { clientDownloadId: null, downloadClientId: null }
+      });
 
       const { Importer } = await import('./importer');
       
@@ -514,7 +530,7 @@ export const DownloadService = {
       }
   },
 
-  async getAllActiveDownloads() {
+  async getAllActiveDownloads(trackedIds: string[] = []) {
     const clients = await prisma.downloadClient.findMany();
     if (clients.length === 0) return [];
     
@@ -584,18 +600,44 @@ export const DownloadService = {
             if (queueRes.data.queue?.slots) {
                 const validSlots = queueRes.data.queue.slots.filter((s: any) => isAllowedCategory(s.cat));
                 Logger.log(`[Download Service Debug] [SABnzbd] Fetched ${queueRes.data.queue.slots.length} queue items. ${validSlots.length} matched allowed categories.`, 'debug');
-                downloads.push(...validSlots.map((s: any) => ({ id: s.nzo_id, name: s.filename, progress: s.percentage, status: s.status, clientName: client.name, size: s.size })));
+                downloads.push(...validSlots.map((s: any) => ({ id: s.nzo_id, name: s.filename, progress: s.percentage, status: s.status, clientName: client.name, clientId: client.id, clientType: 'sab', isComplete: false, size: s.size })));
             }
+            const appendHistory = (slots: any[]) => {
+                for (const s of slots) {
+                    // Download progress can reach 100 while repair, extraction, moving, or scripts
+                    // are still running. Only a terminal history entry has a usable final path.
+                    const isComplete = s.status === 'Completed' && !s.loaded;
+                    const item = {
+                        id: s.nzo_id, name: s.name, progress: isComplete ? '100.0' : '0.0',
+                        status: s.status, clientName: client.name, clientId: client.id, clientType: 'sab',
+                        contentPath: typeof s.storage === 'string' ? s.storage.trim() : '',
+                        isComplete, size: s.size
+                    };
+                    const existing = downloads.findIndex(d => d.id === item.id);
+                    if (existing >= 0) downloads[existing] = item;
+                    else downloads.push(item);
+                }
+            };
             try {
                 const historyRes = await axios.get(`${cleanUrl}/api`, { params: { mode: 'history', limit: 20, apikey: client.apiKey, output: 'json' }, headers: baseHeaders, timeout: 15000 });
                 if (historyRes.data.history?.slots) {
                     const validHistory = historyRes.data.history.slots.filter((s: any) => isAllowedCategory(s.category));
                     Logger.log(`[Download Service Debug] [SABnzbd] Fetched ${historyRes.data.history.slots.length} history items. ${validHistory.length} matched allowed categories.`, 'debug');
-                    downloads.push(...validHistory.map((s: any) => ({
-                        id: s.nzo_id, name: s.name, progress: s.status === 'Completed' ? "100.0" : "0.0", status: s.status, clientName: client.name, size: s.size
-                    })));
+                    appendHistory(validHistory);
                 }
-            } catch (e) { }
+                // A busy SAB instance can push a job out of the dashboard's recent history page.
+                // Look up tracked jobs by ID rather than guessing their release name on disk.
+                const missingIds = [...new Set(trackedIds.filter(id => id.startsWith('SABnzbd_nzo_') && !downloads.some(d => d.id === id)))];
+                if (missingIds.length) {
+                    const trackedHistory = await axios.get(`${cleanUrl}/api`, {
+                        params: { mode: 'history', nzo_ids: missingIds.join(','), limit: missingIds.length, apikey: client.apiKey, output: 'json' },
+                        headers: baseHeaders, timeout: 15000
+                    });
+                    appendHistory((trackedHistory.data.history?.slots || []).filter((s: any) => missingIds.includes(s.nzo_id)));
+                }
+            } catch (e) {
+                Logger.log(`[Download Service] Could not read SABnzbd history from "${client.name}": ${getErrorMessage(e)}`, 'warn');
+            }
         }
         else if (client.type === 'nzbget') {
             const auth = Buffer.from(`${client.user}:${client.pass}`).toString('base64');
@@ -619,7 +661,7 @@ export const DownloadService = {
           // the importer/cron lookup fail later as a generic "not found" rather than an auth problem.
           Logger.log(`[Download Service] Could not list active downloads from "${rawClient?.name || 'client'}": ${getErrorMessage(err)}`, 'warn');
       }
-      return downloads;
+      return downloads.map(item => ({ ...item, clientId: client.id, clientType: client.type }));
     }));
     return perClient.flatMap(r => r.status === 'fulfilled' ? r.value : []);
   }

@@ -107,7 +107,7 @@ export function DownloadsTab({ s }: { s: SettingsBag }) {
             <Card className="shadow-sm border-border bg-background">
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2 text-foreground"><Server className="w-5 h-5 text-primary" /> Direct Downloads & File Hosters</CardTitle>
-                    <CardDescription className="text-muted-foreground">Manage priority and add premium credentials for third-party file hosters (like MediaFire or Mega).</CardDescription>
+                    <CardDescription className="text-muted-foreground">Manage download host priority and supported account credentials.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-10">
 
@@ -393,7 +393,7 @@ export function DownloadsTab({ s }: { s: SettingsBag }) {
                     {/* Hoster Accounts */}
                     <div className="space-y-4">
                         <h3 className="text-lg font-bold border-b border-border pb-2 text-foreground">Hoster Accounts (Optional)</h3>
-                        <p className="text-xs text-muted-foreground mb-4">Add your free or premium credentials to bypass bandwidth limits.</p>
+                        <p className="text-xs text-muted-foreground mb-4">Use your MEGA account&apos;s transfer allowance or configure supported API-key integrations.</p>
                         
                         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
                             {['mediafire', 'mega', 'pixeldrain', 'rootz', 'vikingfile', 'terabox'].map(type => {
@@ -420,6 +420,7 @@ export function DownloadsTab({ s }: { s: SettingsBag }) {
                                                     <Badge variant="secondary" className="bg-primary/10 text-primary text-[10px]">{hoster.username || "API Key Linked"}</Badge>
                                                 </div>
                                                 <div className="flex gap-1 shrink-0">
+                                                    {hoster.hoster === 'mega' && <Button variant="ghost" size="icon" aria-label="Edit MEGA account" className="h-8 w-8" onClick={() => openHosterSetup('mega')}><Settings className="h-4 w-4" /></Button>}
                                                     <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500" onClick={() => deleteHoster(hoster.id)}><Trash2 className="h-4 w-4"/></Button>
                                                 </div>
                                             </div>

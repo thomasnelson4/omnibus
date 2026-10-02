@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { POST } from '@/app/api/admin/config/route';
 import { loggerLog, auditLog } from '../helpers/setup-global';
+import { encryptSecret } from '@/lib/encryption';
 
 // Settings-save response contract (2026-07-28 field repro on the dev box): once the settings
 // transaction commits, NOTHING after it may stall or fail the response. With Redis down, the old
@@ -90,6 +91,37 @@ describe('Settings save: the response never waits on (or fails from) post-commit
         expect(res.status).toBe(200);
         expect(mocks.settingUpsert).toHaveBeenCalled();
         expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('audit table locked'), 'error');
+    });
+
+    it.each([
+        { username: 'reader@example.com', password: '' },
+        { username: '', password: 'password' },
+        { username: 42, password: 'password' },
+    ])('rejects incomplete or malformed active MEGA credentials before saving (%j)', async fields => {
+        const response = await POST(mockReq({ hosterAccounts: [{ id: 'mega-1', hoster: 'mega', ...fields }] }));
+        expect(response.status).toBe(400);
+        expect(mocks.transaction).not.toHaveBeenCalled();
+    });
+
+    it('encrypts a new MEGA password before persisting it', async () => {
+        const upsert = vi.fn();
+        mocks.transaction.mockImplementationOnce(async fn => fn({ hosterAccount: { findMany: vi.fn().mockResolvedValue([]), upsert } }));
+        vi.mocked(encryptSecret).mockResolvedValueOnce('enc:v2:encrypted-password');
+        const response = await POST(mockReq({ hosterAccounts: [{ id: 'mega-1', hoster: 'mega', username: 'reader@example.com', password: 'password' }] }));
+        expect(response.status).toBe(200);
+        expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ update: expect.objectContaining({ password: 'enc:v2:encrypted-password' }) }));
+    });
+
+    it('preserves masked passwords and allows explicit clearing to anonymous mode', async () => {
+        for (const fields of [{ username: 'reader@example.com', password: '********' }, { username: '', password: '' }]) {
+            const upsert = vi.fn();
+            mocks.transaction.mockImplementationOnce(async fn => fn({ hosterAccount: { findMany: vi.fn().mockResolvedValue([]), upsert } }));
+            const response = await POST(mockReq({ hosterAccounts: [{ id: 'mega-1', hoster: 'mega', ...fields }] }));
+            expect(response.status).toBe(200);
+            const update = upsert.mock.calls[0][0].update;
+            if (fields.password) expect(update).not.toHaveProperty('password');
+            else expect(update.password).toBe('');
+        }
     });
 
     it('saves normalized fallback mirrors and passes them to the automation connection test', async () => {

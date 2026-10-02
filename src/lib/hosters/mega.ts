@@ -1,70 +1,75 @@
-// src/lib/hosters/mega.ts
 import { File } from 'megajs';
 import { Logger } from '../logger';
+import { acquireMegaSession, isMegaSessionError, MegaLoginError, type MegaAccount } from './mega-session';
+import type { HosterResolveResult } from './index';
 
-export async function resolveMega(url: string, account?: any) {
+export function isMegaLink(url: string): boolean {
     try {
-        Logger.log(`[Mega] Initializing decryption for: ${url}`, 'info');
-        Logger.log(`[Mega Debug] Attempting to load Mega attributes...`, 'debug');
-        
-        const node = File.fromURL(url);
-        await node.loadAttributes();
+        const parsed = new URL(url);
+        return (parsed.protocol === 'https:' || parsed.protocol === 'http:')
+            && (parsed.hostname === 'mega.nz' || parsed.hostname === 'mega.co.nz');
+    } catch {
+        return false;
+    }
+}
 
-        Logger.log(`[Mega Debug] Decryption successful. Node Name: "${node.name}", Is Directory: ${node.directory}`, 'debug');
-
-        // If it's a single file, just return its node stream
-        if (!node.directory) {
-            Logger.log(`[Mega Debug] Target is a direct file. Proceeding with stream.`, 'debug');
-            return { 
-                success: true, 
-                isMegaStream: true,
-                megaFileNode: node,
-                fileName: node.name
-            };
+export async function resolveMega(url: string, account?: MegaAccount | null): Promise<HosterResolveResult> {
+    let lease: Awaited<ReturnType<typeof acquireMegaSession>> | undefined;
+    try {
+        // Validate before logging in. File.fromURL's errors may include the URL's key.
+        File.fromURL(url);
+        const email = account?.isActive !== false ? account?.username?.trim() : '';
+        const password = account?.isActive !== false ? account?.password : '';
+        if (!!email !== !!password) {
+            return { success: false, error: 'Enter both a MEGA email and password, or clear both for anonymous downloads.' };
         }
-
-        // If it's a folder, we need to search inside it for the comic archive
-        let targetFile: any = null;
-        let largestSize = 0;
-
-        Logger.log(`[Mega Debug] Scanning decrypted folder contents (${node.children?.length || 0} items)...`, 'debug');
-
-        for (const child of node.children || []) {
-            if (child.directory) continue;
-            
-            const ext = child.name?.toLowerCase().split('.').pop();
-            if (['cbz', 'cbr', 'zip', 'rar'].includes(ext || '')) {
-                // Fallback to 0 if the size is undefined to satisfy TypeScript
-                const childSize = child.size || 0;
-
-                Logger.log(`[Mega Debug] Evaluated child file: "${child.name}" | Ext: .${ext} | Size: ${Math.round(childSize/1024/1024)}MB`, 'debug');
-                
-                // Grab the largest valid archive in the folder
-                if (childSize > largestSize) {
-                    largestSize = childSize;
-                    targetFile = child;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (email && password && account) {
+                try {
+                    lease = await acquireMegaSession(account);
+                } catch (error) {
+                    if (!(error instanceof MegaLoginError) || !error.allowAnonymous) throw error;
+                    Logger.log(`[Mega] ${error.message} Trying anonymous download.`, 'warn');
                 }
             }
+            try {
+                Logger.log(`[Mega] Loading shared link (${lease ? 'authenticated' : 'anonymous'}).`, 'info');
+                const root = File.fromURL(url, lease ? { api: lease.api } : undefined);
+                const node = await root.loadAttributes();
+                let target: File | undefined = node;
+                if (node.directory) {
+                    target = (node.children || [])
+                        .filter(child => !child.directory && /\.(cbz|cbr|zip|rar)$/i.test(child.name || ''))
+                        .sort((a, b) => (b.size || 0) - (a.size || 0))[0];
+                }
+                if (!target) throw new Error('No comic archives found');
+                // megajs 1.3.10 creates folder children with the anonymous global API.
+                target.api = root.api;
+                return {
+                    success: true,
+                    isMegaStream: true,
+                    megaFileNode: target,
+                    fileName: target.name || undefined,
+                    release: lease?.release,
+                    invalidateMegaSession: lease?.invalidate,
+                };
+            } catch (error) {
+                lease?.release();
+                if (!lease || !isMegaSessionError(error)) throw error;
+                lease.invalidate();
+                lease = undefined;
+                if (attempt === 1) throw error;
+                Logger.log('[Mega] Session expired; logging in again.', 'warn');
+            }
         }
-
-        if (!targetFile) {
-            Logger.log(`[Mega Debug] Failed to find a valid comic archive inside the Mega folder.`, 'debug');
-            return { success: false, error: "No comic files (.cbz, .cbr) found inside the Mega folder." };
-        }
-
-        Logger.log(`[Mega] Found file inside decrypted folder: ${targetFile.name}`, 'info');
-        Logger.log(`[Mega Debug] Selected target file: ${targetFile.name} (${Math.round(largestSize/1024/1024)}MB)`, 'debug');
-        
-        return { 
-            success: true, 
-            isMegaStream: true,
-            megaFileNode: targetFile,
-            fileName: targetFile.name
-        };
-
-    } catch (error: any) {
-        // --- NEW: Added debug trace for decryption crashes ---
-        Logger.log(`[Mega Debug] Uncaught exception during decryption: ${error.message}`, 'debug');
-        return { success: false, error: `Mega Error: ${error.message}` };
+        throw new Error('MEGA resolution failed');
+    } catch (error) {
+        lease?.release();
+        const message = error instanceof MegaLoginError ? error.message
+            : isMegaSessionError(error) ? 'MEGA session expired again. Try the download later.'
+            : error instanceof Error && error.message === 'No comic archives found' ? 'No comic files (.cbz, .cbr, .zip, .rar) found inside the MEGA folder.'
+            : 'Could not load the MEGA file or folder. Check the link and its decryption key, or try again later.';
+        Logger.log(`[Mega] ${message}`, 'warn');
+        return { success: false, error: message };
     }
 }

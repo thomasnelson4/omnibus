@@ -22,6 +22,7 @@ import {
 } from "lucide-react"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { RECOMMENDED_PUBLISHERS, RECOMMENDED_KEYWORDS } from "@/lib/filter-defaults"
+import { MegaAccountFields } from "@/components/mega-account-fields"
 
 const DISCORD_EVENTS = [
   { id: "pending_request", label: "Pending Request", desc: "Includes requester username, cover image, and synopsis." },
@@ -265,7 +266,7 @@ export default function SetupWizard() {
 
   // --- Hoster Methods ---
   const openHosterSetup = (hosterName: string) => {
-      setEditingHoster({
+      setEditingHoster(configuredHosters.find((account: any) => account.hoster === hosterName) || {
           id: `tmp_${Math.random().toString(36).substr(2, 9)}`,
           name: hosterDisplayNames[hosterName] || hosterName,
           hoster: hosterName,
@@ -277,6 +278,10 @@ export default function SetupWizard() {
 
   const saveHosterInState = () => {
       if (!editingHoster) return;
+      if (editingHoster.hoster === 'mega' && editingHoster.isActive !== false && !!editingHoster.username?.trim() !== !!editingHoster.password) {
+          toast({ title: "Incomplete MEGA Account", description: "Enter both an email and password, or clear both for anonymous downloads.", variant: "destructive" });
+          return;
+      }
       setConfiguredHosters(prev => {
           const filtered = prev.filter(c => c.id !== editingHoster.id);
           return [...filtered, editingHoster];
@@ -817,7 +822,7 @@ export default function SetupWizard() {
                 <div className="space-y-6 animate-in fade-in slide-in-from-right-4">
                     <div>
                         <h2 className="text-2xl font-bold flex items-center gap-2 text-foreground"><Server className="w-6 h-6 text-indigo-500"/> File Hosters (Optional)</h2>
-                        <p className="text-muted-foreground mt-1">Add credentials for third-party file hosters (like MediaFire or Mega) to bypass bandwidth limits on direct downloads.</p>
+                        <p className="text-muted-foreground mt-1">Use your MEGA account&apos;s transfer allowance or configure supported API-key integrations.</p>
                     </div>
 
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
@@ -843,6 +848,7 @@ export default function SetupWizard() {
                                             <Badge variant="secondary" className="bg-primary/10 text-primary text-[10px]">{hoster.username || "API Key Linked"}</Badge>
                                         </div>
                                         <div className="flex gap-1 shrink-0">
+                                            {hoster.hoster === 'mega' && <Button variant="ghost" size="icon" aria-label="Edit MEGA account" className="h-8 w-8" onClick={() => openHosterSetup('mega')}><Settings2 className="h-4 w-4" /></Button>}
                                             <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500" onClick={() => deleteHoster(hoster.id)}><Trash2 className="h-4 w-4"/></Button>
                                         </div>
                                     </div>
@@ -1328,6 +1334,8 @@ export default function SetupWizard() {
             <DialogHeader><DialogTitle className="text-foreground">Configure {editingHoster?.name}</DialogTitle></DialogHeader>
             {editingHoster && (
                 <div className="grid gap-4 py-4">
+                    {editingHoster.hoster === 'mega' ? <MegaAccountFields account={editingHoster}
+                        onChange={fields => setEditingHoster({ ...editingHoster, ...fields })} /> : <>
                     <div className="grid gap-2">
                         <Label className="text-foreground font-semibold">Account Username (Optional)</Label>
                         <Input value={editingHoster.username || ""} onChange={e => setEditingHoster({...editingHoster, username: e.target.value})} placeholder="email@example.com" className="h-12 sm:h-10 bg-muted/20 border-border text-foreground" />
@@ -1340,6 +1348,7 @@ export default function SetupWizard() {
                         <Label className="text-foreground font-semibold">API / Session Key (Optional)</Label>
                         <Input type="password" value={editingHoster.apiKey || ""} onChange={e => setEditingHoster({...editingHoster, apiKey: e.target.value})} className="h-12 sm:h-10 bg-muted/20 border-border text-foreground" />
                     </div>
+                    </>}
                 </div>
             )}
             <DialogFooter className="gap-2 sm:gap-0">

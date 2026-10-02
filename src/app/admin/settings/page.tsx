@@ -30,6 +30,7 @@ import { DiscoveryTab } from "./tabs/discovery-tab"
 import { NotificationsTab } from "./tabs/notifications-tab"
 import { AccessSecurityTab } from "./tabs/access-security-tab"
 import { SystemTab } from "./tabs/system-tab"
+import { MegaAccountFields } from "@/components/mega-account-fields"
 
 import type { LibraryConfig, IndexerConfig, CustomHeader, AcronymConfig, ScoringRule, ClientConfig, WebhookConfig, HosterAccountConfig } from "./tabs/shared"
 
@@ -608,7 +609,7 @@ export default function SettingsPage() {
   };
 
   const openHosterSetup = (hosterName: string) => {
-      setEditingHoster({
+      setEditingHoster(configuredHosters.find(account => account.hoster === hosterName) || {
           id: `tmp_${Math.random().toString(36).substr(2, 9)}`,
           name: hosterDisplayNames[hosterName] || hosterName,
           hoster: hosterName,
@@ -620,6 +621,10 @@ export default function SettingsPage() {
 
   const saveHosterInState = () => {
       if (!editingHoster) return;
+      if (editingHoster.hoster === 'mega' && editingHoster.isActive !== false && !!editingHoster.username?.trim() !== !!editingHoster.password) {
+          toast({ title: "Incomplete MEGA Account", description: "Enter both an email and password, or clear both for anonymous downloads.", variant: "destructive" });
+          return;
+      }
       setConfiguredHosters(prev => {
           const filtered = prev.filter(c => c.id !== editingHoster.id);
           return [...filtered, editingHoster];
@@ -936,6 +941,8 @@ export default function SettingsPage() {
             <DialogHeader><DialogTitle className="text-foreground">Configure {editingHoster?.name}</DialogTitle></DialogHeader>
             {editingHoster && (
                 <div className="grid gap-4 py-4">
+                    {editingHoster.hoster === 'mega' ? <MegaAccountFields account={editingHoster}
+                        onChange={fields => setEditingHoster({ ...editingHoster, ...fields })} /> : <>
                     <div className="grid gap-2">
                         <Label className="text-foreground font-semibold">API Key (Optional)</Label>
                         <Input type="password" value={editingHoster.apiKey || ""} onChange={e => setEditingHoster({...editingHoster, apiKey: e.target.value})} placeholder="Paste your API key" className="h-12 sm:h-10 bg-muted/20 border-border text-foreground" />
@@ -945,6 +952,7 @@ export default function SettingsPage() {
                             ? <>An API key authenticates with <strong>{editingHoster.name}</strong> — it bypasses guest bandwidth limits (Pixeldrain) or enables automated downloads (Anna&apos;s Archive member key). Leave blank for anonymous downloads.</>
                             : <><strong>{editingHoster.name}</strong> doesn&apos;t use credentials in Omnibus — downloads are anonymous, so this field has no effect. Only <strong>Pixeldrain</strong> and <strong>Anna&apos;s Archive</strong> currently use an API key.</>}
                     </p>
+                    </>}
                 </div>
             )}
             <DialogFooter className="gap-2 sm:gap-0">

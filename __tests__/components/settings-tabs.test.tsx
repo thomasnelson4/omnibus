@@ -122,6 +122,13 @@ describe('Settings tabs (Phase 1 reorganization)', () => {
         expect(screen.getByText(/Flag stalled requests/i)).toBeInTheDocument();
     });
 
+    it('lets an administrator edit an already configured MEGA account', () => {
+        const bag = mkBag({ configuredHosters: [{ id: 'mega-1', hoster: 'mega', name: 'Mega', username: 'reader@example.com', isActive: true }] });
+        render(<DownloadsTab s={bag} />);
+        fireEvent.click(screen.getByRole('button', { name: 'Edit MEGA account' }));
+        expect(bag.openHosterSetup).toHaveBeenCalledWith('mega');
+    });
+
     it('DiscoveryTab unifies the manga story: visibility, request gate, and detection lists', () => {
         render(<DiscoveryTab s={mkBag()} />);
         expect(screen.getByText(/Manga Visibility/i)).toBeInTheDocument();

@@ -7,11 +7,15 @@ import { loggerLog } from '../helpers/setup-global';
 const mocks = vi.hoisted(() => ({
     findFirstHoster: vi.fn(),
     log: vi.fn(),
+    decrypt: vi.fn(async value => value),
+    resolveMega: vi.fn(),
     findMirrorSettings: vi.fn().mockResolvedValue([]),
 }));
 
 // 2. Mock Axios and Database
 vi.mock('axios');
+vi.mock('@/lib/encryption', () => ({ decryptSecret: mocks.decrypt }));
+vi.mock('@/lib/hosters/mega', () => ({ resolveMega: mocks.resolveMega }));
 vi.mock('@/lib/db', () => ({
     prisma: {
         hosterAccount: { findFirst: mocks.findFirstHoster },
@@ -20,6 +24,29 @@ vi.mock('@/lib/db', () => ({
 }));
 
 describe('Download Pipeline: Hoster Engine', () => {
+
+    it('decrypts the saved MEGA password without mutating the stored account', async () => {
+        const saved = { id: 'mega-1', username: 'reader@example.com', password: 'enc:password', apiKey: 'unused-legacy-key', isActive: true };
+        mocks.findFirstHoster.mockResolvedValueOnce(saved);
+        mocks.decrypt.mockResolvedValueOnce('password');
+        mocks.resolveMega.mockResolvedValueOnce({ success: true, isMegaStream: true });
+        await HosterEngine.resolveLink('https://mega.nz/file/id#key', 'mega');
+        expect(mocks.findFirstHoster).toHaveBeenCalledWith({
+            where: { hoster: 'mega', isActive: true }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        });
+        expect(mocks.resolveMega).toHaveBeenCalledWith('https://mega.nz/file/id#key', expect.objectContaining({ password: 'password', apiKey: null }));
+        expect(saved.password).toBe('enc:password');
+    });
+
+    it('contains an unreadable MEGA password without exposing its error details', async () => {
+        mocks.findFirstHoster.mockResolvedValueOnce({ id: 'mega-1', password: 'enc:password' });
+        mocks.decrypt.mockRejectedValueOnce(new Error('private-password'));
+        const result = await HosterEngine.resolveLink('https://mega.nz/file/id#key', 'mega');
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Re-enter');
+        expect(JSON.stringify([result, loggerLog.mock.calls])).not.toContain('private-password');
+        expect(mocks.resolveMega).not.toHaveBeenCalled();
+    });
 
     it('should resolve Pixeldrain links, attach Premium API headers, and trace debug logs', async () => {
         mocks.findFirstHoster.mockResolvedValueOnce({ apiKey: 'premium_key_123', isActive: true });

@@ -17,7 +17,7 @@ import Link from "next/link"
 import { Logger } from "@/lib/logger"
 import { getErrorMessage } from "@/lib/utils/error"
 import { extractIssueNumber } from "@/lib/utils/issue-parser"
-import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName, pickSuggestion } from "@/lib/utils/smart-match-search"
+import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName } from "@/lib/utils/smart-match-search"
 import SmartMatchMetadataDialog, { type SmartMatchOverride, buildFolderPreview, shouldEmbedIssueCover, COMIC_INFO_DEFAULT_KEYS } from "@/components/smart-match-metadata-dialog"
 import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
 import { AttachLocalCollectedDialog } from "@/components/attach-local-collected-dialog"
@@ -25,36 +25,14 @@ import { BookMarked } from "lucide-react"
 import SmartMatchBoundIssue from "@/components/smart-match-bound-issue"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 
-// Auto-scan results (the ComicVine/Metron match suggestions) are kept in sessionStorage so a page
-// refresh or navigate-away-and-back restores them instead of re-running the scan. The cache is
-// provider-scoped and shares the 12h TTL of the server-side /api/search cache so client and server
-// expire in lockstep. sessionStorage (not localStorage) clears on tab close, which matches the
-// volatile nature of a matching session.
-const SCAN_CACHE_PREFIX = 'omnibus-smartmatch-suggestions';
-const SCAN_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-
-function readScanCache(provider: string): Record<string, any> {
+// Matching decisions live on the server and are revalidated before acceptance.
+// Remove legacy suggestion caches so a page refresh never restores a stale bulk decision.
+function clearLegacyScanCache() {
     try {
-        const raw = sessionStorage.getItem(`${SCAN_CACHE_PREFIX}-${provider}`);
-        if (!raw) return {};
-        const env = JSON.parse(raw);
-        if (!env || typeof env.ts !== 'number' || Date.now() - env.ts > SCAN_CACHE_TTL_MS) {
-            sessionStorage.removeItem(`${SCAN_CACHE_PREFIX}-${provider}`);
-            return {};
+        for (let i = sessionStorage.length - 1; i >= 0; i--) {
+            const key = sessionStorage.key(i);
+            if (key?.startsWith('omnibus-smartmatch-suggestions')) sessionStorage.removeItem(key);
         }
-        return env.data && typeof env.data === 'object' ? env.data : {};
-    } catch {
-        return {};
-    }
-}
-
-function writeScanCache(provider: string, data: Record<string, any>) {
-    try {
-        if (!data || Object.keys(data).length === 0) {
-            sessionStorage.removeItem(`${SCAN_CACHE_PREFIX}-${provider}`);
-            return;
-        }
-        sessionStorage.setItem(`${SCAN_CACHE_PREFIX}-${provider}`, JSON.stringify({ ts: Date.now(), data }));
     } catch {}
 }
 
@@ -101,6 +79,7 @@ export default function SmartMatchPage() {
     // where the provider already gave us covers (Metron), otherwise in ONE batch call (ComicVine).
     const [issueCovers, setIssueCovers] = useState<Record<string, string>>({});
     const [suggestions, setSuggestions] = useState<Record<string, any>>({});
+    const [decisions, setDecisions] = useState<Record<string, any>>({});
     const [isScanning, setIsScanning] = useState(false);
     const [processingId, setProcessingId] = useState<string | null>(null);
     // A match whose folder another series already owns (409 from match-series): the admin chooses
@@ -401,86 +380,53 @@ export default function SmartMatchPage() {
             });
     }, [toast]);
 
-    // Which provider the live `suggestions` belong to. The persist effect writes under this ref (not
-    // the latest searchProvider) so a provider switch — which re-hydrates suggestions on the next
-    // render — can't momentarily clobber the other provider's cache with stale data.
-    const suggestionsProviderRef = useRef<string>('COMICVINE');
-
-    // Hydrate cached suggestions whenever the active provider changes (incl. the initial settle from
-    // saved config). Stale entries for series no longer unmatched simply don't render and age out by TTL.
     useEffect(() => {
-        suggestionsProviderRef.current = searchProvider;
-        setSuggestions(readScanCache(searchProvider));
+        clearLegacyScanCache();
+        setSuggestions({});
+        setDecisions({});
     }, [searchProvider]);
 
-    // Persist live suggestions under the provider they belong to.
-    useEffect(() => {
-        writeScanCache(suggestionsProviderRef.current, suggestions);
-    }, [suggestions]);
+    const scanItem = async (series: any, refresh = false) => {
+        const res = await fetch('/api/admin/smart-match', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId: series.id, provider: searchProvider, refresh }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Matching failed');
+        setDecisions(prev => ({ ...prev, [series.id]: data }));
+        const selected = data.selected;
+        setSuggestions(prev => ({ ...prev, [series.id]: selected
+            ? { ...selected, matchDecision: data }
+            : ['provider_error', 'rate_limited', 'deferred'].includes(data.status) ? 'ERROR' : 'NOT_FOUND' }));
+        return data;
+    };
+
+    const retryMatch = async (series: any) => {
+        setProcessingId(series.id);
+        try { await scanItem(series, true); }
+        catch (error: any) { toast({ title: 'Retry failed', description: error.message, variant: 'destructive' }); }
+        finally { setProcessingId(null); }
+    };
 
     const startSmartScan = async () => {
         setIsScanning(true);
         let matchCount = 0;
-
-        for (const series of visibleUnmatched) {
-            // An ignored series is visible only while the toggle is on; scanning it would put a
-            // suggestion back on a row the admin has already dealt with.
-            if (series.isIgnored) continue;
-            // Retry transient errors; successful suggestions and cached empty searches are done.
-            // The search API caches NOT_FOUND results for 12 hours, so retrying those just delays
-            // every untried row by another 1.5 seconds without fetching fresh provider data.
-            if (suggestions[series.id] && suggestions[series.id] !== 'ERROR') continue;
-
-            try {
-                // The search term is the SERIES, not the file: a loose file arrives as its filename
-                // ("X-Men 001 (2024)"), and the issue number pollutes the provider query. The year is
-                // kept aside for ranking and never sent — the search route would only turn it into a
-                // boolean sort that pulls every same-year volume ahead of the exact name.
-                const { query: cleanName, year: nameYear } = seriesQueryFromName(series.name);
-                const wantedYear = series.year > 0 ? series.year : nameYear;
-                const query = `${cleanName} ${wantedYear ?? ''}`.trim();
-
-                Logger.log(`[Smart Match Debug] Auto-scanning for "${query}" using provider: ${searchProvider}`, 'debug');
-
-                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&provider=${searchProvider}`);
-                
-                if (res.status === 429) {
-                    throw new Error("FATAL_RATE_LIMIT");
-                }
-
-                if (!res.ok) throw new Error(`Search failed (${res.status})`);
-
-                const data = await res.json();
-
-                // Score every candidate — name similarity first, the year as a tiebreaker — instead of
-                // trusting results[0]. A best candidate that barely resembles the name becomes
-                // NOT_FOUND on purpose: Accept All takes any row with a suggestion, and a confident-
-                // looking wrong answer there costs a folder move to undo.
-                const picked = pickSuggestion(cleanName, wantedYear, data.results || []);
-                if (picked) {
-                    setSuggestions(prev => ({ ...prev, [series.id]: picked }));
-                    matchCount++;
-                } else {
-                    setSuggestions(prev => ({ ...prev, [series.id]: 'NOT_FOUND' }));
-                }
-            } catch (e: any) {
-                setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
-
-                if (e.message === "FATAL_RATE_LIMIT" || e.message?.includes("429")) {
-                    toast({ 
-                        title: "Rate Limit Exceeded", 
-                        description: "Omnibus has hit the API limits. Pausing the smart scan to protect your connection. Please attempt the scan again later to continue.", 
-                        variant: "destructive" 
-                    });
-                    break;
+        try {
+            for (const series of visibleUnmatched) {
+                if (series.isIgnored) continue;
+                try {
+                    const decision = await scanItem(series);
+                    if (decision.selected) matchCount++;
+                    if (['rate_limited', 'deferred'].includes(decision.status)) {
+                        toast({ title: 'Scan paused', description: decision.reasons.join(' '), variant: 'destructive' });
+                        break;
+                    }
+                } catch {
+                    setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
                 }
             }
-
-            await new Promise(r => setTimeout(r, 1500));
-        }
-
-        setIsScanning(false);
-        toast({ title: "Scan Complete", description: `Found suggestions for ${matchCount} series.` });
+        } finally { setIsScanning(false); }
+        toast({ title: 'Scan complete', description: `Found candidates for ${matchCount} entries. Only convincing matches can be accepted automatically.` });
     };
 
     // The exact single-accept payload, shared by the per-row accept, Accept Selected, and Accept
@@ -502,6 +448,9 @@ export default function SmartMatchPage() {
             : undefined;
         return {
             oldFolderPath: series.folderPath,
+            ...(suggestion.matchDecision && !suggestion.manualReviewed ? {
+                automaticMatch: { itemId: series.id, fingerprint: suggestion.matchDecision.fingerprint, provider: searchProvider },
+            } : { manualReview: true }),
             cvId: suggestion.id,
             metadataId: suggestion.id,
             metadataSource: suggestion.metadataSource || 'COMICVINE',
@@ -1358,6 +1307,28 @@ export default function SmartMatchPage() {
                                         </div>
                                     )}
 
+                                    {decisions[series.id] && (
+                                        <details className="mt-2 text-xs text-muted-foreground" open={decisions[series.id].status !== 'high'}>
+                                            <summary className="cursor-pointer font-semibold">{decisions[series.id].status.replace(/_/g, ' ')} · {decisions[series.id].confidence} confidence</summary>
+                                            <p className="mt-1">Parsed: {decisions[series.id].parsed.title} · {decisions[series.id].parsed.domain}
+                                                {decisions[series.id].parsed.issue ? ` #${decisions[series.id].parsed.issue.value} (${decisions[series.id].parsed.issue.source})` : ' · issue unknown'}
+                                                {decisions[series.id].parsed.publicationYear ? ` · published ${decisions[series.id].parsed.publicationYear.value}` : ''}
+                                                {decisions[series.id].parsed.seriesYear ? ` · run year ${decisions[series.id].parsed.seriesYear.value} (${decisions[series.id].parsed.seriesYear.source})` : ''}
+                                                {decisions[series.id].parsed.run ? ` · volume ${decisions[series.id].parsed.run.value}` : ''}
+                                                {decisions[series.id].parsed.format ? ` · ${decisions[series.id].parsed.format.value}` : ''}</p>
+                                            <p>{decisions[series.id].reasons.join(' ')}</p>
+                                            <ul className="mt-2 space-y-2">
+                                                {decisions[series.id].candidates.map((candidate: any) => (
+                                                    <li key={`${candidate.candidate.metadataSource}:${candidate.candidate.id}`}>
+                                                        <strong>{candidate.candidate.name} ({candidate.candidate.year || '?'}) · {candidate.candidate.metadataSource} · {Math.round(candidate.score * 100)}%</strong>
+                                                        <p>{[...candidate.positive, ...candidate.contradictions, ...candidate.reasons].join('; ') || 'Name similarity only; details not verified'}</p>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                            {decisions[series.id].status !== 'high' && <p className="mt-2">Use Search Match to review and choose a candidate manually.</p>}
+                                        </details>
+                                    )}
+
                                     {/* Custom metadata preview — shows where this match will actually land. */}
                                     {metadataOverrides[series.id] && (
                                         <div className="mt-2 pt-2 border-t border-border/60 flex items-start gap-1.5 text-[11px] text-primary" title="Folder this match will be organized into">
@@ -1377,11 +1348,12 @@ export default function SmartMatchPage() {
 
                                 {/* ACTIONS */}
                                 <div className="flex md:flex-col gap-2 shrink-0 w-full md:w-auto justify-end">
+                                    <Button size="sm" variant="outline" disabled={matchBusy || isScanning || series.isIgnored} onClick={(e) => { e.stopPropagation(); retryMatch(series); }}>Retry / Refresh</Button>
                                     <Button 
                                         size="sm" 
                                         className="flex-1 md:flex-none bg-green-600 hover:bg-green-700 text-white font-bold disabled:opacity-50 border-0"
-                                        disabled={!suggestion || suggestion === 'NOT_FOUND' || suggestion === 'ERROR' || isSelectionMode || matchBusy}
-                                        onClick={(e) => { e.stopPropagation(); handleAcceptMatch(series, suggestion); }}
+                                        disabled={acceptableForBulk([series], suggestions).length === 0 || isSelectionMode || matchBusy}
+                                        onClick={(e) => { e.stopPropagation(); if (acceptableForBulk([series], suggestions).length) handleAcceptMatch(series, suggestion); }}
                                     >
                                         <Check className="w-5 h-5 md:mr-2" /> <span className="hidden md:inline">Accept</span>
                                     </Button>

@@ -25,6 +25,7 @@ import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { findLocalCoverBasename } from '@/lib/utils/cover-plan';
 import { parseComicVineCredits } from '@/lib/utils';
 import { folderOwner, suggestFreeFolderName, attachAsCollected } from '@/lib/match-collision';
+import { assertAutomaticMatch, revalidateAutomaticMatch, type AutomaticMatchToken } from '@/lib/smart-match/service';
 
 // #199 round 4 Beta B: only non-empty credit groups become columns (never write a literal '[]' —
 // issue #179), stringified to the Issue JSON-array convention.
@@ -80,6 +81,15 @@ export async function POST(request: Request) {
     const session = await getServerSession(await getAuthOptions());
     if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
     const req = (await request.json()) as any;
+    // An automatic (auto-scan) suggestion is only as good as the server decision behind it: the
+    // browser's confidence flag authorizes nothing. Verified here, then re-checked (local evidence +
+    // settings only, no provider work) immediately before each write, because the provider/detail/
+    // collision reads in between can take seconds. Explicit reviewed manual matches are untouched.
+    let automaticToken: AutomaticMatchToken | null = null;
+    if (req.automaticMatch) {
+        try { automaticToken = await assertAutomaticMatch(req); }
+        catch (error: unknown) { return NextResponse.json({ error: getErrorMessage(error) }, { status: 409 }); }
+    }
     const { oldFolderPath, cvId, metadataId, metadataSource, name, year, publisher, exactIssueId, exactIssueNumber,
             universe, seriesGroup, description, lockMetadata, writeToFile, coverImageBase64, issueCoverImageBase64, issueCoverEmbed,
             dataMode, issueTitle } = req;
@@ -237,6 +247,10 @@ export async function POST(request: Request) {
     }
     const owner = await folderOwner(newFolderPath, excludeIds);
     if (owner && resolution?.mode === 'attach') {
+        if (automaticToken) {
+            try { await revalidateAutomaticMatch(automaticToken, req); }
+            catch (error: unknown) { return NextResponse.json({ error: getErrorMessage(error) }, { status: 409 }); }
+        }
         const attached = await attachAsCollected({
             owner,
             source: oldFolderPath,
@@ -288,6 +302,12 @@ export async function POST(request: Request) {
                 suggestedFolderName, volumeName: realName, volumeYear: realYear || null,
             },
         }, { status: 409 });
+    }
+
+    // Last read-only moment before the ordinary path mutates (publisher dir, Series row, moves).
+    if (automaticToken) {
+        try { await revalidateAutomaticMatch(automaticToken, req); }
+        catch (error: unknown) { return NextResponse.json({ error: getErrorMessage(error) }, { status: 409 }); }
     }
 
     const pubDir = path.dirname(newFolderPath);

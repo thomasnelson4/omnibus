@@ -24,7 +24,7 @@ const req = (body: any) => new NextRequest('http://localhost/api/library/match-s
     body: JSON.stringify(body),
 });
 
-const item = (folder: string) => ({ oldFolderPath: folder, metadataId: '42', metadataSource: 'METRON' });
+const item = (folder: string) => ({ oldFolderPath: folder, metadataId: '42', metadataSource: 'METRON', manualReview: true });
 
 describe('API Route: bulk match accept (/api/library/match-series/bulk)', () => {
     beforeEach(() => {

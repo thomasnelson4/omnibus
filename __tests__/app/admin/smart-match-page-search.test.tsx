@@ -54,11 +54,17 @@ const VOLUME_DETAILS = {
 let searchCalls: string[] = [];
 let detailCalls: string[] = [];
 
-// Collapse only the scan's pacing delay; Testing Library's timeout must stay real.
-const stubScanDelays = () => {
-    const original = globalThis.setTimeout;
-    vi.stubGlobal('setTimeout', (callback: () => void, delay: number, ...args: unknown[]) =>
-        original(callback, delay === 1500 ? 0 : delay, ...args));
+// A server decision as /api/admin/smart-match returns it (src/lib/smart-match/service.ts): the
+// page renders its parsed signals, candidates and reasons, and may accept only what it marks safe.
+const DECISION = {
+    status: 'high', confidence: 'high', safeToAccept: true, autoAccept: false, fingerprint: 'f'.repeat(64),
+    algorithmVersion: 'evidence-1', expiresAt: Date.now() + 60 * 60 * 1000, requests: 1, queries: ['METRON:conan & dragonero:1'],
+    selected: { ...SEARCH_RESULT, id: '16180' }, reasons: [], files: [],
+    parsed: { title: 'Conan & Dragonero', domain: 'regular', alternateTitles: [], releaseTags: [], warnings: [], issue: { value: '1', source: 'filename trailing number', confidence: 'medium' } },
+    candidates: [{
+        candidate: { ...SEARCH_RESULT, id: '16180' }, similarity: 1, score: 0.96, validated: true, exact: false,
+        positive: ['Issue #1 exists (regular)', 'Publisher agrees'], contradictions: [], reasons: [],
+    }],
 };
 
 const openSearchMatchDialog = async () => {
@@ -255,42 +261,63 @@ describe('Smart Matcher — Search Match dialog', () => {
         await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'No results' })));
     });
 
-    it('retries a failed auto-search instead of caching a 500 as NOT_FOUND', async () => {
-        stubScanDelays();
-        let attempts = 0;
+    it('auto-scan asks the server decision service, explains the decision, and retries a failed item on the next scan', async () => {
+        const bodies: Record<string, unknown>[] = [];
         stubFetchRouter([
             ['/api/admin/unmatched', () => ok([RAW_ITEM])],
             ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
-            ['/api/search', () => ++attempts === 1 ? err(500, { error: 'temporary' }) : ok({ results: [SEARCH_RESULT] })],
+            ['/api/admin/smart-match', (_u, init) => {
+                bodies.push(JSON.parse(init.body));
+                return bodies.length === 1 ? err(422, { error: 'Could not read matching evidence for this item' }) : ok(DECISION);
+            }],
         ]);
         render(<SmartMatchPage />);
         await screen.findByText(RAW_ITEM.name);
         fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
-        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan Complete' })));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan complete', description: expect.stringContaining('0 entries') })));
+        expect(screen.getByRole('button', { name: 'Accept' }).hasAttribute('disabled')).toBe(true);
+
         toast.mockClear();
         fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
-        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({
-            title: 'Scan Complete', description: 'Found suggestions for 1 series.',
-        })));
-        expect(attempts).toBe(2);
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan complete', description: expect.stringContaining('1 entries') })));
+        // The decision came from the server for THIS item under the page's provider, with no cache bypass…
+        expect(bodies).toEqual([
+            { itemId: RAW_ITEM.id, provider: 'METRON', refresh: false },
+            { itemId: RAW_ITEM.id, provider: 'METRON', refresh: false },
+        ]);
+        // …and its explanation is on the row: parsed signals, confidence and per-candidate evidence.
+        expect(screen.getByText(/high · high confidence/)).toBeTruthy();
+        expect(screen.getByText(/Parsed: Conan & Dragonero · regular #1/)).toBeTruthy();
+        expect(screen.getByText(/Issue #1 exists \(regular\); Publisher agrees/)).toBeTruthy();
+        // A convincing, unexpired server decision is acceptable.
+        expect(screen.getByRole('button', { name: 'Accept' }).hasAttribute('disabled')).toBe(false);
     });
 
-    it('does not repeat cached NOT_FOUND searches on every auto-scan', async () => {
-        stubScanDelays();
-        let attempts = 0;
+    it('an ambiguous decision shows its candidates, cannot be accepted, and Retry / Refresh bypasses the server caches', async () => {
+        const bodies: Record<string, unknown>[] = [];
+        const ambiguous = {
+            ...DECISION, status: 'ambiguous', confidence: 'medium', safeToAccept: false, reasons: ['No clear lead over the runner-up'],
+            candidates: [DECISION.candidates[0], { ...DECISION.candidates[0], candidate: { ...SEARCH_RESULT, id: '999', year: 2011 }, score: 0.94 }],
+        };
         stubFetchRouter([
             ['/api/admin/unmatched', () => ok([RAW_ITEM])],
             ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
-            ['/api/search', () => { attempts++; return ok({ results: [] }); }],
+            ['/api/admin/smart-match', (_u, init) => { bodies.push(JSON.parse(init.body)); return ok(ambiguous); }],
         ]);
         render(<SmartMatchPage />);
         await screen.findByText(RAW_ITEM.name);
-        for (let run = 0; run < 2; run++) {
-            toast.mockClear();
-            fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
-            await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan Complete' })));
-        }
-        expect(attempts).toBe(1);
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan complete' })));
+
+        expect(screen.getByText(/ambiguous · medium confidence/)).toBeTruthy();
+        expect(screen.getByText(/No clear lead over the runner-up/)).toBeTruthy();
+        expect(screen.getByText(/Conan & Dragonero \(2011\) · METRON · 94%/)).toBeTruthy();
+        // A best candidate is not a convincing match: nothing can be accepted blindly.
+        expect(screen.getByRole('button', { name: 'Accept' }).hasAttribute('disabled')).toBe(true);
+
+        fireEvent.click(screen.getByRole('button', { name: /Retry \/ Refresh/ }));
+        await waitFor(() => expect(bodies).toHaveLength(2));
+        expect(bodies[1]).toEqual({ itemId: RAW_ITEM.id, provider: 'METRON', refresh: true });
     });
 
     it('assigns selected files with one search and distinct, editable issue mappings', async () => {

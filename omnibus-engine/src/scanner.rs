@@ -831,61 +831,6 @@ fn issue_file_meta(info: Option<&ScanComicInfo>) -> IssueFileMeta {
     }
 }
 
-/// Folder-level identity evidence for the unmatched-retry sweep (matcher.rs): the first comic
-/// file's ComicInfo + the folder's series.json — the same precedence the scanner uses — with the
-/// live issue-id→volume resolution gated behind `allow_api` (budget-aware callers). Returns
-/// (metadataSource, metadataId, cv_id, metron_id) when the files identify the series.
-pub(crate) async fn folder_match_evidence(
-    db: &Db,
-    client: &reqwest::Client,
-    folder: &Path,
-    allow_api: bool,
-) -> Option<(String, String, Option<i32>, Option<i32>)> {
-    let f = folder.to_path_buf();
-    let (info, sj) = tokio::task::spawn_blocking(move || {
-        let first = crate::converter::first_comic_file(&f);
-        let info = first.as_ref().and_then(|p| parse_comic_info(p));
-        let sj = read_series_json(&f);
-        (info, sj)
-    })
-    .await
-    .ok()?;
-
-    let mut derived = info.as_ref().map(derive_meta);
-    if let Some(sj_id) = sj.as_ref().and_then(|j| j.comicid) {
-        match derived.as_mut() {
-            Some(d) => {
-                if d.cv_id.is_none() && d.metron_id.is_none() {
-                    d.cv_id = Some(sj_id as i32);
-                    d.recompute_resolved();
-                }
-            }
-            None => {
-                derived = Some(DerivedMeta {
-                    cv_id: Some(sj_id as i32),
-                    metron_id: None,
-                    cv_issue_id: None,
-                    metron_issue_id: None,
-                    metadata_id: Some(sj_id.to_string()),
-                    metadata_issue_id: None,
-                    metadata_source: "COMICVINE".to_string(),
-                    is_manga: false,
-                    parsed_year: sj.as_ref().and_then(|j| j.year),
-                });
-            }
-        }
-    }
-    if allow_api {
-        if let Some(d) = derived.as_mut() {
-            if d.metadata_id.is_none() {
-                let name = info.as_ref().and_then(|i| i.series.as_deref()).map(str::trim).filter(|s| !s.is_empty())
-                    .or_else(|| sj.as_ref().and_then(|j| j.name.as_deref()));
-                resolve_dynamic_ids(db, client, d, name).await;
-            }
-        }
-    }
-    derived.and_then(|d| d.metadata_id.clone().map(|id| (d.metadata_source.clone(), id, d.cv_id, d.metron_id)))
-}
 
 fn derive_meta(info: &ScanComicInfo) -> DerivedMeta {
     let mut cv_id = info.comic_vine_volume_id.as_deref().and_then(parse_i32);

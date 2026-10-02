@@ -3,10 +3,11 @@
 // classic exact-provider-ID lookup kept as the advanced fallback. Both paths funnel into
 // the same volume-details resolution, so the shapes here are the single source of truth
 // for what the page holds as a "manual match result".
-import { normalizeFractionNumbers } from '@/lib/utils/issue-parser'
+import { canonicalNumber, parseSignals, titleSimilarity } from '@/lib/smart-match/signals'
 
 /** The suggestion shape the matcher stores for a manually-resolved volume/series. */
 export interface ManualSuggestion {
+    manualReviewed: true
     id: any
     name: string
     year: any
@@ -31,7 +32,7 @@ export function cleanProviderId(raw: string): string {
 /** "049" and "49" are the same issue; leading zeros are presentation, not identity. So are
  *  ComicVine's vulgar fractions (#205): its "13½" is the admin's "13.5". */
 export function normalizeIssueNumber(n: unknown): string {
-    return normalizeFractionNumbers((n ?? '').toString().trim()).replace(/^0+(?=\d)/, '')
+    return canonicalNumber(n)
 }
 
 /**
@@ -119,6 +120,7 @@ export function buildManualSuggestion(data: any, provider: string): ManualSugges
     addCredit('storyArc', data.storyArcs)
 
     return {
+        manualReviewed: true,
         id: data.id || data.volumeId,
         name: data.name,
         year: data.year,
@@ -148,8 +150,9 @@ export function acceptableForBulk<T extends { id: string; isIgnored?: boolean }>
 ): T[] {
     return items.filter(item => {
         if (item.isIgnored) return false;
-        const s = suggestions[item.id];
-        return !!s && s !== 'NOT_FOUND' && s !== 'ERROR';
+        const s = suggestions[item.id] as any;
+        return !!s && typeof s === 'object' && (s.manualReviewed === true ||
+            s.matchDecision?.safeToAccept === true && s.matchDecision?.expiresAt > Date.now());
     });
 }
 
@@ -163,25 +166,23 @@ export function acceptableForBulk<T extends { id: string; isIgnored?: boolean }>
 // first. Name relevance was never scored at all. These helpers score it, with the year as a
 // tiebreaker-plus rather than a sort key, so the name dominates unless names tie.
 //
-// nameSimilarity is an EXACT twin of the engine's renamer-side scorer (matcher.rs name_similarity)
-// and the year term twins matcher.rs year_term — the background sweep and the Smart Matcher must
-// rank the same candidates the same way, or the sweep would auto-match what the UI would reject.
+// The engine no longer carries a scorer of its own: the background sweep asks the shared server
+// decision service (src/lib/smart-match) for the same evidence-first decision the UI shows, so
+// there is exactly one ranking implementation — titleSimilarity in smart-match/signals.ts, which
+// nameSimilarity delegates to. The year term below survives only for the manual Search Match
+// result ordering (rankSearchResults).
 // ---------------------------------------------------------------------------------------------
 
-/** Case-insensitive token Dice coefficient over alphanumeric words. Symbols fold to spaces, so
- *  "Hack/Slash" == "Hack Slash" == "hack slash". Token-based, order-insensitive. Twin of Rust. */
+/** Case-insensitive set-Dice coefficient over alphanumeric words. Symbols fold to spaces, so
+ *  "Hack/Slash" == "Hack Slash" == "hack slash". Token-based, order-insensitive, and bounded to
+ *  [0, 1] even with repeated words ("Batman Batman Batman" vs "Batman" is 1, never 1.5). */
 export function nameSimilarity(a: string, b: string): number {
-    const tokens = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim().split(/\s+/).filter(Boolean);
-    const ta = tokens(a);
-    const tb = tokens(b);
-    if (ta.length === 0 || tb.length === 0) return 0;
-    const common = ta.filter(t => tb.includes(t)).length;
-    return (2 * common) / (ta.length + tb.length);
+    return titleSimilarity(a, b);
 }
 
 /** The year's contribution to a candidate's score. A tiebreaker-plus, deliberately small next to a
  *  full-name match: exact year +0.10, off by one +0.05 (ComicVine's start_year and a folder's year
- *  disagree by one all the time), further off −0.05, either side unknown 0. Twin of Rust.
+ *  disagree by one all the time), further off −0.05, either side unknown 0.
  *
  *  The magnitudes are chosen so the year's whole reach (+0.10 to −0.05 = 0.15) stays UNDER a
  *  one-token name difference on a two-token name (1.0 vs 0.8 = 0.2): a folder whose year is wrong
@@ -200,17 +201,8 @@ export function yearTerm(candidateYear: number | null | undefined, wantedYear: n
  *  off or they pollute the provider query; a folder arrives as "Batman Omnibus Vol. 2". The year is
  *  returned separately so the ranker can use it — it never goes into the query itself. */
 export function seriesQueryFromName(name: string): { query: string; year: number | null } {
-    let s = name.trim();
-    const yearMatch = s.match(/[(\[]?\b(19\d{2}|20\d{2})\b[)\]]?/);
-    const year = yearMatch ? parseInt(yearMatch[1], 10) : null;
-    if (yearMatch) s = s.replace(yearMatch[0], ' ');
-    // Edition / volume words, anywhere, whole words only (the old regex matched once, unbounded).
-    s = s.replace(/\b(omnibus|tpb|compendium|hardcover|hc|vol\.?|volume)\b\.?\s*\d*/gi, ' ');
-    // A trailing issue token: "#12", "001", "12.5", "v01". Trailing only — "Kaiju No. 8" keeps its 8.
-    s = s.replace(/\s+(?:#\s*)?(?:v\d+|\d{1,4}(?:\.\d+)?)\s*$/i, ' ');
-    s = s.replace(/\s+/g, ' ').trim();
-    // Never search for nothing: a name that was ALL edition words falls back to itself.
-    return { query: s.length >= 2 ? s : name.trim(), year };
+    const parsed = parseSignals(name, 'filename');
+    return { query: parsed.title, year: parsed.publicationYear?.value ?? parsed.seriesYear?.value ?? null };
 }
 
 export interface RankedCandidate<T> {

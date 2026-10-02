@@ -44,6 +44,11 @@ export async function POST(request: NextRequest) {
     // (provider + disk I/O dominate).
     for (const item of items as unknown[]) {
         try {
+            const intent = item as any;
+            if (!intent?.automaticMatch && intent?.manualReview !== true) {
+                results.push({ ok: false, error: 'Bulk match requires a fresh automatic decision or an explicitly reviewed manual assignment' });
+                continue;
+            }
             const inner = new Request('http://internal/api/library/match-series', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', cookie },

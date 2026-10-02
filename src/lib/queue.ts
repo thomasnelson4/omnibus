@@ -496,7 +496,9 @@ export function initWorker() {
                             where: { 
                                 OR: [
                                     { key: { startsWith: 'cv_details_cache_' } },
-                                    { key: { startsWith: 'meta_details_' } }
+                                    { key: { startsWith: 'meta_details_' } },
+                                    { key: { startsWith: 'search_v3_' } },
+                                    { key: { startsWith: 'smart_match_v1_' } }
                                 ]
                             }
                         });
@@ -504,7 +506,9 @@ export function initWorker() {
                         for (const cache of oldCacheSettings) {
                             try {
                                 const parsed = JSON.parse(cache.value);
-                                if (Date.now() - parsed.timestamp > 24 * 60 * 60 * 1000) {
+                                const expired = cache.key.startsWith('smart_match_v1_') ? !parsed.expiresAt || parsed.expiresAt <= Date.now()
+                                    : Date.now() - parsed.timestamp > (cache.key.startsWith('search_v3_') ? 12 : 24) * 60 * 60 * 1000;
+                                if (expired) {
                                     await prisma.systemSetting.delete({ where: { key: cache.key } });
                                     dbDeletedCount++;
                                 }

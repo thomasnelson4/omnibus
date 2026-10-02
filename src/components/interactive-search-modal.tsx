@@ -15,7 +15,7 @@ interface Props {
   onClose: () => void;
   initialQuery: string;
   comicData: {
-    cvId: number;
+    cvId: number | string;
     year: string;
     publisher: string;
     image: string;

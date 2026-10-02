@@ -5,7 +5,7 @@
 // quota-free key-check endpoint, so we probe fast_download.json with a placeholder md5: a valid key
 // returns a download_url and/or account_fast_download_info (quota); an invalid key returns an error.
 // (Placeholder md5 — Phase 3 may switch to a known-present md5 for a stricter check.)
-import axios from 'axios';
+import { requestAnnasArchiveApi } from './annas-api';
 
 export interface AnnasTestResult {
     success: boolean;
@@ -13,22 +13,12 @@ export interface AnnasTestResult {
     downloadsLeft?: number;
 }
 
-export async function testAnnasArchiveKey(key: string | null | undefined, baseUrl?: string): Promise<AnnasTestResult> {
+export async function testAnnasArchiveKey(key: string | null | undefined, baseUrl?: string, mirrors?: string): Promise<AnnasTestResult> {
     if (!key) {
         return { success: false, message: "No Anna's Archive API key configured. Add one under Hoster Accounts — interactive search still works without it." };
     }
-    const base = (baseUrl?.trim() || 'https://annas-archive.gl').replace(/\/$/, '');
     try {
-        const res = await axios.get(`${base}/dyn/api/fast_download.json`, {
-            headers: { 'User-Agent': 'Omnibus/1.0' },
-            params: { key, md5: '00000000000000000000000000000000' },
-            timeout: 10000,
-            validateStatus: () => true,
-        });
-        if (typeof res.data === 'string' && res.data.includes('<!DOCTYPE html>')) {
-            return { success: false, message: "Connection Blocked: Cloudflare challenge detected." };
-        }
-        const data = res.data || {};
+        const { data } = await requestAnnasArchiveApi(key, '00000000000000000000000000000000', { baseUrl, mirrors }, 10000);
         const left = data.account_fast_download_info?.downloads_left;
         if (data.download_url || typeof left === 'number') {
             return {

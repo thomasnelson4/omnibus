@@ -36,6 +36,7 @@ describe('lib: settings per-tab dirty tracking', () => {
         expect(computeDirtyTabs(withConfig({ manga_publishers: 'viz' }), withConfig({}))).toEqual(['discovery']);
         expect(computeDirtyTabs(withConfig({ engine_cpu_cap: '4' }), withConfig({}))).toEqual(['system']);
         expect(computeDirtyTabs(withConfig({ flaresolverr_url: 'http://x' }), withConfig({}))).toEqual(['downloads']);
+        expect(computeDirtyTabs(withConfig({ annas_archive_mirrors: 'https://mirror.example' }), withConfig({}))).toEqual(['downloads']);
         expect(computeDirtyTabs(withConfig({ oidc_enabled: 'true' }), withConfig({}))).toEqual(['access']);
         expect(computeDirtyTabs(withConfig({ smtp_host: 'smtp.x' }), withConfig({}))).toEqual(['notifications']);
         expect(computeDirtyTabs(withConfig({ folder_naming_pattern: '{Series}' }), withConfig({}))).toEqual(['library']);

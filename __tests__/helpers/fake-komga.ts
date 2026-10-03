@@ -186,8 +186,11 @@ export function makeKomgaLibrary(partial: Partial<KomgaLibraryDto> = {}): KomgaL
 
 export function makeKomgaBook(
     partial: Partial<Omit<KomgaBookDto, 'metadata'>> & { metadata?: Partial<KomgaBookMetadataDto> } = {},
+    /** Shorthand for `partial.metadata`; the argument wins, so callers can do either. */
+    extraMetadata?: Partial<KomgaBookMetadataDto>,
 ): KomgaBookDto {
     const { metadata, ...rest } = partial;
+    const merged = extraMetadata ? { ...metadata, ...extraMetadata } : metadata;
     const url = rest.url ?? `/comics/Series/Book ${idSeq + 1}.cbz`;
     const fileName = url.split(/[\\/]/).pop() ?? url;
     const name = rest.name ?? fileName.replace(/\.[^.]+$/, '');
@@ -221,7 +224,7 @@ export function makeKomgaBook(
             releaseDate: null, releaseDateLock: false, authors: [], authorsLock: false,
             tags: [], tagsLock: false, isbn: '', isbnLock: false, links: [], linksLock: false,
             created: stamp, lastModified: stamp,
-            ...metadata,
+            ...merged,
         },
     };
 }

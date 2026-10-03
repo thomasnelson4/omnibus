@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => ({
     on: vi.fn(),
     settings: vi.fn(),
     komgaLibraryFindMany: vi.fn(),
+    libraryFindMany: vi.fn(),
     enqueueKomgaSync: vi.fn(),
     enqueueKomgaReconcile: vi.fn(),
     runLibrarySync: vi.fn(),
@@ -38,7 +39,7 @@ vi.mock('@/lib/komga/queue', () => ({
     KOMGA_JOB: { SYNC: 'KOMGA_SYNC', RECONCILE: 'KOMGA_RECONCILE', READLIST_PUSH: 'KOMGA_READLIST_PUSH', READLIST_DELETE: 'KOMGA_READLIST_DELETE' },
 }));
 vi.mock('@/lib/komga/sync', () => ({ runLibrarySync: mocks.runLibrarySync }));
-vi.mock('@/lib/db', () => ({ prisma: { komgaLibrary: { findMany: mocks.komgaLibraryFindMany } } }));
+vi.mock('@/lib/db', () => ({ prisma: { komgaLibrary: { findMany: mocks.komgaLibraryFindMany }, library: { findMany: mocks.libraryFindMany } } }));
 
 import { initKomgaWorker, processKomgaJob, scheduleKomgaReconcile } from '@/lib/komga/worker';
 import { KOMGA_RECONCILE_INTERVAL_MS, KOMGA_FLUSH_INTERVAL_MS } from '@/lib/komga/constants';
@@ -56,7 +57,8 @@ beforeEach(() => {
     mocks.settings.mockResolvedValue(ENABLED);
     mocks.add.mockResolvedValue({ id: '1' });
     mocks.upsertJobScheduler.mockResolvedValue(undefined);
-    mocks.komgaLibraryFindMany.mockResolvedValue([{ omnibusLibraryId: 'lib-1' }]);
+    mocks.komgaLibraryFindMany.mockResolvedValue([]);
+    mocks.libraryFindMany.mockResolvedValue([]);
     mocks.enqueueKomgaSync.mockResolvedValue(undefined);
     mocks.runLibrarySync.mockResolvedValue({ done: true });
     mocks.flushDueLibraries.mockResolvedValue(0);
@@ -97,8 +99,17 @@ describe('processKomgaJob dispatch', () => {
 });
 
 describe('the daily reconcile', () => {
-    it('enqueues a full sync for every mapped Omnibus library', async () => {
-        mocks.komgaLibraryFindMany.mockResolvedValue([{ omnibusLibraryId: 'lib-1' }, { omnibusLibraryId: 'lib-2' }]);
+    const komgaLib = (id: string, translatedRoot: string, over: Record<string, unknown> = {}) => ({
+        komgaLibraryId: id, name: id, root: `/komga${translatedRoot}`, translatedRoot,
+        omnibusLibraryId: null, settings: '{}', unavailable: false, ...over,
+    });
+
+    it('enqueues a full sync for every Omnibus library a Komga library serves', async () => {
+        mocks.libraryFindMany.mockResolvedValue([
+            { id: 'lib-1', name: 'A', path: '/data/a' },
+            { id: 'lib-2', name: 'B', path: '/data/b' },
+        ]);
+        mocks.komgaLibraryFindMany.mockResolvedValue([komgaLib('K1', '/data')]);
         await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
         expect(mocks.enqueueKomgaSync).toHaveBeenCalledTimes(2);
         expect(mocks.enqueueKomgaSync).toHaveBeenCalledWith(
@@ -106,14 +117,36 @@ describe('the daily reconcile', () => {
         );
     });
 
-    it('dedupes libraries that appear more than once', async () => {
-        mocks.komgaLibraryFindMany.mockResolvedValue([{ omnibusLibraryId: 'lib-1' }, { omnibusLibraryId: 'lib-1' }]);
+    it('covers a library whose cached best-match column points somewhere else', async () => {
+        // One Komga library over /data is stored against the single best match (lib-1). lib-2 is
+        // equally served and must still get its nightly pass — this is why selection uses runtime
+        // containment rather than the omnibusLibraryId column.
+        mocks.libraryFindMany.mockResolvedValue([
+            { id: 'lib-1', name: 'A', path: '/data/a' },
+            { id: 'lib-2', name: 'B', path: '/data/b' },
+        ]);
+        mocks.komgaLibraryFindMany.mockResolvedValue([komgaLib('K1', '/data', { omnibusLibraryId: 'lib-1' })]);
+        await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
+        expect(mocks.enqueueKomgaSync).toHaveBeenCalledTimes(2);
+    });
+
+    it('enqueues one job for a library served by two Komga libraries', async () => {
+        mocks.libraryFindMany.mockResolvedValue([{ id: 'lib-1', name: 'A', path: '/data/a' }]);
+        mocks.komgaLibraryFindMany.mockResolvedValue([komgaLib('K1', '/data/a'), komgaLib('K2', '/data/a2')]);
         await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
         expect(mocks.enqueueKomgaSync).toHaveBeenCalledTimes(1);
     });
 
-    it('ignores libraries with no omnibus mapping', async () => {
-        mocks.komgaLibraryFindMany.mockResolvedValue([{ omnibusLibraryId: null }]);
+    it('ignores libraries no Komga library serves', async () => {
+        mocks.libraryFindMany.mockResolvedValue([{ id: 'lib-1', name: 'A', path: '/data/a' }]);
+        mocks.komgaLibraryFindMany.mockResolvedValue([komgaLib('K1', '/other')]);
+        await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
+        expect(mocks.enqueueKomgaSync).not.toHaveBeenCalled();
+    });
+
+    it('skips a Komga library Komga reports as unavailable', async () => {
+        mocks.libraryFindMany.mockResolvedValue([{ id: 'lib-1', name: 'A', path: '/data/a' }]);
+        mocks.komgaLibraryFindMany.mockResolvedValue([komgaLib('K1', '/data/a', { unavailable: true })]);
         await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
         expect(mocks.enqueueKomgaSync).not.toHaveBeenCalled();
     });

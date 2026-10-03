@@ -167,3 +167,105 @@ changed, and no test was updated to accommodate them:
   `!` binds tighter than `!==`, so this is already a correct XOR ("exactly one of
   username/password supplied → error"). Rewriting it as the linter suggests would introduce a real
   bug. Left as-is and reported.
+
+---
+
+## Phase 3 — identity map and post-scan verification
+
+No schema change was needed: `KomgaBookLink` (`omnibusPath`, `komgaPath`, `matchedBy`, `missCount`,
+`verifiedAt`) and `KomgaSeriesLink` (`komgaSeriesId`, `komgaLibraryId`, `verifiedAt`) already carried
+everything the plan needs. `prisma/schema.prisma` was not touched.
+
+### Behaviour added on top of PLAN §Phase 3 (all deliberate)
+
+- **A valve trip aborts EVERY map write, not only deletions** — no deletes, no upserts and, most
+  importantly, **no `missCount` bump**. PLAN says "abort link deletions, keep existing links". Taken
+  literally, a valve trip would still bump `missCount`; two consecutive 0-book listings would then
+  delete the whole map on the second pass, which is the exact catastrophe the valve exists to
+  prevent. The abort is therefore the default-safe path: `reconcileKomgaLibrary` computes the diff,
+  checks the valve, and returns without writing anything if it tripped.
+- **`lastReconciledAt` does not move when the valve trips** (nor when the listing failed). It is the
+  Phase 5 health check's "the map is out of date" signal, so a nightly valve trip must be visible.
+- **The valve is evaluated on the computed diff**, after matching, not on a special error path. There
+  is one place where a new reason to distrust the listing can be added, and it cannot forget to trip.
+- **Provider keys are host-scoped and boundary-terminated.** PLAN says "parse issue-level
+  `4000-(\d+)` / `metron.cloud/issue/(\d+)`". A bare `metron.cloud/issue/(\d+)` against
+  `https://metron.cloud/issue/4000-123/` yields `METRON:4000`, silently claiming Metron issue 4000.
+  Both patterns now require their host and a `(?=[/?#]|$)` terminator. Verified against 5000 real
+  books: all 5000 still parse, and all 5000 keys are distinct.
+- **The issue side rejects `'0'`** as well as `unmatched_*` / `LOCAL` and non-numeric ids. The
+  importer already treats `volumeId === "0"` as "no provider id" (`lib/importer.ts:511`), so a `0`
+  row is a placeholder that several issues share.
+- **Duplicate book urls are excluded from PATH matching** rather than resolved arbitrarily. Komga
+  never produced one in 5000 live books, but "pick the first" is a silent corruption if it ever does.
+- **The `getBook` probe for stale links is capped at 200 per Komga library.** An uncapped loop turns
+  one badly out-of-sync library into thousands of sequential requests. Unprobed links fall back to
+  the two-miss rule, which is the safe direction. The cap is not a PLAN item; it bounds a case the
+  plan does not discuss.
+- **Verification treats an unreachable Komga as "cannot verify", not as a miss.** PLAN is silent; the
+  settle rule ("a settle timeout is not a verification miss") is the closest precedent. Counting an
+  outage as a miss would burn the 2-retry budget and end in a false "gave up" JobLog.
+- **A folder path in `pendingPaths` is expanded from the DB** (issues under that prefix, capped at
+  2000, ordered by path) rather than being stat'ed once. Phase 2 emits series folders, so this is
+  the common case, not an edge case.
+- **The overflow sweep fetches up to 4 × `KOMGA_OVERFLOW_STAT_LIMIT` rows and stats at most 500**,
+  because the "scannable and unbooked" filter runs client-side (it needs the Komga library's
+  `scanCbx`/`scanPdf`/`scanEpub` and exclusions). Fetching exactly 500 and filtering after would
+  under-cover a library whose first 500 paths are all `.cb7`.
+- **The verification give-up is logged as `jobType: 'KOMGA_SCAN'`**, `status:
+  'COMPLETED_WITH_ERRORS'`, so the `JobLog.jobType` set stays the three PLAN §Phase 5 declares
+  (`KOMGA_SCAN`, `KOMGA_RECONCILE`, `KOMGA_READLIST_SYNC`). The message begins "Komga did not pick
+  up …", which is what a reader greps for.
+- **`KOMGA_RECONCILE` selects libraries by runtime containment**, not by the cached
+  `KomgaLibrary.omnibusLibraryId` column. One Komga library over a parent folder is stored against a
+  single best match, so the old filter would skip the other Omnibus libraries it serves on every
+  nightly pass — while `stepStart` (which uses `komgaLibrariesForOmnibusLibrary`) would have scanned
+  them. That inconsistency is now gone.
+- **The lease is re-taken by `stepReconcile` and released by `stepVerify`.** `stepSettle` releases
+  it (that is where `lastSyncCompletedAt` is stamped), so without this the library would be unlocked
+  for the rest of the pipeline: the flush could start a second sync and two verifications would
+  double-count a miss.
+- **`GET /api/admin/komga/id-map` reads the Komga version best-effort.** The map itself is a pure DB
+  read, so the export still works when Komga is down; a failed `getInfo` degrades
+  `komga.version` to `null` instead of failing the request. The API key is never read.
+
+### Live validation against PID 55968 (Komga 1.28.1)
+
+A throwaway vitest suite drove the real `KomgaClient`, `extractProviderKeys`, `issueProviderKey`,
+`isBookCurrent` and `isPathUnder` against the running instance, then was deleted. Results:
+
+| Check | Result |
+| --- | --- |
+| `listBooks` over Live Bulk (5000 books) | 5000 books, all pages, no throw |
+| urls absolute | 5000/5000 (LIVE delta 7 **confirmed**) |
+| urls under `LibraryDto.root` | 5000/5000 (the valve's 3rd condition never false-positives) |
+| duplicate urls | 0 |
+| `fileLastModified` whole-second | 5000/5000 (LIVE delta 9 **confirmed**) |
+| provider keys parsed | 5000/5000, all distinct (no false negatives from host-scoping) |
+| `isBookCurrent(book, real fs mtime)` over Live A | 9/9 current; worst delta **843 ms** |
+
+The 843 ms worst delta confirms Komga truncates the file mtime **down** to the second, so
+`floor(mtime)` (not the raw mtime) is the right basis for the −2 s slack. The slack is generous for
+this filesystem and necessary for coarse-grained ones (SMB shares, FAT volumes mounted into a
+container).
+
+`size=5000` was re-confirmed to be silently clamped to 2000 (`totalPages: 3` for 5000 books), which
+is why `listBooks` loops on `last` rather than on the row count.
+
+### Bugs found in the Phase 1 fake while testing Phase 3 (fixed, shared helper)
+
+`makeKomgaBook`'s metadata argument was ignored: the returned DTO spread the *original*
+`partial.metadata` rather than the merged value, so `makeKomgaBook({...}, { links })` produced a
+book with no links. The helper now accepts the shorthand second argument and merges it. This is an
+extension to `__tests__/helpers/fake-komga.ts`, not a fork.
+
+### Carried into Phase 4 / Phase 5
+
+- The identity map is only as good as its safety valve, so **Phase 4's reading-list push must treat
+  `komgaBookLink` as read-only** and must not delete remote lists on the strength of a link that
+  reconcile has not re-verified. `lastVerifiedAt` (not `updatedAt`) is the column to reason about.
+- `health.ts` (Phase 5) should count `KomgaSyncState.lastError LIKE 'reconcile safety valve%'` for
+  the valve-trip signal and `lastReconciledAt` older than 48 h for a stale map; both are now written
+  by Phase 3 and nothing else writes them.
+- The give-up JobLog uses `jobType: 'KOMGA_SCAN'`, so a Phase 5 health check that counts "verification
+  give-ups in the last 24 h" must filter on that type plus the `Komga did not pick up` message.

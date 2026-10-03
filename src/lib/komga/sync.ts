@@ -38,6 +38,8 @@ import {
 import { getKomgaClient } from './factory';
 import { enqueueKomgaSync, type KomgaSyncJobData } from './queue';
 import { backoffMs } from './flush';
+import { reconcileLibrary } from './reconcile';
+import { verifyLibrary } from './verify';
 import {
     KOMGA_LEASE_MS,
     KOMGA_PRE_IDLE_RECHECK_MS,
@@ -55,8 +57,13 @@ export type StepResult =
     | { wait: number; stage: SyncStage; patch?: Partial<KomgaSyncJobData> }
     | { done: true };
 
-/** Only the models Phase 2 touches. Phase 3 widens this (issue, komgaBookLink, komgaSeriesLink). */
-export type KomgaSyncDb = Pick<typeof prisma, 'komgaSyncState' | 'komgaLibrary' | 'library' | 'jobLog'>;
+/**
+ * The models the stage machine touches. Phase 3 widened this (issue, komgaBookLink,
+ * komgaSeriesLink, $transaction) for the reconcile and verify stages; $transaction is here so a
+ * missing batch writer is a type error rather than a runtime one.
+ */
+export type KomgaSyncDb = Pick<typeof prisma,
+    'komgaSyncState' | 'komgaLibrary' | 'library' | 'jobLog' | 'issue' | 'komgaBookLink' | 'komgaSeriesLink' | '$transaction'>;
 
 type SyncStateRow = {
     omnibusLibraryId: string;
@@ -411,6 +418,70 @@ async function stepSettle(ctx: SyncContext): Promise<StepResult> {
     }).catch(() => { /* never let the audit write change the outcome */ });
 
     log(`settled (${detection}) after ${durationMs}ms for ${data.omnibusLibraryId}`, timedOut ? 'warn' : 'info');
+    return { next: 'reconcile' };
+}
+
+/**
+ * Stage e: rewrite the identity map for the Komga libraries this sync just scanned.
+ *
+ * The lease is taken back here because settle released it (that is where lastSyncCompletedAt is
+ * stamped). Letting it go in the middle of the pipeline would let the flush start a second sync for
+ * the same library, and two verifies would double-count a miss.
+ */
+async function stepReconcile(ctx: SyncContext): Promise<StepResult> {
+    const { db, data, now } = ctx;
+    await db.komgaSyncState.updateMany({
+        where: { omnibusLibraryId: data.omnibusLibraryId },
+        data: { syncLeaseUntil: new Date(now().getTime() + KOMGA_LEASE_MS) },
+    }).catch(() => { /* the original lease expires on its own */ });
+
+    try {
+        await reconcileLibrary(data.omnibusLibraryId, {
+            db,
+            client: ctx.client,
+            settings: ctx.settings,
+            komgaLibs: ctx.komgaLibs,
+            now,
+        });
+    } catch (e) {
+        // reconcileLibrary folds its own failures into its result, so this is a last resort. Verify
+        // must still run: it is the stage that re-dirties the library, and skipping it would turn a
+        // reconcile bug into a silent "Komga has everything".
+        log(`reconcile threw for ${data.omnibusLibraryId}: ${getErrorMessage(e)}`, 'warn');
+    }
+    return { next: 'verify' };
+}
+
+/**
+ * Stage f: check the scan against the snapshot step c took, and re-dirty the library on a miss.
+ *
+ * This is the last stage Phase 3 adds, so it hands the lease back: Phase 4 appends 'readlists'
+ * after it, and leaving the library locked for 30 minutes would stop the flush from acting on the
+ * retry this stage may have just scheduled.
+ */
+async function stepVerify(ctx: SyncContext): Promise<StepResult> {
+    const { db, data, now } = ctx;
+    try {
+        const result = await verifyLibrary(data.omnibusLibraryId, {
+            db,
+            client: ctx.client,
+            settings: ctx.settings,
+            komgaLibs: ctx.komgaLibs,
+            snapshotPaths: data.snapshotPaths,
+            snapshotOverflow: data.snapshotOverflow,
+            now,
+        });
+        if (result.unverifiable) {
+            // The lease still has to go, or the library stalls for 30 minutes.
+            log(`verification could not run for ${data.omnibusLibraryId}; the retry state is unchanged`, 'warn');
+        }
+    } catch (e) {
+        log(`verify threw for ${data.omnibusLibraryId}: ${getErrorMessage(e)}`, 'warn');
+    }
+    await db.komgaSyncState.updateMany({
+        where: { omnibusLibraryId: data.omnibusLibraryId },
+        data: { syncLeaseUntil: null },
+    }).catch((e: unknown) => log(`could not release the sync lease: ${getErrorMessage(e)}`, 'warn'));
     return { done: true };
 }
 
@@ -423,6 +494,8 @@ export const SYNC_STEPS: { stage: SyncStage; run: (ctx: SyncContext) => Promise<
     { stage: 'preIdle', run: stepPreIdle },
     { stage: 'scan', run: stepScan },
     { stage: 'settle', run: stepSettle },
+    { stage: 'reconcile', run: stepReconcile },
+    { stage: 'verify', run: stepVerify },
 ];
 
 const STEP_BY_STAGE = new Map(SYNC_STEPS.map(s => [s.stage, s]));

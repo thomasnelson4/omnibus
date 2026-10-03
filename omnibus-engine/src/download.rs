@@ -4,14 +4,14 @@
 // rename. Hoster *resolution* (HosterEngine.resolveLink) and the Mega SDK stream stay in Node, which
 // calls this only for plain HTTP(S) URLs and handles the failure alert.
 use anyhow::{anyhow, bail, Result};
- 
+
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use std::sync::OnceLock;
-use futures_util::StreamExt;
 
 const STALL_SECS: u64 = 45;
 const DEFAULT_MIN_SIZE: u64 = 500_000;
@@ -36,7 +36,13 @@ fn clearance_cache() -> &'static Mutex<Option<CachedClearance>> {
 /// The solve runs WHILE HOLDING THE LOCK, so a burst of concurrent GetComics downloads triggers ONE
 /// FlareSolverr solve — the rest wait on the lock and reuse the result — instead of stampeding a
 /// single-browser FlareSolverr into "no usable cookies" / timeouts.
-async fn get_clearance(client: &reqwest::Client, db: &sqlx::AnyPool, flare_url: &str, url: &str, sc: &crate::getcomics::SolverConfig) -> Result<(String, String)> {
+async fn get_clearance(
+    client: &reqwest::Client,
+    db: &sqlx::AnyPool,
+    flare_url: &str,
+    url: &str,
+    sc: &crate::getcomics::SolverConfig,
+) -> Result<(String, String)> {
     let mut guard = clearance_cache().lock().await;
     if let Some(c) = guard.as_ref() {
         if c.fetched_at.elapsed() < CLEARANCE_TTL {
@@ -44,7 +50,11 @@ async fn get_clearance(client: &reqwest::Client, db: &sqlx::AnyPool, flare_url: 
         }
     }
     let c = crate::getcomics::flaresolverr_clearance(client, db, flare_url, url, sc).await?;
-    *guard = Some(CachedClearance { cookie: c.cookie.clone(), user_agent: c.user_agent.clone(), fetched_at: std::time::Instant::now() });
+    *guard = Some(CachedClearance {
+        cookie: c.cookie.clone(),
+        user_agent: c.user_agent.clone(),
+        fetched_at: std::time::Instant::now(),
+    });
     Ok((c.cookie, c.user_agent))
 }
 
@@ -52,10 +62,20 @@ async fn get_clearance(client: &reqwest::Client, db: &sqlx::AnyPool, flare_url: 
 /// the solver's landed URL. Used when the cached-cookie replay still answers with a challenge: the
 /// landed URL is per-solve and per-link, so only a fresh solve of THIS url can produce it. Updates
 /// the shared cache so followers still benefit from the new cookie.
-async fn get_clearance_full(client: &reqwest::Client, db: &sqlx::AnyPool, flare_url: &str, url: &str, sc: &crate::getcomics::SolverConfig) -> Result<crate::getcomics::SolverClearance> {
+async fn get_clearance_full(
+    client: &reqwest::Client,
+    db: &sqlx::AnyPool,
+    flare_url: &str,
+    url: &str,
+    sc: &crate::getcomics::SolverConfig,
+) -> Result<crate::getcomics::SolverClearance> {
     let mut guard = clearance_cache().lock().await;
     let c = crate::getcomics::flaresolverr_clearance(client, db, flare_url, url, sc).await?;
-    *guard = Some(CachedClearance { cookie: c.cookie.clone(), user_agent: c.user_agent.clone(), fetched_at: std::time::Instant::now() });
+    *guard = Some(CachedClearance {
+        cookie: c.cookie.clone(),
+        user_agent: c.user_agent.clone(),
+        fetched_at: std::time::Instant::now(),
+    });
     Ok(c)
 }
 
@@ -63,7 +83,8 @@ async fn get_clearance_full(client: &reqwest::Client, db: &sqlx::AnyPool, flare_
 /// it can't be parsed. Used as the HTML page to solve the Cloudflare challenge against, and for the
 /// warm-up visit.
 fn site_origin(url: &str) -> String {
-    reqwest::Url::parse(url).ok()
+    reqwest::Url::parse(url)
+        .ok()
         .and_then(|u| u.host_str().map(|h| format!("{}://{}/", u.scheme(), h)))
         .unwrap_or_else(|| "https://getcomics.org/".to_string())
 }
@@ -71,7 +92,9 @@ fn site_origin(url: &str) -> String {
 /// Joins a response's Set-Cookie headers into one Cookie request-header value ("a=1; b=2"), taking
 /// just the `name=value` before each cookie's attributes. Used by the warm-up below.
 fn collect_set_cookies(resp: &reqwest::Response) -> String {
-    resp.headers().get_all(reqwest::header::SET_COOKIE).iter()
+    resp.headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
         .filter_map(|v| v.to_str().ok())
         .filter_map(|c| c.split(';').next())
         .map(|c| c.trim().to_string())
@@ -87,20 +110,34 @@ fn collect_set_cookies(resp: &reqwest::Response) -> String {
 /// browser passes invisibly — without involving a solver at all. Best-effort: a hard interactive
 /// Turnstile won't be cleared this way (the engine runs no JS), so the solver fallback still runs when
 /// this doesn't get past it. Returns the retried response (which the caller re-checks for HTML).
-async fn warm_up_and_retry(client: &reqwest::Client, req: &StreamRequest) -> Result<reqwest::Response> {
+async fn warm_up_and_retry(
+    client: &reqwest::Client,
+    req: &StreamRequest,
+) -> Result<reqwest::Response> {
     let origin = site_origin(&req.url);
-    log::info!("[Internal DL] Cloudflare cookie warm-up: visiting {} to seed cf cookies.", origin);
-    let warm_cookies = match client.get(&origin)
+    log::info!(
+        "[Internal DL] Cloudflare cookie warm-up: visiting {} to seed cf cookies.",
+        origin
+    );
+    let warm_cookies = match client
+        .get(&origin)
         .header("User-Agent", DEFAULT_UA)
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        .header(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
         .timeout(std::time::Duration::from_secs(20))
-        .send().await
+        .send()
+        .await
     {
         Ok(r) => collect_set_cookies(&r),
-        Err(e) => { log::debug!("[Internal DL] warm-up origin visit failed: {e}"); String::new() }
+        Err(e) => {
+            log::debug!("[Internal DL] warm-up origin visit failed: {e}");
+            String::new()
+        }
     };
     if warm_cookies.is_empty() {
-        bail!("warm-up obtained no cookies");
+        bail!("{M_WARMUP_NO_COOKIES}");
     }
     establish_stream(client, req, &req.url, Some(&warm_cookies), DEFAULT_UA, None).await
 }
@@ -135,8 +172,12 @@ pub struct StreamResponse {
 fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
-                || v4.is_broadcast() || v4.is_documentation()
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40) // CGNAT 100.64/10
         }
         std::net::IpAddr::V6(v6) => {
@@ -151,19 +192,21 @@ fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
 /// Rejects non-HTTP(S) schemes and hosts that resolve to an internal address before any request is
 /// made. Best-effort (DNS can change before the real connect), but it closes the obvious SSRF paths.
 async fn validate_download_target(url_str: &str) -> Result<()> {
-    let url = reqwest::Url::parse(url_str).map_err(|_| anyhow::anyhow!("Invalid download URL"))?;
+    let url = reqwest::Url::parse(url_str).map_err(|_| anyhow::anyhow!("{M_INVALID_URL}"))?;
     match url.scheme() {
         "http" | "https" => {}
-        other => bail!("Refusing to download from non-HTTP(S) scheme: {other}"),
+        other => bail!("{M_BAD_SCHEME}: {other}"),
     }
-    let host = url.host_str().ok_or_else(|| anyhow::anyhow!("Download URL has no host"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("{M_NO_HOST}"))?;
     let port = url.port_or_known_default().unwrap_or(443);
     let addrs = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| anyhow::anyhow!("Could not resolve download host {host}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{M_DNS} {host}: {e}"))?;
     for addr in addrs {
         if is_blocked_ip(&addr.ip()) {
-            bail!("Refusing to download from internal address ({})", addr.ip());
+            bail!("{M_SSRF} ({})", addr.ip());
         }
     }
     Ok(())
@@ -176,12 +219,103 @@ async fn validate_download_target(url_str: &str) -> Result<()> {
 const DEFAULT_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 
 /// 429 is a throttle, not a challenge — it must never burn a 300s solver run.
-fn is_rate_limited(status: u16) -> bool { status == 429 }
+fn is_rate_limited(status: u16) -> bool {
+    status == 429
+}
+
+// ==== GetComics failure classification (see `classify_getcomics_failure`) ====
+//
+// Every marker below is declared ONCE here and interpolated at both the producer (`bail!`) and the
+// classifier, so a message can never drift out of the bucket it was filed under. That drift is
+// exactly what made the old catch-all (`is_getcomics && !msg.contains("rate limited")`) hand every
+// DNS blip and every SSRF rejection to a human.
+
+// ── Human-gated: only a person (or a fresh interactive browser) can get past these. ──
+/// The Cloudflare warm-up/solver got nothing usable back.
+const M_WARMUP_NO_COOKIES: &str = "warm-up obtained no cookies";
+/// The endpoint answered with an HTML page instead of a file — an unsolved Cloudflare interstitial.
+const M_HTML_PAGE: &str = "Download URL returned an HTML webpage instead of a comic file.";
+/// No bytes for the whole stall window. On a getcomics /dls/ link the solver has already navigated
+/// to the URL, consuming the ONE-SHOT signed token, so the replayed stream can never complete.
+const M_STALLED: &str = "Download stalled for";
+/// The body completed but is far too small to be a comic: the one-shot link was consumed/emptied.
+const M_TOO_SMALL: &str = "Downloaded file is suspiciously small";
+
+// ── Deterministic: the identical request can never succeed, so retrying it forever helps nobody. ──
+const M_INVALID_URL: &str = "Invalid download URL";
+const M_BAD_SCHEME: &str = "Refusing to download from non-HTTP(S) scheme";
+const M_NO_HOST: &str = "Download URL has no host";
+/// SSRF guard. Deterministic by policy, not by accident — the guard will always refuse this target.
+const M_SSRF: &str = "Refusing to download from internal address";
+/// reqwest's redirect policy hook, surfaced as the io::Error that became the redirect failure.
+const REDIRECT_M_TOO_MANY: &str = "too many redirects";
+const REDIRECT_M_SCHEME: &str = "redirect to non-HTTP(S) scheme blocked";
+const REDIRECT_M_INTERNAL: &str = "redirect to internal address blocked";
+
+// ── Transient: not human-gated, and not fatal either — let the normal retry/stall lifecycle handle it. ──
+/// DNS blip. Explicitly NOT a manual hold: the name resolves again seconds later.
+const M_DNS: &str = "Could not resolve download host";
+/// TCP/TLS never came up across the 3 in-process attempts.
+const M_CONNECT: &str = "Failed to connect after 3 attempts";
+/// Connection dropped mid-body.
+const M_STREAM_ERROR: &str = "Stream error:";
+/// The pre-existing 429 carve-out. Deliberately UNCLASSIFIED (falls through to Transient): a throttle
+/// is not a challenge, and "manual download" would just hand the user the same throttle.
+const M_RATE_LIMITED: &str = "rate limited";
+
+/// Which bucket a failed GetComics download falls into. The point of this enum is that the three
+/// buckets are *named* at one place instead of being re-derived from message text at every call site.
+#[derive(Debug, PartialEq, Eq)]
+enum GetComicsFailure {
+    /// Only a human can complete it → hold the request as MANUAL_DDL (the safety net the solver's
+    /// one-shot /dls/ token actually needs).
+    HumanGated,
+    /// Will never succeed however many times it is retried → surface as a real hard error.
+    Deterministic,
+    /// A network/transport blip → surface as a real hard error and let the normal retry lifecycle
+    /// (retry route / dead-request sweep) re-fire it.
+    Transient,
+}
+
+/// Classifies a failed getcomics download. PURE and string-driven, but string-driven over markers that
+/// are declared once and shared with the `bail!` sites, and matched across the whole `anyhow` cause
+/// chain rather than only the top-level `to_string()`.
+///
+/// The chain walk matters: `run_stream_download` propagates with `?` and some inner steps add
+/// `.context(...)`, so the root message routinely sits one level down. A top-level-only match would
+/// silently fall back to the "unknown" bucket — and since the old code's default was *manual hold*,
+/// that is the regression direction this function exists to prevent.
+fn classify_getcomics_failure(err: &anyhow::Error) -> GetComicsFailure {
+    let chain: Vec<String> = err.chain().map(|c| c.to_string()).collect();
+    let has = |marker: &str| chain.iter().any(|c| c.contains(marker));
+
+    // ── Human-gated ──
+    if has(M_WARMUP_NO_COOKIES) || has(M_HTML_PAGE) || has(M_STALLED) || has(M_TOO_SMALL) {
+        return GetComicsFailure::HumanGated;
+    }
+    // ── Deterministic ──
+    if has(M_INVALID_URL)
+        || has(M_BAD_SCHEME)
+        || has(M_NO_HOST)
+        || has(M_SSRF)
+        || has(REDIRECT_M_TOO_MANY)
+        || has(REDIRECT_M_SCHEME)
+        || has(REDIRECT_M_INTERNAL)
+    {
+        return GetComicsFailure::Deterministic;
+    }
+    // ── Transient (includes the 429 carve-out) ──
+    GetComicsFailure::Transient
+}
 
 /// Lower-cased Content-Type of a response (empty string if absent).
 fn response_content_type(response: &reqwest::Response) -> String {
-    response.headers().get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase()
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase()
 }
 
 /// Builds the outgoing header set with each header present exactly once. reqwest's `.header()`
@@ -195,10 +329,19 @@ fn build_stream_headers(
     user_agent: &str,
     resume_from: Option<u64>,
 ) -> reqwest::header::HeaderMap {
-    use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, COOKIE, RANGE, REFERER, USER_AGENT};
+    use reqwest::header::{
+        HeaderMap, HeaderName, HeaderValue, ACCEPT, COOKIE, RANGE, REFERER, USER_AGENT,
+    };
     let mut map = HeaderMap::new();
-    if let Ok(v) = HeaderValue::from_str(user_agent) { map.insert(USER_AGENT, v); }
-    map.insert(ACCEPT, HeaderValue::from_static("application/zip, application/x-rar-compressed, application/octet-stream, */*"));
+    if let Ok(v) = HeaderValue::from_str(user_agent) {
+        map.insert(USER_AGENT, v);
+    }
+    map.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "application/zip, application/x-rar-compressed, application/octet-stream, */*",
+        ),
+    );
     map.insert(REFERER, HeaderValue::from_static("https://getcomics.org/"));
     for (k, v) in node_headers {
         if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
@@ -206,12 +349,18 @@ fn build_stream_headers(
         }
     }
     if let Some(c) = clearance_cookie {
-        if let Ok(v) = HeaderValue::from_str(c) { map.insert(COOKIE, v); }
+        if let Ok(v) = HeaderValue::from_str(c) {
+            map.insert(COOKIE, v);
+        }
         // The clearance cookie only validates alongside the exact UA the solver used.
-        if let Ok(v) = HeaderValue::from_str(user_agent) { map.insert(USER_AGENT, v); }
+        if let Ok(v) = HeaderValue::from_str(user_agent) {
+            map.insert(USER_AGENT, v);
+        }
     }
     if let Some(offset) = resume_from {
-        if let Ok(v) = HeaderValue::from_str(&format!("bytes={}-", offset)) { map.insert(RANGE, v); }
+        if let Ok(v) = HeaderValue::from_str(&format!("bytes={}-", offset)) {
+            map.insert(RANGE, v);
+        }
     }
     map
 }
@@ -243,32 +392,51 @@ async fn establish_stream(
             Ok(r) => return Ok(r),
             Err(e) => {
                 last_err = e.to_string();
-                log::warn!("[Internal DL] Attempt {} failed ({}). Retrying in 3s...", attempt, last_err);
-                if attempt < 3 { tokio::time::sleep(std::time::Duration::from_secs(3)).await; }
+                log::warn!(
+                    "[Internal DL] Attempt {} failed ({}). Retrying in 3s...",
+                    attempt,
+                    last_err
+                );
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
             }
         }
     }
-    bail!("Failed to connect after 3 attempts: {}", last_err)
+    bail!("{M_CONNECT}: {}", last_err)
 }
 
 pub async fn stream_download(db: &sqlx::AnyPool, req: StreamRequest) -> Result<String> {
-    // For a getcomics.org /dls/ link, ANY failure to deliver the file automatically — an unsolved
-    // Cloudflare challenge, OR a stalled/empty stream because the solver consumed getcomics' one-shot
-    // signed download in its own browser (cookie-replay can't re-fetch it) — is best handed to the user
-    // as a one-click manual download. Map every such failure to the "manual download required" marker so
-    // Node holds the request as MANUAL_DDL instead of grinding to STALLED. Non-getcomics hosts keep their
-    // original error (retry/stall as before).
+    // For a getcomics.org /dls/ link, a HUMAN-GATED failure — an unsolved Cloudflare challenge, or a
+    // stalled/empty stream because the solver consumed getcomics' one-shot signed download in its own
+    // browser (cookie-replay can't re-fetch it) — is handed to the user as a one-click manual download,
+    // and mapped to the "manual download required" marker so Node holds the request as MANUAL_DDL
+    // instead of grinding to STALLED.
+    //
+    // It used to be the other way round: EVERY error on a getcomics.org URL was flattened into that
+    // marker, so a DNS blip, a dropped TCP mid-stream, a disk error or an SSRF-guard refusal all became
+    // "manual download required" and the two failure worlds were indistinguishable. Now the buckets come
+    // from `classify_getcomics_failure` and only the genuinely human-gated one is held.
     let is_getcomics = req.url.contains("getcomics.org");
     match run_stream_download(db, &req).await {
         Ok(path) => Ok(path),
-        // A 429 throttle is NOT a "couldn't get past Cloudflare" situation — holding it for manual
-        // download would just have the user click into the same throttle. Let it surface as a normal
-        // retryable failure so the request lifecycle (retry route / dead-request sweep) re-fires it
-        // once the window passes.
-        Err(e) if is_getcomics && !e.to_string().contains("rate limited") => {
-            log::warn!("[Internal DL] GetComics download couldn't be completed automatically ({e}); holding for manual download.");
-            bail!("GetComics download couldn't be completed automatically; manual download required.")
-        }
+        Err(e) if is_getcomics => match classify_getcomics_failure(&e) {
+            GetComicsFailure::HumanGated => {
+                log::warn!("[Internal DL] GetComics download is human-gated and can't complete automatically ({e}); holding for manual download.");
+                bail!("GetComics download couldn't be completed automatically; manual download required.")
+            }
+            // Deterministic: the same request will never succeed, so surface it as a hard error rather
+            // than inventing a manual hold (which would ask the user to retry something that cannot
+            // work, and would hide a mis-scraped/SSRF-blocked URL behind a "human problem" badge).
+            GetComicsFailure::Deterministic => {
+                log::error!("[Internal DL] GetComics download is permanently blocked ({e}); surfacing as a hard error.");
+                Err(e)
+            }
+            // Transient: DNS, connect, mid-stream, 429 — leave the original error intact so the
+            // normal retry/stall lifecycle re-fires it. The 429 carve-out lives here by construction:
+            // `M_RATE_LIMITED` is deliberately not in any gated bucket, so a throttle is never held.
+            GetComicsFailure::Transient => Err(e),
+        },
         Err(e) => Err(e),
     }
 }
@@ -295,19 +463,25 @@ async fn run_stream_download(db: &sqlx::AnyPool, req: &StreamRequest) -> Result<
         }
         let url = attempt.url();
         if !matches!(url.scheme(), "http" | "https") {
-            return attempt.error(std::io::Error::other("redirect to non-HTTP(S) scheme blocked"));
+            return attempt.error(std::io::Error::other(
+                "redirect to non-HTTP(S) scheme blocked",
+            ));
         }
         if let Some(host) = url.host_str() {
             let host = host.trim_start_matches('[').trim_end_matches(']');
             if let Ok(ip) = host.parse::<std::net::IpAddr>() {
                 if is_blocked_ip(&ip) {
-                    return attempt.error(std::io::Error::other("redirect to internal address blocked"));
+                    return attempt.error(std::io::Error::other(
+                        "redirect to internal address blocked",
+                    ));
                 }
             }
         }
         attempt.follow()
     });
-    let client = reqwest::Client::builder().redirect(redirect_policy).build()?;
+    let client = reqwest::Client::builder()
+        .redirect(redirect_policy)
+        .build()?;
 
     // Each attempt re-establishes the stream AND runs the transfer to completion: a mid-stream 45s stall
     // (or a truncated/too-small file, or an HTML error/challenge page) consumes a retry instead of
@@ -319,7 +493,8 @@ async fn run_stream_download(db: &sqlx::AnyPool, req: &StreamRequest) -> Result<
     let mut succeeded = false;
     let mut resume_hint: Option<(String, u64)> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        let (result, streamed_url) = attempt_stream_to_part(db, &client, req, &part_path, &resume_hint).await;
+        let (result, streamed_url) =
+            attempt_stream_to_part(db, &client, req, &part_path, &resume_hint).await;
         match result {
             Ok(()) => {
                 succeeded = true;
@@ -327,16 +502,24 @@ async fn run_stream_download(db: &sqlx::AnyPool, req: &StreamRequest) -> Result<
             }
             Err(e) => {
                 // A 429 means the source will refuse the NEXT attempt too — stop burning retries.
-                let is_throttle = e.to_string().contains("rate limited");
-                let part_len = tokio::fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
+                let is_throttle = e.to_string().contains(M_RATE_LIMITED);
+                let part_len = tokio::fs::metadata(&part_path)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 resume_hint = streamed_url.filter(|_| part_len > 0).map(|u| (u, part_len));
                 if resume_hint.is_none() {
                     let _ = tokio::fs::remove_file(&part_path).await;
                 }
                 log::warn!(
                     "[Internal DL] Attempt {}/{} failed ({}){}.",
-                    attempt, MAX_ATTEMPTS, e,
-                    resume_hint.as_ref().map(|(_, n)| format!("; {} bytes banked for a Range resume", n)).unwrap_or_default()
+                    attempt,
+                    MAX_ATTEMPTS,
+                    e,
+                    resume_hint
+                        .as_ref()
+                        .map(|(_, n)| format!("; {} bytes banked for a Range resume", n))
+                        .unwrap_or_default()
                 );
                 last_err = e;
                 if is_throttle {
@@ -358,7 +541,10 @@ async fn run_stream_download(db: &sqlx::AnyPool, req: &StreamRequest) -> Result<
     if tokio::fs::rename(&part_path, &req.dest_path).await.is_ok() {
         return Ok(req.dest_path.clone());
     }
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     let ts_path = match &req.ext {
         Some(ext) if req.dest_path.ends_with(&format!(".{}", ext)) => {
             let stem = &req.dest_path[..req.dest_path.len() - ext.len() - 1];
@@ -381,7 +567,8 @@ async fn attempt_stream_to_part(
     resume_hint: &Option<(String, u64)>,
 ) -> (Result<()>, Option<String>) {
     let mut streamed_from: Option<String> = None;
-    let result = attempt_stream_inner(db, client, req, part_path, resume_hint, &mut streamed_from).await;
+    let result =
+        attempt_stream_inner(db, client, req, part_path, resume_hint, &mut streamed_from).await;
     (result, streamed_from)
 }
 
@@ -403,7 +590,15 @@ async fn attempt_stream_inner(
     // isn't actually behind a challenge — serve the file straight away and stream with zero FlareSolverr
     // overhead. A prior attempt's partial bytes resume here when the URL matches.
     let mut target_url = req.url.clone();
-    let mut response = establish_stream(client, req, &target_url, None, DEFAULT_UA, resume_offset(resume_hint, &target_url)).await?;
+    let mut response = establish_stream(
+        client,
+        req,
+        &target_url,
+        None,
+        DEFAULT_UA,
+        resume_offset(resume_hint, &target_url),
+    )
+    .await?;
     let mut content_type = response_content_type(&response);
 
     // A 429 is a throttle, not a challenge: solving it would burn a 300s solver run on a page that
@@ -439,29 +634,66 @@ async fn attempt_stream_inner(
     // itself may consume the original hop, so wherever the solver's browser ended up (post-redirect,
     // post-challenge) is the fetchable target, with the original URL kept as the fallback.
     if content_type.contains("text/html") && is_getcomics {
-        let flare: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#)
-            .fetch_optional(db).await.ok().flatten().filter(|s: &String| !s.trim().is_empty());
+        let flare: Option<String> = sqlx::query_scalar(
+            r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#,
+        )
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .filter(|s: &String| !s.trim().is_empty());
         match flare {
             Some(flare_url) => {
                 let sc = crate::getcomics::solver_config(db).await;
                 match get_clearance(client, db, &flare_url, &req.url, &sc).await {
                     Ok((cookie, ua)) => {
                         log::info!("[Internal DL] GetComics Cloudflare challenge solved via {}; replaying the clearance on the download.", sc.kind);
-                        let ua_eff = if ua.is_empty() { DEFAULT_UA.to_string() } else { ua };
-                        response = establish_stream(client, req, &target_url, Some(&cookie), &ua_eff, resume_offset(resume_hint, &target_url)).await?;
+                        let ua_eff = if ua.is_empty() {
+                            DEFAULT_UA.to_string()
+                        } else {
+                            ua
+                        };
+                        response = establish_stream(
+                            client,
+                            req,
+                            &target_url,
+                            Some(&cookie),
+                            &ua_eff,
+                            resume_offset(resume_hint, &target_url),
+                        )
+                        .await?;
                         content_type = response_content_type(&response);
                         // Cached cookie stale (or the original hop already consumed) → one fresh solve
                         // of THIS url, then prefer its landed URL for the stream.
                         if content_type.contains("text/html") {
                             match get_clearance_full(client, db, &flare_url, &req.url, &sc).await {
                                 Ok(clearance) => {
-                                    let ua_eff = if clearance.user_agent.is_empty() { DEFAULT_UA.to_string() } else { clearance.user_agent.clone() };
+                                    let ua_eff = if clearance.user_agent.is_empty() {
+                                        DEFAULT_UA.to_string()
+                                    } else {
+                                        clearance.user_agent.clone()
+                                    };
                                     // Only chase the landed URL when the solver's browser actually
                                     // reached it (2xx there; unknown status = still worth trying).
-                                    let landed_reachable = clearance.solved_status.map(|s| (200..300).contains(&s)).unwrap_or(true);
-                                    if let Some(landed) = clearance.solved_url.as_deref().filter(|u| *u != req.url && landed_reachable) {
+                                    let landed_reachable = clearance
+                                        .solved_status
+                                        .map(|s| (200..300).contains(&s))
+                                        .unwrap_or(true);
+                                    if let Some(landed) = clearance
+                                        .solved_url
+                                        .as_deref()
+                                        .filter(|u| *u != req.url && landed_reachable)
+                                    {
                                         log::info!("[Internal DL] Streaming from the solver's landed URL instead of the original /dls/ hop.");
-                                        let landed_resp = establish_stream(client, req, landed, Some(&clearance.cookie), &ua_eff, resume_offset(resume_hint, landed)).await?;
+                                        let landed_resp = establish_stream(
+                                            client,
+                                            req,
+                                            landed,
+                                            Some(&clearance.cookie),
+                                            &ua_eff,
+                                            resume_offset(resume_hint, landed),
+                                        )
+                                        .await?;
                                         let landed_ct = response_content_type(&landed_resp);
                                         if !landed_ct.contains("text/html") {
                                             target_url = landed.to_string();
@@ -472,18 +704,31 @@ async fn attempt_stream_inner(
                                         log::debug!("[Internal DL] Solver landed on a non-2xx page (status {:?}); keeping the original URL.", clearance.solved_status);
                                     }
                                     if content_type.contains("text/html") {
-                                        response = establish_stream(client, req, &target_url, Some(&clearance.cookie), &ua_eff, resume_offset(resume_hint, &target_url)).await?;
+                                        response = establish_stream(
+                                            client,
+                                            req,
+                                            &target_url,
+                                            Some(&clearance.cookie),
+                                            &ua_eff,
+                                            resume_offset(resume_hint, &target_url),
+                                        )
+                                        .await?;
                                         content_type = response_content_type(&response);
                                     }
                                 }
-                                Err(e) => log::warn!("[Internal DL] fresh {} solve failed ({e}).", sc.kind),
+                                Err(e) => log::warn!(
+                                    "[Internal DL] fresh {} solve failed ({e}).",
+                                    sc.kind
+                                ),
                             }
                         }
                     }
                     Err(e) => log::warn!("[Internal DL] {} clearance failed ({e}).", sc.kind),
                 }
             }
-            None => log::warn!("[Internal DL] GetComics returned a Cloudflare challenge but no solver URL is set."),
+            None => log::warn!(
+                "[Internal DL] GetComics returned a Cloudflare challenge but no solver URL is set."
+            ),
         }
     }
 
@@ -491,7 +736,7 @@ async fn attempt_stream_inner(
     // For a getcomics.org link the outer wrapper turns this (and any later stall/small-file failure)
     // into the "manual download required" signal that holds the request as MANUAL_DDL.
     if content_type.contains("text/html") {
-        bail!("Download URL returned an HTML webpage instead of a comic file.");
+        bail!("{M_HTML_PAGE}");
     }
 
     // From here on bytes may land in the .part file — record where they came from for resume banking.
@@ -500,7 +745,8 @@ async fn attempt_stream_inner(
     // 206 = the server honored the Range resume: append after the banked bytes. Any 200 (even when a
     // resume was requested) means a full body: truncate and restart the count from zero.
     let requested_resume = resume_offset(resume_hint, &target_url).unwrap_or(0);
-    let resuming = requested_resume > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let resuming =
+        requested_resume > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let already_have: u64 = if resuming { requested_resume } else { 0 };
     let total = match response.content_length() {
         Some(len) if len > 0 => already_have + len,
@@ -510,7 +756,10 @@ async fn attempt_stream_inner(
     // Stream to the .part file. The 45s stall-watchdog is a per-chunk timeout: no data for 45s aborts
     // (Node reset a setTimeout on every 'data' event). Progress is throttled to every 5% / >2s.
     let mut file = if resuming {
-        tokio::fs::OpenOptions::new().append(true).open(part_path).await?
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(part_path)
+            .await?
     } else {
         tokio::fs::File::create(part_path).await?
     };
@@ -521,26 +770,36 @@ async fn attempt_stream_inner(
     let mut first_update = true;
 
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(STALL_SECS), stream.next()).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(STALL_SECS), stream.next()).await
+        {
             Err(_) => {
-                log::error!("[Internal DL] Data stream stalled for {} seconds. Aborting to trigger retry.", STALL_SECS);
-                bail!("Download stalled for {} seconds", STALL_SECS);
+                log::error!(
+                    "[Internal DL] Data stream stalled for {} seconds. Aborting to trigger retry.",
+                    STALL_SECS
+                );
+                bail!("{M_STALLED} {} seconds", STALL_SECS);
             }
             Ok(None) => break, // stream finished
             Ok(Some(Err(e))) => {
-                bail!("Stream error: {}", e);
+                bail!("{M_STREAM_ERROR} {}", e);
             }
             Ok(Some(Ok(chunk))) => {
                 file.write_all(&chunk).await?;
                 downloaded += chunk.len() as u64;
                 if total > 0 {
                     let pct = ((downloaded as f64 / total as f64) * 100.0) as i64;
-                    if pct % 5 == 0 && pct != last_pct && (first_update || last_update.elapsed().as_millis() > 2000) {
+                    if pct % 5 == 0
+                        && pct != last_pct
+                        && (first_update || last_update.elapsed().as_millis() > 2000)
+                    {
                         first_update = false;
                         last_pct = pct;
                         last_update = std::time::Instant::now();
                         let _ = sqlx::query(r#"UPDATE "Request" SET progress = $1 WHERE id = $2"#)
-                            .bind(pct as i32).bind(&req.request_id).execute(db).await;
+                            .bind(pct as i32)
+                            .bind(&req.request_id)
+                            .execute(db)
+                            .await;
                     }
                 }
             }
@@ -554,7 +813,7 @@ async fn attempt_stream_inner(
     let size = tokio::fs::metadata(part_path).await?.len();
     let min_size = req.min_size_bytes.unwrap_or(DEFAULT_MIN_SIZE);
     if size < min_size {
-        bail!("Downloaded file is suspiciously small ({}kb). Aborting.", size / 1024);
+        bail!("{M_TOO_SMALL} ({}kb). Aborting.", size / 1024);
     }
 
     Ok(())
@@ -572,8 +831,16 @@ mod tests {
     #[test]
     fn blocks_internal_ipv4_ranges() {
         for s in [
-            "127.0.0.1", "10.1.2.3", "192.168.0.1", "172.16.5.5", "172.31.255.255",
-            "169.254.1.1", "0.0.0.0", "100.64.0.1", "100.127.255.255", "255.255.255.255",
+            "127.0.0.1",
+            "10.1.2.3",
+            "192.168.0.1",
+            "172.16.5.5",
+            "172.31.255.255",
+            "169.254.1.1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "100.127.255.255",
+            "255.255.255.255",
         ] {
             assert!(is_blocked_ip(&ip(s)), "{s} should be blocked");
         }
@@ -582,7 +849,15 @@ mod tests {
     #[test]
     fn allows_public_ipv4() {
         // 172.15/172.32 are outside the private 172.16-31 block; 100.63/100.128 outside CGNAT.
-        for s in ["8.8.8.8", "1.1.1.1", "104.18.0.1", "172.15.0.1", "172.32.0.1", "100.63.255.255", "100.128.0.0"] {
+        for s in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "104.18.0.1",
+            "172.15.0.1",
+            "172.32.0.1",
+            "100.63.255.255",
+            "100.128.0.0",
+        ] {
             assert!(!is_blocked_ip(&ip(s)), "{s} should be allowed");
         }
     }
@@ -599,11 +874,19 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_bad_scheme_and_internal_literals() {
-        assert!(validate_download_target("ftp://example.com/file").await.is_err());
-        assert!(validate_download_target("file:///etc/passwd").await.is_err());
+        assert!(validate_download_target("ftp://example.com/file")
+            .await
+            .is_err());
+        assert!(validate_download_target("file:///etc/passwd")
+            .await
+            .is_err());
         assert!(validate_download_target("not a url").await.is_err());
-        assert!(validate_download_target("http://127.0.0.1/x").await.is_err());
-        assert!(validate_download_target("http://192.168.1.1/x").await.is_err());
+        assert!(validate_download_target("http://127.0.0.1/x")
+            .await
+            .is_err());
+        assert!(validate_download_target("http://192.168.1.1/x")
+            .await
+            .is_err());
         assert!(validate_download_target("http://[::1]/x").await.is_err());
         // A public literal IP resolves to itself (no DNS) and is allowed.
         assert!(validate_download_target("http://1.1.1.1/x").await.is_ok());
@@ -619,11 +902,22 @@ mod tests {
         node_headers.insert("Cookie".to_string(), "node=1".to_string());
         node_headers.insert("X-Custom".to_string(), "keep".to_string());
 
-        let map = build_stream_headers(&node_headers, Some("cf_clearance=abc"), "SolverUA/2.0", None);
+        let map = build_stream_headers(
+            &node_headers,
+            Some("cf_clearance=abc"),
+            "SolverUA/2.0",
+            None,
+        );
         assert_eq!(map.get_all(reqwest::header::COOKIE).iter().count(), 1);
         assert_eq!(map.get_all(reqwest::header::USER_AGENT).iter().count(), 1);
-        assert_eq!(map.get(reqwest::header::COOKIE).unwrap(), "cf_clearance=abc");
-        assert_eq!(map.get(reqwest::header::USER_AGENT).unwrap(), "SolverUA/2.0");
+        assert_eq!(
+            map.get(reqwest::header::COOKIE).unwrap(),
+            "cf_clearance=abc"
+        );
+        assert_eq!(
+            map.get(reqwest::header::USER_AGENT).unwrap(),
+            "SolverUA/2.0"
+        );
         assert_eq!(map.get("X-Custom").unwrap(), "keep");
         // Without a clearance, Node's own headers override the defaults (still exactly once each).
         let map2 = build_stream_headers(&node_headers, None, DEFAULT_UA, None);
@@ -639,7 +933,10 @@ mod tests {
     #[test]
     fn resume_offset_requires_matching_url() {
         let hint = Some(("https://getcomics.org/dls/x".to_string(), 4096u64));
-        assert_eq!(resume_offset(&hint, "https://getcomics.org/dls/x"), Some(4096));
+        assert_eq!(
+            resume_offset(&hint, "https://getcomics.org/dls/x"),
+            Some(4096)
+        );
         assert_eq!(resume_offset(&hint, "https://cdn.example.net/landed"), None);
         assert_eq!(resume_offset(&None, "https://getcomics.org/dls/x"), None);
         // Zero bytes is not a resume.
@@ -652,8 +949,14 @@ mod tests {
     // invites the very challenges the solver then has to clear.
     #[test]
     fn default_ua_is_a_complete_browser_string() {
-        assert!(DEFAULT_UA.contains("Chrome/"), "UA should carry a Chrome token: {DEFAULT_UA}");
-        assert!(DEFAULT_UA.ends_with("Safari/537.36"), "UA should end with the Safari token: {DEFAULT_UA}");
+        assert!(
+            DEFAULT_UA.contains("Chrome/"),
+            "UA should carry a Chrome token: {DEFAULT_UA}"
+        );
+        assert!(
+            DEFAULT_UA.ends_with("Safari/537.36"),
+            "UA should end with the Safari token: {DEFAULT_UA}"
+        );
     }
 
     // 429 is a throttle, not a challenge: it must be classified as rate-limited (skip/defer) rather
@@ -663,5 +966,137 @@ mod tests {
         assert!(is_rate_limited(429));
         assert!(!is_rate_limited(403));
         assert!(!is_rate_limited(200));
+    }
+
+    // ==== Manual-hold classification ====
+    //
+    // The MANUAL_DDL hold must fire for the four genuinely human-gated failures ONLY. Every other
+    // error has to keep flowing to the normal retry/stall lifecycle; holding a transient for manual
+    // is the regression this whole table exists to prevent (see the incident: users drowning in
+    // MANUAL_DDL rows that were really DNS blips and dropped TCP mid-stream).
+
+    fn err_from(msg: &str) -> anyhow::Error {
+        anyhow::anyhow!("{msg}")
+    }
+
+    #[test]
+    fn human_gated_failures_are_held_for_manual() {
+        // Row: warm-up obtained no cookies — the solver got nothing usable back.
+        assert_eq!(
+            classify_getcomics_failure(&err_from(M_WARMUP_NO_COOKIES)),
+            GetComicsFailure::HumanGated
+        );
+        // Row: HTML page instead of a comic file — an unsolved Cloudflare interstitial.
+        assert_eq!(
+            classify_getcomics_failure(&err_from(M_HTML_PAGE)),
+            GetComicsFailure::HumanGated
+        );
+        // Row: stall — the solver already consumed the one-shot /dls/ token, so replay can never finish.
+        assert_eq!(
+            classify_getcomics_failure(&err_from(&format!("{M_STALLED} 45 seconds"))),
+            GetComicsFailure::HumanGated
+        );
+        // Row: suspiciously small file — consumed/emptied body.
+        assert_eq!(
+            classify_getcomics_failure(&err_from(&format!("{M_TOO_SMALL} (12kb). Aborting."))),
+            GetComicsFailure::HumanGated
+        );
+        assert_eq!(
+            classify_getcomics_failure(&err_from(M_HTML_PAGE)),
+            GetComicsFailure::HumanGated
+        );
+    }
+
+    #[test]
+    fn deterministic_failures_are_hard_errors_not_manual_holds() {
+        for msg in [
+            M_INVALID_URL.to_string(),
+            format!("{M_BAD_SCHEME}: ftp"),
+            M_NO_HOST.to_string(),
+            format!("{M_SSRF} (10.0.0.5)"),
+            format!("error following redirect for url (https://getcomics.org/dls/x): {REDIRECT_M_TOO_MANY}"),
+            format!("error following redirect for url (https://getcomics.org/dls/x): {REDIRECT_M_SCHEME}"),
+            format!("error following redirect for url (https://getcomics.org/dls/x): {REDIRECT_M_INTERNAL}"),
+        ] {
+            let e = err_from(&msg);
+            assert_eq!(classify_getcomics_failure(&e), GetComicsFailure::Deterministic, "{msg}");
+        }
+    }
+
+    #[test]
+    fn transient_failures_are_retried_not_held() {
+        // DNS: transient by nature — the name resolves again seconds later.
+        let dns = err_from(&format!(
+            "{M_DNS} getcomics.org: dns error: failed to lookup address"
+        ));
+        assert_eq!(
+            classify_getcomics_failure(&dns),
+            GetComicsFailure::Transient
+        );
+        // Connect: TCP/TLS never came up across the 3 in-process attempts.
+        let connect = err_from(&format!(
+            "{M_CONNECT}: error sending request for url (https://getcomics.org/dls/x)"
+        ));
+        assert_eq!(
+            classify_getcomics_failure(&connect),
+            GetComicsFailure::Transient
+        );
+        // Stream: connection dropped mid-body.
+        let stream = err_from(&format!("{M_STREAM_ERROR} connection reset by peer"));
+        assert_eq!(
+            classify_getcomics_failure(&stream),
+            GetComicsFailure::Transient
+        );
+    }
+
+    #[test]
+    fn rate_limit_carve_out_is_preserved() {
+        // The pre-existing carve-out, kept verbatim: a 429 is not a challenge, so it must surface as a
+        // normal retryable failure. It is now structural — `M_RATE_LIMITED` is deliberately filed in no
+        // gated bucket — rather than a negative string check bolted onto the catch-all.
+        let e = err_from(
+            "GetComics rate limited (429) the download link; deferring for a later retry.",
+        );
+        assert!(e.to_string().contains(M_RATE_LIMITED));
+        assert_eq!(classify_getcomics_failure(&e), GetComicsFailure::Transient);
+    }
+
+    #[test]
+    fn unrecognised_errors_default_to_transient_never_to_manual() {
+        // The old catch-all's default was MANUAL_DDL, so an unrecognised error silently asked a human
+        // to do something a retry would have fixed. The default must be the retryable side.
+        for msg in [
+            "download failed before any attempt",
+            "permission denied (os error 13)",
+            "",
+        ] {
+            let e = err_from(msg);
+            assert_eq!(
+                classify_getcomics_failure(&e),
+                GetComicsFailure::Transient,
+                "{msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn classification_sees_the_root_cause_through_wrappers() {
+        // `run_stream_download` propagates with `?` and some steps add `.context(..)`, so the root
+        // message is routinely buried. Matching only the top level would fall through to the default
+        // bucket — which, when the default is "retry", would wrongly RE-classify a human-gated failure.
+        let wrapped = anyhow::anyhow!("{M_HTML_PAGE}")
+            .context("GetComics download couldn't be completed automatically");
+        assert_eq!(
+            classify_getcomics_failure(&wrapped),
+            GetComicsFailure::HumanGated
+        );
+        // Two levels deep, the shape a reqwest redirect refusal actually takes.
+        let redirect = std::io::Error::other(REDIRECT_M_INTERNAL);
+        let redirect = anyhow::Error::new(redirect)
+            .context("error following redirect for url (https://getcomics.org/dls/x)");
+        assert_eq!(
+            classify_getcomics_failure(&redirect),
+            GetComicsFailure::Deterministic
+        );
     }
 }

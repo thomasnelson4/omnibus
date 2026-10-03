@@ -1,7 +1,7 @@
 // src/app/reading-lists/page.tsx
 "use client"
 
-import { useState, useEffect, Suspense, useMemo } from "react"
+import { useState, useEffect, Suspense, useMemo, useRef } from "react"
 import { useSession } from "next-auth/react"
 import { useSearchParams } from "next/navigation"
 import { DragDropContext, Droppable, Draggable } from "@hello-pangea/dnd"
@@ -18,7 +18,7 @@ import {
     BookOpen, Trash2, Plus, GripVertical, Loader2, Image as ImageIcon,
     ArrowLeft, ListOrdered, Calendar, Minus, FolderOpen, CloudDownload,
     Check, DownloadCloud, Sparkles, Globe, ExternalLink, Share2, Info,
-    ChevronDown, ChevronUp, LayoutList, List, RefreshCw
+    ChevronDown, ChevronUp, LayoutList, List, RefreshCw, Link2
 } from "lucide-react"
 import Link from "next/link"
 import { Badge } from "@/components/ui/badge"
@@ -26,6 +26,27 @@ import { Logger } from "@/lib/logger"
 import { getErrorMessage } from "@/lib/utils/error"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { ReadingListItemMatchDialog } from "@/components/reading-list-item-match-dialog"
+import {
+    isMatchProvider, providerIssueUrl, providerLabel, providerShortLabel, isDownloaded, readingListItemLabel, linkedIssueRequest
+} from "@/lib/utils/reading-list-match"
+
+// The entry's provider identity (ReadingListItem.cvIssueId + metadataSource). It's how a user tells
+// "identified but not in the library" from "title only", and links to the provider's issue page.
+function ProviderIdBadge({ item }: { item: any }) {
+    if (!item?.cvIssueId || !isMatchProvider(item.metadataSource)) return null
+    return (
+        <a
+            href={providerIssueUrl(item.metadataSource, item.cvIssueId)}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`Open on ${providerLabel(item.metadataSource)}`}
+            className="shrink-0 font-mono text-[10px] leading-none px-1.5 py-0.5 rounded border border-border bg-muted text-muted-foreground hover:text-primary hover:border-primary/40 transition-colors"
+        >
+            {providerShortLabel(item.metadataSource)} #{item.cvIssueId}
+        </a>
+    )
+}
 
 function ReadingListsContent() {
   const { data: session } = useSession()
@@ -57,6 +78,11 @@ function ReadingListsContent() {
   const [isRefreshingList, setIsRefreshingList] = useState(false)
   const [refreshingItemIds, setRefreshingItemIds] = useState<Set<string>>(new Set())
   const [resyncingSeriesIds, setResyncingSeriesIds] = useState<Set<string>>(new Set())
+
+  // Fix match: the entry being re-pointed, plus what to re-expand / re-focus after the in-place patch
+  const [matchItem, setMatchItem] = useState<any | null>(null)
+  const [revealItemIds, setRevealItemIds] = useState<Set<string> | null>(null)
+  const pendingFocusRef = useRef<string | null>(null)
 
   // CSV Import Modal
   const [csvModalOpen, setCsvModalOpen] = useState(false)
@@ -158,7 +184,9 @@ function ReadingListsContent() {
           
           if (seriesName !== currentSeriesName) {
               if (currentChunk.length > 0) {
-                  chunks.push({ id: `chunk-${chunks.length}`, seriesName: currentSeriesName || "Unknown", items: currentChunk, startIndex });
+                  // Keyed by the chunk's first entry (not its position) so expanded groups survive an
+                  // in-place edit that splits or merges an earlier chunk.
+                  chunks.push({ id: `chunk-${currentChunk[0].id}`, seriesName: currentSeriesName || "Unknown", items: currentChunk, startIndex });
               }
               currentChunk = [item];
               currentSeriesName = seriesName;
@@ -169,7 +197,7 @@ function ReadingListsContent() {
       });
 
       if (currentChunk.length > 0) {
-          chunks.push({ id: `chunk-${chunks.length}`, seriesName: currentSeriesName || "Unknown", items: currentChunk, startIndex });
+          chunks.push({ id: `chunk-${currentChunk[0].id}`, seriesName: currentSeriesName || "Unknown", items: currentChunk, startIndex });
       }
 
       return chunks;
@@ -183,6 +211,32 @@ function ReadingListsContent() {
           return next;
       });
   };
+
+  // After a Fix match the edited row may have moved to another group (it now has — or lost — a
+  // series), so re-expand every group holding a row that was visible before, then return focus to
+  // the row's Fix match button (the row may have remounted under a new chunk key).
+  useEffect(() => {
+      if (!revealItemIds) return;
+      const ids = revealItemIds;
+      setExpandedChunks(prev => {
+          const next = new Set(prev);
+          for (const chunk of groupedItems) {
+              if (chunk.items.some((i: any) => ids.has(i.id))) next.add(chunk.id);
+          }
+          return next;
+      });
+      setRevealItemIds(null);
+      const focusId = pendingFocusRef.current;
+      pendingFocusRef.current = null;
+      if (!focusId) return;
+      const focusRow = () => {
+          const trigger = Array.from(document.querySelectorAll<HTMLElement>('[data-match-trigger]'))
+              .find(el => el.dataset.matchTrigger === focusId);
+          trigger?.focus();
+      };
+      if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(focusRow);
+      else setTimeout(focusRow, 0);
+  }, [groupedItems, revealItemIds]);
 
   useEffect(() => {
     setIsMounted(true)
@@ -556,51 +610,106 @@ function ReadingListsContent() {
       }
   }
 
+  // Fix match saved or cleared: patch the one entry in place — no refetch (that would replace every
+  // list and re-run the auto-link), scroll position kept, open groups kept open, focus back on the row.
+  const handleItemMatched = (updated: any, _outcome: { linked: boolean; cleared: boolean }) => {
+      if (!updated) {
+          fetchLists(activeListId);
+          return;
+      }
+      const keepOpen = new Set<string>([updated.id]);
+      for (const chunk of groupedItems) {
+          if (expandedChunks.has(chunk.id)) chunk.items.forEach((i: any) => keepOpen.add(i.id));
+      }
+      setLists(prev => prev.map(l => l.id !== activeListId ? l : { ...l, items: l.items.map((i: any) => i.id === updated.id ? updated : i) }));
+      pendingFocusRef.current = updated.id;
+      setRevealItemIds(keepOpen);
+      // A "Requested" mark belonged to the entry's OLD identity — the new one may need its own request.
+      setRequestedIds(prev => {
+          if (!prev.has(updated.id)) return prev;
+          const next = new Set(prev);
+          next.delete(updated.id);
+          try { localStorage.setItem('omnibus_requested_issues', JSON.stringify(Array.from(next))); } catch { /* storage unavailable */ }
+          return next;
+      });
+  }
+
+  const handleMatchStale = () => fetchLists(activeListId);
+
   const handleRequestMissing = async (item: any, coverUrl: string | null = null) => {
       setRequestingIds(prev => new Set(prev).add(item.id));
-      
+
       try {
-          let volumeId = 0;
+          let volumeId: number | string = 0;
           let year = new Date().getFullYear().toString();
-          
+
           // FIX: Natively pull the provider from the list item
-          const provider = item.metadataSource || item.issue?.metadataSource || 'COMICVINE';
-          
-          if (item.cvIssueId) {
-              try {
-                  // FIX: Pass provider to lookup-volume API
-                  const lookupRes = await fetch(`/api/reading-lists/lookup-volume?issueId=${item.cvIssueId}&provider=${provider}`);
-                  if (lookupRes.ok) {
-                      const data = await lookupRes.json();
-                      if (data.volumeId) volumeId = data.volumeId;
-                      if (data.year) year = data.year;
-                  }
-              } catch (e) { Logger.log(`Lookup failed: ${getErrorMessage(e)}`, 'error'); }
-          }
+          let provider = item.metadataSource || item.issue?.metadataSource || 'COMICVINE';
+          // A single-issue manual add stores title "" — never send an empty name (the request
+          // route would throw on it); fall back to the linked issue, then a placeholder.
+          const title = (item.title || '').trim() || (item.issue?.series?.name ? `${item.issue.series.name} #${item.issue.number}` : 'Unknown issue');
+          let requestName = title;
 
-          let extractedIssueNumber = "1";
-          const match = item.title.match(/(?:#|issue\s*#?|ch(?:apter)?\s*\.?)\s*0*(\d+(?:\.\d+)?)/i);
-          if (match) {
-              extractedIssueNumber = match[1];
-          }
+          // Linked to an issue that isn't downloaded: file it against the series volume with the
+          // shared request name — exactly what the library's Missing Issues view sends.
+          const linked = linkedIssueRequest(item);
+          let standardRes: Response;
+          if (linked) {
+              volumeId = linked.cvId;
+              provider = linked.metadataSource;
+              requestName = linked.name;
+              standardRes = await fetch('/api/request', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                      type: 'issue',
+                      cvId: linked.cvId,
+                      name: linked.name,
+                      year: linked.year,
+                      publisher: linked.publisher,
+                      image: coverUrl,
+                      issueNumber: linked.issueNumber,
+                      metadataSource: linked.metadataSource,
+                      ...(linked.releaseDate ? { releaseDate: linked.releaseDate } : {})
+                  })
+              });
+          } else {
+              if (item.cvIssueId) {
+                  try {
+                      // FIX: Pass provider to lookup-volume API
+                      const lookupRes = await fetch(`/api/reading-lists/lookup-volume?issueId=${item.cvIssueId}&provider=${provider}`);
+                      if (lookupRes.ok) {
+                          const data = await lookupRes.json();
+                          if (data.volumeId) volumeId = data.volumeId;
+                          if (data.year) year = data.year;
+                      }
+                  } catch (e) { Logger.log(`Lookup failed: ${getErrorMessage(e)}`, 'error'); }
+              }
 
-          const standardRes = await fetch('/api/request', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                  type: 'issue',
-                  cvId: volumeId,
-                  name: item.title, 
-                  year: year,
-                  publisher: "Unknown",
-                  image: coverUrl,
-                  issueNumber: extractedIssueNumber,
-                  metadataSource: provider // <-- FIX: Pass down provider
-              })
-          });
+              let extractedIssueNumber = "1";
+              const match = title.match(/(?:#|issue\s*#?|ch(?:apter)?\s*\.?)\s*0*(\d+(?:\.\d+)?)/i);
+              if (match) {
+                  extractedIssueNumber = match[1];
+              }
+
+              standardRes = await fetch('/api/request', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                      type: 'issue',
+                      cvId: volumeId,
+                      name: title,
+                      year: year,
+                      publisher: "Unknown",
+                      image: coverUrl,
+                      issueNumber: extractedIssueNumber,
+                      metadataSource: provider // <-- FIX: Pass down provider
+                  })
+              });
+          }
 
           if (!standardRes.ok) {
-              const baseName = item.title.split('#')[0].trim();
+              const baseName = requestName.split('#')[0].trim();
               const cleanSearchTerm = baseName.replace(/[^a-zA-Z0-9\s]/g, "").trim().replace(/\s+/g, "+");
               const searchLink = `https://getcomics.org/?s=${cleanSearchTerm}`;
 
@@ -609,7 +718,7 @@ function ReadingListsContent() {
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                       cvId: volumeId,
-                      name: item.title,
+                      name: requestName,
                       image: coverUrl,
                       searchLink: searchLink,
                       metadataSource: provider // <-- FIX: Pass down provider
@@ -695,7 +804,37 @@ function ReadingListsContent() {
   }
 
   const activeList = lists.find(l => l.id === activeListId);
-  const missingItems = activeList ? activeList.items.filter((i: any) => !i.issueId) : [];
+  // Mirrors the server's edit rule (owner or ADMIN; system lists are ADMIN-only).
+  const canEditActiveList = !!activeList && (isAdmin || activeList.userId === session?.user?.id);
+  // "Missing" = nothing to read: unlinked entries AND entries linked to an issue without a file.
+  const missingItems = activeList ? activeList.items.filter((i: any) => !isDownloaded(i)) : [];
+
+  // Request / Requested for any entry without a file. Icon-only below sm so a 360px row keeps room
+  // for its title next to Fix match.
+  const renderRequestButton = (item: any) => {
+      if (requestedIds.has(item.id)) {
+          return (
+              <Button size="sm" variant="secondary" disabled aria-label="Requested" className="h-8 bg-green-50 text-green-700 dark:bg-green-900/20 border-green-200 opacity-100 cursor-not-allowed">
+                  <Check className="w-3.5 h-3.5 sm:mr-1"/> <span className="hidden sm:inline">Requested</span>
+              </Button>
+          );
+      }
+      const isRequesting = requestingIds.has(item.id);
+      return (
+          <Button size="sm" variant="outline" aria-label={`Request ${readingListItemLabel(item)}`} className="h-8 font-bold text-[10px] uppercase tracking-wider border-primary/30 text-primary bg-primary/5 hover:bg-primary/10" onClick={() => handleRequestMissing(item)} disabled={isRequesting}>
+              {isRequesting ? <Loader2 className="w-3.5 h-3.5 animate-spin sm:mr-1"/> : <CloudDownload className="w-3.5 h-3.5 sm:mr-1"/>} <span className="hidden sm:inline">Request</span>
+          </Button>
+      );
+  };
+
+  // Always visible (never hidden below sm): it's the only way to fix a wrong or missing match.
+  const renderFixMatchButton = (item: any) => canEditActiveList ? (
+      <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary" data-match-trigger={item.id} title="Fix match" aria-label={`Fix match for ${readingListItemLabel(item)}`} onClick={() => setMatchItem(item)}>
+          <Link2 className="w-4 h-4" />
+      </Button>
+  ) : null;
+
+  const hasProviderBadge = (item: any) => !!item.cvIssueId && isMatchProvider(item.metadataSource);
 
   return (
     <div className="container mx-auto py-10 px-6 max-w-[1400px] space-y-8 transition-colors duration-300">
@@ -839,7 +978,7 @@ function ReadingListsContent() {
                                           Missing ({missingItems.length})
                                       </Button>
                                   )}
-                                  {(isAdmin || activeList.userId === session?.user?.id) && (
+                                  {canEditActiveList && (
                                       <Button variant="ghost" size="icon" className="h-10 w-10 sm:h-9 sm:w-9 border border-transparent hover:border-red-200 dark:hover:border-red-900/50 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20" onClick={() => setDeleteModalOpen(true)}>
                                           <Trash2 className="w-4 h-4" />
                                       </Button>
@@ -868,9 +1007,18 @@ function ReadingListsContent() {
                                 const isExpanded = expandedChunks.has(chunk.id);
                                 return (
                                     <div key={chunk.id} className="border border-border rounded-xl bg-background shadow-sm overflow-hidden transition-all">
-                                        <div 
+                                        <div
                                             className="p-4 bg-muted/30 flex items-center justify-between cursor-pointer hover:bg-muted/60 transition-colors"
+                                            role="button"
+                                            tabIndex={0}
+                                            aria-expanded={isExpanded}
                                             onClick={() => toggleChunk(chunk.id)}
+                                            onKeyDown={e => {
+                                                if (e.key === 'Enter' || e.key === ' ') {
+                                                    e.preventDefault();
+                                                    toggleChunk(chunk.id);
+                                                }
+                                            }}
                                         >
                                             <div className="flex items-center gap-3">
                                                 <FolderOpen className="w-5 h-5 text-primary" />
@@ -890,6 +1038,7 @@ function ReadingListsContent() {
                                                     const index = chunk.startIndex + localIdx;
                                                     const issue = item.issue;
                                                     const series = issue?.series;
+                                                    const downloaded = isDownloaded(item);
                                                     const coverUrl = activeList.coverUrl || issue?.coverUrl || (series?.folderPath ? `/api/library/cover?path=${encodeURIComponent(series.folderPath)}` : '/api/library/cover?path=missing');
 
                                                 return (
@@ -907,10 +1056,16 @@ function ReadingListsContent() {
                                                         ) : (
                                                                 <h4 className="font-bold text-sm truncate text-muted-foreground">{item.title} (Missing File)</h4>
                                                         )}
+                                                        {((issue && !downloaded) || hasProviderBadge(item)) && (
+                                                            <div className="flex flex-wrap items-center gap-2 mt-0.5 text-[10px]">
+                                                                {issue && !downloaded && <span className="text-[10px] font-bold uppercase tracking-wider text-orange-500">Not downloaded</span>}
+                                                                <ProviderIdBadge item={item} />
+                                                            </div>
+                                                        )}
                                                     </div>
                                                     <div className="flex items-center gap-2 pr-2 shrink-0">
                                                         {!issue && (
-                                                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary" title="Re-check this item against the library" onClick={() => handleRefreshItem(item.id)} disabled={refreshingItemIds.has(item.id)}>
+                                                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary hidden sm:flex" title="Re-check this item against the library" onClick={() => handleRefreshItem(item.id)} disabled={refreshingItemIds.has(item.id)}>
                                                                 {refreshingItemIds.has(item.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                             </Button>
                                                         )}
@@ -919,14 +1074,16 @@ function ReadingListsContent() {
                                                                 {resyncingSeriesIds.has(series.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                             </Button>
                                                         )}
-                                                        {issue && (
+                                                        {issue && downloaded && (
                                                             <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
                                                                 <Link href={`/reader?path=${encodeURIComponent(issue.filePath)}&series=${encodeURIComponent(series.folderPath)}`}>
                                                                     <BookOpen className="w-3.5 h-3.5 sm:mr-2" /> <span className="hidden sm:inline">Read</span>
                                                                 </Link>
                                                             </Button>
                                                         )}
-                                                        {(isAdmin || activeList.userId === session?.user?.id) && (
+                                                        {!downloaded && renderRequestButton(item)}
+                                                        {renderFixMatchButton(item)}
+                                                        {canEditActiveList && (
                                                             <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:text-red-700 hover:bg-red-50 hidden sm:flex" onClick={() => handleRemoveItem(item.id)}>
                                                                 <Minus className="w-4 h-4" />
                                                             </Button>
@@ -952,9 +1109,6 @@ function ReadingListsContent() {
                                           const coverUrl = activeList.coverUrl || issue?.coverUrl || (series?.folderPath ? `/api/library/cover?path=${encodeURIComponent(series.folderPath)}` : '/api/library/cover?path=missing');
 
                                           if (!issue) {
-                                              const isRequesting = requestingIds.has(item.id);
-                                              const isAlreadyRequested = requestedIds.has(item.id);
-                                              
                                               return (
                                                   <Draggable key={item.id} draggableId={item.id} index={index}>
                                                       {(provided, snapshot) => (
@@ -976,22 +1130,18 @@ function ReadingListsContent() {
                                                                       <Badge variant="secondary" className="shrink-0 text-[10px] font-mono h-5 bg-muted border-border text-muted-foreground">Part {index + 1}</Badge>
                                                                       <h4 className="font-bold text-sm truncate text-muted-foreground">{item.title}</h4>
                                                                   </div>
-                                                                  <div className="text-[10px] font-bold uppercase tracking-wider text-orange-500 dark:text-orange-400 mt-1">Not in Library</div>
+                                                                  <div className="flex flex-wrap items-center gap-2 mt-0.5 text-[10px]">
+                                                                      <span className="text-[10px] font-bold uppercase tracking-wider text-orange-500 dark:text-orange-400">Not in Library</span>
+                                                                      <ProviderIdBadge item={item} />
+                                                                  </div>
                                                               </div>
 
                                                               <div className="flex items-center gap-2 shrink-0 pr-2">
-                                                                  <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary" title="Re-check this item against the library" onClick={() => handleRefreshItem(item.id)} disabled={refreshingItemIds.has(item.id)}>
+                                                                  <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-primary hidden sm:flex" title="Re-check this item against the library" onClick={() => handleRefreshItem(item.id)} disabled={refreshingItemIds.has(item.id)}>
                                                                       {refreshingItemIds.has(item.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                                   </Button>
-                                                                  {isAlreadyRequested ? (
-                                                                      <Button size="sm" variant="secondary" disabled className="h-8 bg-green-50 text-green-700 dark:bg-green-900/20 border-green-200 opacity-100 cursor-not-allowed">
-                                                                          <Check className="w-3.5 h-3.5 mr-1"/> Requested
-                                                                      </Button>
-                                                                  ) : (
-                                                                      <Button size="sm" variant="outline" className="h-8 font-bold text-[10px] uppercase tracking-wider border-primary/30 text-primary bg-primary/5 hover:bg-primary/10" onClick={() => handleRequestMissing(item)} disabled={isRequesting}>
-                                                                          {isRequesting ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-1"/> : <CloudDownload className="w-3.5 h-3.5 mr-1"/>} Request
-                                                                      </Button>
-                                                                  )}
+                                                                  {renderRequestButton(item)}
+                                                                  {renderFixMatchButton(item)}
                                                               </div>
                                                           </div>
                                                       )}
@@ -1024,6 +1174,12 @@ function ReadingListsContent() {
                                                                   <span className="font-bold text-foreground shrink-0">Issue #{issue.number}</span>
                                                                   <span className="truncate hidden sm:inline">• {issue.name || "Untitled Issue"}</span>
                                                               </div>
+                                                              {(!isDownloaded(item) || hasProviderBadge(item)) && (
+                                                                  <div className="flex flex-wrap items-center gap-2 mt-0.5 text-[10px]">
+                                                                      {!isDownloaded(item) && <span className="text-[10px] font-bold uppercase tracking-wider text-orange-500">Not downloaded</span>}
+                                                                      <ProviderIdBadge item={item} />
+                                                                  </div>
+                                                              )}
                                                           </div>
 
                                                           <div className="flex items-center gap-2 shrink-0 pr-2">
@@ -1032,12 +1188,15 @@ function ReadingListsContent() {
                                                                       {resyncingSeriesIds.has(series.id) ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                                                                   </Button>
                                                               )}
-                                                              <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
-                                                                  <Link href={`/reader?path=${encodeURIComponent(issue.filePath)}&series=${encodeURIComponent(series.folderPath)}`}>
-                                                                      <BookOpen className="w-3.5 h-3.5 sm:mr-2" /> <span className="hidden sm:inline">Read</span>
-                                                                  </Link>
-                                                              </Button>
-                                                              {(isAdmin || activeList.userId === session?.user?.id) && (
+                                                              {isDownloaded(item) ? (
+                                                                  <Button size="sm" asChild className="h-8 shadow-sm font-bold bg-primary hover:bg-primary/90 text-primary-foreground">
+                                                                      <Link href={`/reader?path=${encodeURIComponent(issue.filePath)}&series=${encodeURIComponent(series.folderPath)}`}>
+                                                                          <BookOpen className="w-3.5 h-3.5 sm:mr-2" /> <span className="hidden sm:inline">Read</span>
+                                                                      </Link>
+                                                                  </Button>
+                                                              ) : renderRequestButton(item)}
+                                                              {renderFixMatchButton(item)}
+                                                              {canEditActiveList && (
                                                                   <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20 hidden sm:flex" onClick={() => handleRemoveItem(item.id)}>
                                                                       <Minus className="w-4 h-4" />
                                                                   </Button>
@@ -1402,7 +1561,21 @@ function ReadingListsContent() {
           </DialogContent>
       </Dialog>
 
-      <ConfirmationDialog 
+      {activeList && (
+        <ReadingListItemMatchDialog
+          open={!!matchItem}
+          onOpenChange={o => { if (!o) setMatchItem(null) }}
+          listId={activeList.id}
+          item={matchItem}
+          listItems={activeList.items}
+          resyncWarning={/^Imported from (AniList|MyAnimeList) user:/.test(activeList.description || '')
+            ? 'Re-syncing this list from AniList/MyAnimeList rebuilds it and discards manual match fixes.' : null}
+          onMatched={handleItemMatched}
+          onStale={handleMatchStale}
+        />
+      )}
+
+      <ConfirmationDialog
         isOpen={deleteModalOpen}
         onClose={() => setDeleteModalOpen(false)}
         onConfirm={confirmDeleteList}

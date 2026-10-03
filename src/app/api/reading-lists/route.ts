@@ -5,7 +5,10 @@ import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger';
-import { getAccessibleLibraryIds } from '@/lib/library-access';
+import { getAccessibleLibraryIds, canAccessLibraryId, type AccessibleLibraries } from '@/lib/library-access';
+import { linkAccessForList } from '@/lib/reading-list-links';
+import { parseReadingListTitle, pickPreferredIssue } from '@/lib/utils/reading-list-match';
+import { isSameIssue } from '@/lib/utils/issue-parser';
 
 export const dynamic = 'force-dynamic';
 
@@ -50,34 +53,55 @@ export async function GET(request: Request) {
         }
 
         if (missingItemsMeta.length > 0) {
+            // Links follow the list OWNER's library access (system lists: any library), whoever's
+            // GET triggers them — otherwise an admin's or another viewer's page load could link a
+            // restricted owner's entry into a library the owner can't see, hiding it from them.
+            const viewer = { id: userId, role: (session?.user as any)?.role };
+            const accessCache = new Map<string, Promise<AccessibleLibraries>>();
             const potentialIssues = await prisma.issue.findMany({
-                where: { 
+                where: {
                     OR: missingItemsMeta.map(m => ({ metadataId: m.id, metadataSource: m.source }))
-                }
+                },
+                select: {
+                    id: true, metadataId: true, metadataSource: true, number: true, filePath: true, attachedVolumeId: true,
+                    series: { select: { libraryId: true } }
+                },
+                orderBy: { createdAt: 'asc' }
             });
-            
+
             const linkUpdates = [];
 
             for (const list of lists) {
-                for (const item of list.items) {
-                    if (!item.issueId && item.cvIssueId) {
-                        const validIssue = potentialIssues.find(i => i.metadataId === item.cvIssueId!.toString() && i.metadataSource === (item.metadataSource || 'COMICVINE'));
-                        
-                        if (validIssue) {
-                            linkUpdates.push(
-                                prisma.readingListItem.update({
-                                    where: { id: item.id },
-                                    data: { issueId: validIssue.id }
-                                })
-                            );
-                        }
+                const unlinked = list.items.filter(i => !i.issueId && i.cvIssueId);
+                if (unlinked.length === 0) continue;
+                const access = await linkAccessForList(list, viewer, accessCache);
+                for (const item of unlinked) {
+                    const source = item.metadataSource || 'COMICVINE';
+                    // #194: a row holding the id but a different number than the title's "#N" is a
+                    // mislabeled copy (sync race) — linking it would undo a Fix match on reload.
+                    // Attached-lane numbers are user curation, so those rows are id-anchored only.
+                    const expected = parseReadingListTitle(item.title).number;
+                    const candidates = potentialIssues.filter(i =>
+                        i.metadataId === String(item.cvIssueId) && i.metadataSource === source
+                        && canAccessLibraryId(access, i.series?.libraryId)
+                        && (!expected || !!i.attachedVolumeId || isSameIssue(i.number, expected)));
+                    const validIssue = pickPreferredIssue(candidates);
+
+                    if (validIssue) {
+                        // Conditional write: a concurrent rematch/clear (or another GET) wins.
+                        linkUpdates.push(
+                            prisma.readingListItem.updateMany({
+                                where: { id: item.id, issueId: null, cvIssueId: item.cvIssueId, metadataSource: item.metadataSource },
+                                data: { issueId: validIssue.id }
+                            })
+                        );
                     }
                 }
             }
 
             if (linkUpdates.length > 0) {
-                await prisma.$transaction(linkUpdates);
-                requiresRefresh = true;
+                const results = await prisma.$transaction(linkUpdates);
+                requiresRefresh = results.some((r: { count: number }) => r.count > 0);
             }
         }
 

@@ -71,8 +71,10 @@ prisma/schema - BACKUP.prisma
 .claude/worktrees/
 .claude/plans/
 
-# Ignore .pi (Pi agent sessions, task logs, scratch)
-.pi/
+# Ignore .pi runtime state (session scratch, background-task logs) but keep
+# .pi/skills/ tracked — those are durable project knowledge, not temp files.
+.pi/*
+!.pi/skills/
 
 # Internal planning / status docs + local deploy compose (kept local, untracked)
 ANNAS_ARCHIVE_PLAN.md

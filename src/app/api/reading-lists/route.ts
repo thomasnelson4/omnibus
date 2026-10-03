@@ -170,6 +170,96 @@ export async function POST(request: Request) {
     }
 }
 
+// PATCH — the only post-creation list edit. Deliberately narrow (visibility only): every extra
+// writable field is another field the ownership rule has to be re-argued for, and nothing else is
+// missing. Lives here rather than in its own route so the ownership rule sits next to DELETE's copy.
+export async function PATCH(request: Request) {
+    try {
+        const authOptions = await getAuthOptions();
+        const session = await getServerSession(authOptions);
+        if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+        const userId = (session.user as any).id;
+        const role = (session.user as any).role;
+        const canMakeGlobal = role === 'ADMIN' || (session.user as any).canCreateGlobalLists === true;
+
+        const bad = (error: string) => NextResponse.json({ error, code: 'INVALID_INPUT' }, { status: 400 });
+
+        // Hand-validated (this repo has no zod). Strings only, because an object here would reach
+        // Prisma as a filter operator ({ not: '' }) rather than as a value.
+        let body: any;
+        try {
+            body = await request.json();
+        } catch {
+            return bad('Invalid JSON body.');
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('Invalid JSON body.');
+
+        const { id, isGlobal } = body;
+        if (typeof id !== 'string' || !id) return bad('id is required.');
+        if (typeof isGlobal !== 'boolean') return bad('isGlobal must be a boolean.');
+
+        const list = await prisma.readingList.findUnique({ where: { id } });
+        if (!list) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+        // Same edit rule as DELETE and items/route.ts: owner or ADMIN; system lists (userId null)
+        // have no owner, so they are ADMIN-only.
+        if (list.userId !== userId && role !== 'ADMIN') {
+            return NextResponse.json({ error: "Forbidden", code: 'FORBIDDEN' }, { status: 403 });
+        }
+
+        // canCreateGlobalLists gates PUBLISHING, one way only. An ADMIN may have made this owner's
+        // list global for them; gating the reverse direction too would leave a public list that its
+        // owner cannot hide. So: promotion needs the permission, demotion only needs ownership.
+        // Refused loudly (403) rather than coerced to false the way POST does — POST has no prior
+        // state to contradict, here it would leave the caller believing it had changed something.
+        if (isGlobal && !canMakeGlobal) {
+            return NextResponse.json({
+                error: "You do not have permission to publish a list to all users.",
+                code: 'FORBIDDEN_GLOBAL'
+            }, { status: 403 });
+        }
+
+        // A list with no owner is visible to every user REGARDLESS of this flag (the OR filter in
+        // GET, and share/route.ts's isPublic, both test userId === null on their own). Flipping it
+        // changes nothing, so the response says so instead of letting a caller read "private" off a
+        // 200. The write itself is still allowed: the flag is still the list's honest metadata.
+        const isSystemList = list.userId === null;
+
+        // Demoting has to actually mean private. /reading-lists/shared/[shareId] is an
+        // unauthenticated server component keyed only on shareId, so a link minted while the list
+        // was public keeps reading it forever. Revoking it with the exposure is the honest reading
+        // of "private" — and it is one click to re-mint. NOT done for a system list: that one never
+        // becomes private, so clearing would be a pure, unrequested loss. Also only on a real
+        // true -> false transition, so a redundant call cannot quietly destroy a link.
+        const revokeShare = list.isGlobal === true && !isGlobal && !isSystemList;
+
+        const updated = await prisma.readingList.update({
+            where: { id },
+            data: { isGlobal, ...(revokeShare ? { shareId: null } : {}) }
+        });
+
+        // Phase 4 naming rule is `{name}` for a global list and `{name} ({owner})` for a user-owned
+        // one, so this flag change renames the remote read list — re-push so it can't silently drift.
+        // The trigger no-ops for a list without komgaSync and never throws when Redis is down.
+        if (updated.komgaSync && updated.isGlobal !== list.isGlobal) triggerReadListPushSoon(updated.id);
+
+        return NextResponse.json({
+            success: true,
+            list: updated,
+            shareRevoked: revokeShare,
+            // What the list actually is now, independent of what the flag says.
+            isPrivate: !isSystemList && updated.isGlobal === false,
+            notice: isSystemList
+                ? "This list has no owner, so it stays visible to every user."
+                : undefined
+        });
+    } catch (error: unknown) {
+        Logger.log(`[Reading Lists API] Error: ${getErrorMessage(error)}`, 'error');
+        return NextResponse.json({ error: getErrorMessage(error) }, { status: 500 });
+    }
+}
+
 export async function DELETE(request: Request) {
     try {
         const authOptions = await getAuthOptions();

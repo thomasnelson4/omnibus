@@ -116,6 +116,46 @@ export function parseProviderIssueId(provider: MatchProvider, raw: unknown): Par
     return { ok: true, id };
 }
 
+/**
+ * Map a provider token from an import source (a CBL `<Database Name="..."/>`, a CSV column
+ * header) onto the MATCH_PROVIDERS namespace. Anything outside those two is rejected rather than
+ * defaulted: writing a LOCAL / UNMATCHED token into metadataSource would make the Komga identity
+ * map look for an issue id in a namespace that can never match.
+ */
+export function providerFromToken(raw: unknown): MatchProvider | null {
+    const t = String(raw ?? '').trim().toLowerCase().replace(/[^a-z]/g, '');
+    if (t === 'cv' || t === 'comicvine') return 'COMICVINE';
+    if (t === 'metron' || t === 'metroncloud') return 'METRON';
+    return null;
+}
+
+/**
+ * The (metadataSource, cvIssueId) pair an importer may store on a ReadingListItem, or null when the
+ * input does not name a usable provider ISSUE.
+ *
+ * ReadingListItem.cvIssueId is an Int? that holds a provider issue id in EITHER namespace —
+ * metadataSource says which, exactly as the rematch PATCH writes it and the GET auto-link reads it
+ * back. So a Metron id belongs in cvIssueId too; writing it into metadataSource instead (or
+ * leaving it null) would break the auto-link and the Komga LINK pass.
+ *
+ * Every candidate goes through parseProviderIssueId, which is what keeps a mis-typed or oversized
+ * value out of an int4 column: a ComicVine VOLUME id (4050-…) is rejected outright rather than
+ * silently truncated into a plausible-looking issue id, and anything above
+ * MAX_PROVIDER_ISSUE_ID is refused instead of wrapping. A null result is normal — the caller must
+ * simply import the row without an id.
+ */
+export function providerIdentityForImport(source: unknown, rawIssueId: unknown):
+    { metadataSource: MatchProvider, cvIssueId: number } | null {
+    const provider = providerFromToken(source);
+    if (!provider) return null;
+    // Import files write ids provider-prefixed ("cv-12345"); the rest of the app's parsers take the
+    // bare number, so strip the prefix and let parseProviderIssueId do the validating.
+    const raw = String(rawIssueId ?? '').trim().replace(/^[a-z]+-/i, '');
+    if (!raw) return null;
+    const parsed = parseProviderIssueId(provider, raw);
+    return parsed.ok ? { metadataSource: provider, cvIssueId: parsed.id } : null;
+}
+
 /** Canonical issue number for titles and comparisons: "13½"→"13.5", "001"→"1", "-01"→"-1". */
 export function normalizeIssueNo(n: string | number | null | undefined): string {
     return normalizeFractionNumbers(String(n ?? '').trim()).replace(/^(-?)0+(?=\d)/, '$1');

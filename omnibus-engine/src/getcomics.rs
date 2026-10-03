@@ -1,10 +1,10 @@
 use reqwest::Client;
 use scraper::{ElementRef, Html, Selector};
- 
-use std::collections::HashSet;
+
 use crate::prowlarr::ProwlarrResult;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use std::collections::HashSet;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct DeepLinkResult {
@@ -19,18 +19,74 @@ pub struct HosterPref {
     pub enabled: bool,
 }
 
-/// Default hoster order. Both GetComics variants sit at the TOP — `getcomics_direct` (the comicfiles
-/// CDN) first, then `getcomics_main` (the getcomics.org/dls/ "main server"). The /dls/ direct download
-/// succeeds for the majority of issues; only the subset behind a live Cloudflare challenge falls
-/// through to the download-time manual-hold. It deliberately outranks the third-party mirrors because
-/// those (rootz/vikingfile/terabox) are far less reliable to resolve. This matches the original single
-/// `getcomics`-first ordering. Mirrors the Node `DEFAULT_HOSTER_ORDER`.
+/// Default hoster order. Reliable-by-scraping mirrors are tried BEFORE the one hoster that needs a
+/// browser solver:
+///   `getcomics_direct` (the comicfiles CDN, never Cloudflare-gated) → `mediafire` / `mega` /
+///   `pixeldrain` (all resolvable by plain scraping, no solver) → `getcomics_main` (getcomics.org/dls/
+///   "main server" — the ONLY hoster behind Cloudflare, and the only one that can end in MANUAL_DDL).
+/// It used to sit second, ahead of every working mirror, which funnelled the bulk of downloads at the
+/// most failure-prone path for no benefit: a mirror that needs no solver simply succeeds.
+/// `getcomics_main` stays ENABLED — many issues only expose a /dls/ link — it is just tried last.
+/// Mirrors the Node `DEFAULT_HOSTER_ORDER`.
 fn default_hoster_prefs() -> Vec<HosterPref> {
     // rootz/vikingfile/terabox are listed but DISABLED by default — they're Cloudflare/JS/app-gated and
     // can't be resolved by scraping, so they're off out of the box (kept toggleable so a user can try).
-    [("getcomics_direct", true), ("getcomics_main", true), ("mediafire", true), ("mega", true),
-     ("pixeldrain", true), ("rootz", false), ("vikingfile", false), ("terabox", false)]
-        .iter().map(|(h, en)| HosterPref { hoster: h.to_string(), enabled: *en }).collect()
+    [
+        ("getcomics_direct", true),
+        ("mediafire", true),
+        ("mega", true),
+        ("pixeldrain", true),
+        ("getcomics_main", true),
+        ("rootz", false),
+        ("vikingfile", false),
+        ("terabox", false),
+    ]
+    .iter()
+    .map(|(h, en)| HosterPref {
+        hoster: h.to_string(),
+        enabled: *en,
+    })
+    .collect()
+}
+
+/// The order shipped before `getcomics_main` was demoted below the scraping mirrors. Only used as the
+/// "untouched config" fingerprint for `migrate_pristine_default_order`.
+const LEGACY_DEFAULT_ORDER: [(&str, bool); 8] = [
+    ("getcomics_direct", true),
+    ("getcomics_main", true),
+    ("mediafire", true),
+    ("mega", true),
+    ("pixeldrain", true),
+    ("rootz", false),
+    ("vikingfile", false),
+    ("terabox", false),
+];
+
+/// Moves a PRISTINE stored config onto the new default order.
+///
+/// `hoster_priority` is a persisted per-install setting, so changing `default_hoster_prefs()` alone
+/// only helps installs where it is unset — every existing install (including the users drowning in
+/// MANUAL_DDL) keeps its stored order. Reordering stored configs wholesale would be a regression
+/// though: it cannot distinguish "the user never touched this" from "the user deliberately put
+/// getcomics_main first", and silently overwriting deliberate tuning is not acceptable.
+///
+/// So this is deliberately conservative: it fires ONLY when the stored list is byte-for-byte the
+/// order WE shipped (same hosters, same order, same enabled flags). Any customisation — a reordered
+/// entry, a toggled hoster, a dropped hoster, or the string-array form — fails the comparison and is
+/// left completely untouched. Pure and read-path only (no DB write, exactly like
+/// `migrate_legacy_getcomics`), so it is idempotent by construction: applying it to an already-migrated
+/// list finds no `getcomics_main` in the legacy slot and returns it unchanged. Mirrors the Node
+/// `migratePristineHosterOrder`.
+fn migrate_pristine_default_order(prefs: Vec<HosterPref>) -> Vec<HosterPref> {
+    let pristine = prefs.len() == LEGACY_DEFAULT_ORDER.len()
+        && LEGACY_DEFAULT_ORDER
+            .iter()
+            .zip(prefs.iter())
+            .all(|((h, en), p)| p.hoster == *h && p.enabled == *en);
+    if !pristine {
+        return prefs;
+    }
+    default_hoster_prefs()
 }
 
 /// Migrates a legacy single `getcomics` entry into the split scheme: `getcomics_direct` keeps the
@@ -42,7 +98,13 @@ fn migrate_legacy_getcomics(prefs: &mut Vec<HosterPref>) {
         let enabled = prefs[idx].enabled;
         prefs[idx].hoster = "getcomics_direct".to_string();
         if !prefs.iter().any(|p| p.hoster == "getcomics_main") {
-            prefs.insert(idx + 1, HosterPref { hoster: "getcomics_main".to_string(), enabled });
+            prefs.insert(
+                idx + 1,
+                HosterPref {
+                    hoster: "getcomics_main".to_string(),
+                    enabled,
+                },
+            );
         }
     }
 }
@@ -51,35 +113,64 @@ fn migrate_legacy_getcomics(prefs: &mut Vec<HosterPref>) {
 /// `enabledHostersFromSetting`/`migrateHosterPrefs` helpers): unset → defaults; empty array → none;
 /// string array → all enabled in that order; object array → each entry's `enabled` flag (default true).
 pub async fn hoster_prefs(db: &sqlx::AnyPool) -> Vec<HosterPref> {
-    let hp: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'hoster_priority'"#)
-        .fetch_optional(db).await.ok().flatten();
-    let Some(val) = hp else { return default_hoster_prefs(); };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&val) else { return default_hoster_prefs(); };
-    let Some(arr) = parsed.as_array() else { return default_hoster_prefs(); };
-    if arr.is_empty() { return Vec::new(); }
+    let hp: Option<String> =
+        sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'hoster_priority'"#)
+            .fetch_optional(db)
+            .await
+            .ok()
+            .flatten();
+    let Some(val) = hp else {
+        return default_hoster_prefs();
+    };
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&val) else {
+        return default_hoster_prefs();
+    };
+    let Some(arr) = parsed.as_array() else {
+        return default_hoster_prefs();
+    };
+    if arr.is_empty() {
+        return Vec::new();
+    }
     let mut prefs: Vec<HosterPref> = if arr[0].is_string() {
-        arr.iter().filter_map(|v| v.as_str().map(|s| HosterPref { hoster: s.to_string(), enabled: true })).collect()
+        arr.iter()
+            .filter_map(|v| {
+                v.as_str().map(|s| HosterPref {
+                    hoster: s.to_string(),
+                    enabled: true,
+                })
+            })
+            .collect()
     } else {
-        arr.iter().filter_map(|v| {
-            let h = v.get("hoster").and_then(|h| h.as_str())?.to_string();
-            let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
-            Some(HosterPref { hoster: h, enabled })
-        }).collect()
+        arr.iter()
+            .filter_map(|v| {
+                let h = v.get("hoster").and_then(|h| h.as_str())?.to_string();
+                let enabled = v.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true);
+                Some(HosterPref { hoster: h, enabled })
+            })
+            .collect()
     };
     migrate_legacy_getcomics(&mut prefs);
-    prefs
+    migrate_pristine_default_order(prefs)
 }
 
 /// The set of currently-enabled hosters, priority order preserved (Node's `enabledHosters`).
 pub async fn enabled_hosters(db: &sqlx::AnyPool) -> Vec<String> {
-    hoster_prefs(db).await.into_iter().filter(|p| p.enabled).map(|p| p.hoster).collect()
+    hoster_prefs(db)
+        .await
+        .into_iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.hoster)
+        .collect()
 }
 
 /// Whether GetComics is usable as a source at all — either the fast direct CDN (`getcomics_direct`)
 /// or the gated main server (`getcomics_main`) is enabled. The split replaced the single legacy
 /// `getcomics` key, which is still accepted for un-migrated callers.
 pub async fn is_getcomics_enabled(db: &sqlx::AnyPool) -> bool {
-    enabled_hosters(db).await.iter().any(|h| h == "getcomics_direct" || h == "getcomics_main" || h == "getcomics")
+    enabled_hosters(db)
+        .await
+        .iter()
+        .any(|h| h == "getcomics_direct" || h == "getcomics_main" || h == "getcomics")
 }
 
 /// Records a Cloudflare-block timestamp so the rest of the app can back off / surface it in the UI.
@@ -122,7 +213,9 @@ async fn mark_time_flag(db: &sqlx::AnyPool, key: &str) {
 /// same text). None when no size is present or the unit is unrecognized.
 pub(crate) fn parse_size_bytes(text: &str) -> Option<i64> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)size\s*[:\-]\s*([0-9][0-9.,]*)\s*([kmgt])i?b\b").unwrap());
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)size\s*[:\-]\s*([0-9][0-9.,]*)\s*([kmgt])i?b\b").unwrap()
+    });
     let caps = re.captures(text)?;
     let num: f64 = caps[1].replace(',', "").parse().ok()?;
     let mult = match caps[2].to_lowercase().as_str() {
@@ -139,7 +232,9 @@ pub(crate) fn parse_size_bytes(text: &str) -> Option<i64> {
 /// section, and the demotion decision below should key on the biggest thing the page offers.
 pub(crate) fn max_size_bytes(text: &str) -> Option<i64> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| regex::Regex::new(r"(?i)size\s*[:\-]\s*[0-9][0-9.,]*\s*[kmgt]i?b\b").unwrap());
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?i)size\s*[:\-]\s*[0-9][0-9.,]*\s*[kmgt]i?b\b").unwrap()
+    });
     re.find_iter(text)
         .filter_map(|m| parse_size_bytes(m.as_str()))
         .max()
@@ -163,10 +258,20 @@ pub struct SolverConfig {
 /// backend (default `flaresolverr`). GetComics' Cloudflare Turnstile can need far longer than the old
 /// 60s, so the default budget is 300s.
 pub async fn solver_config(db: &sqlx::AnyPool) -> SolverConfig {
-    let secs = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_timeout'"#)
-        .fetch_optional(db).await.ok().flatten();
-    let kind = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'solver_type'"#)
-        .fetch_optional(db).await.ok().flatten();
+    let secs = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_timeout'"#,
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
+    let kind = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'solver_type'"#,
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten();
     derive_solver_config(kind, secs)
 }
 
@@ -176,7 +281,10 @@ pub async fn solver_config(db: &sqlx::AnyPool) -> SolverConfig {
 /// sessionless like Byparr (it manages its own session cache), which solver_request_get handles by
 /// only wrapping `kind == "flaresolverr"` in sessions. The engine's own HTTP timeout is always the
 /// budget + a 15s margin so it never cuts the solver off before the solver's own budget elapses.
-pub(crate) fn derive_solver_config(kind_setting: Option<String>, secs_setting: Option<String>) -> SolverConfig {
+pub(crate) fn derive_solver_config(
+    kind_setting: Option<String>,
+    secs_setting: Option<String>,
+) -> SolverConfig {
     let secs = secs_setting
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(300)
@@ -186,7 +294,11 @@ pub(crate) fn derive_solver_config(kind_setting: Option<String>, secs_setting: O
         .filter(|s| s == "byparr" || s == "flaresolverr" || s == "trawl")
         .unwrap_or_else(|| "flaresolverr".to_string());
     let payload_timeout = if kind == "byparr" { secs } else { secs * 1000 };
-    SolverConfig { kind, payload_timeout, http_timeout_ms: secs * 1000 + 15_000 }
+    SolverConfig {
+        kind,
+        payload_timeout,
+        http_timeout_ms: secs * 1000 + 15_000,
+    }
 }
 
 // ==== Solver health (2026-07-26 field incident): a wedged FlareSolverr — nodriver loop crash,
@@ -199,9 +311,37 @@ pub(crate) fn derive_solver_config(kind_setting: Option<String>, secs_setting: O
 //     skips re-solving that host for a TTL (the success side already has the 600s clearance
 //     cache — this is its mirror).
 
-pub(crate) const SOLVER_BREAKER_THRESHOLD: u32 = 2;
-pub(crate) const SOLVER_BREAKER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(600);
+// Consecutive TRANSPORT failures before the breaker opens. Raised 2 → 5: at threshold 2 a single
+// solver hiccup (one container restart, one blip) opened a 10-minute global pause, and every gated
+// download in that window became MANUAL_DDL. 5 consecutive failures is far more likely to mean
+// "the solver really is down" than "two unlucky requests", and it costs at most a few more
+// budget-timeout grinds before the breaker does open.
+pub(crate) const SOLVER_BREAKER_THRESHOLD: u32 = 5;
+// How long the breaker stays open. Cut 600s → 150s so a self-healed solver (container auto-restart)
+// is picked back up within a couple of minutes instead of stalling every gated download for 10.
+// This only bounds the WORST case (a genuinely wedged solver still waits out the cooldown before the
+// first re-probe) — it never lengthens a solve, so a short cooldown is strictly cheaper than a long one.
+pub(crate) const SOLVER_BREAKER_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(150);
+// A DEFINITIVE "ran the whole budget, could not solve" verdict for one host. Deliberately LEFT at
+// 600s and tuned separately from the breaker: unlike the breaker (which caches "the solver is not
+// answering", a fact that becomes false the instant the solver comes back), this caches "this
+// challenge variant is beyond the solver build" — a verdict that does NOT change by waiting. Each
+// entry costs a full solve budget (default 300s), so shortening it buys nothing but re-running
+// expensive, known-doomed solves: it would turn a 10-minute cooldown into a 10-minute cadence of
+// 300s timeouts on the same link, which is a WORSE outcome than the one it tries to fix. Keep 600s.
+// The two constants are deliberately different lengths: breaker = "re-probe as soon as it's cheap",
+// negative cache = "re-attempt only when enough time has passed to be worth a budget burn".
 pub(crate) const SOLVER_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The verdict of a `skip_reason` probe. `breaker_recovered` is reported separately from `reason`
+/// because a half-open breaker is NOT a skip: the caller must go on to solve AND clear the stale
+/// `solver_unresponsive_time` stamp, otherwise the health panel keeps warning about a solver that
+/// came back minutes ago (health-checker only treats the stamp as recovered after 30 minutes).
+#[derive(Default)]
+pub(crate) struct SkipDecision {
+    pub reason: Option<String>,
+    pub breaker_recovered: bool,
+}
 
 #[derive(Default)]
 pub(crate) struct SolverHealth {
@@ -231,33 +371,39 @@ impl SolverHealth {
 
     /// A definitive "solver ran its budget and could not solve" for this host.
     pub(crate) fn mark_unsolvable(&mut self, host: &str, now: std::time::Instant) {
-        self.negative_hosts.insert(host.to_string(), now + SOLVER_NEGATIVE_TTL);
+        self.negative_hosts
+            .insert(host.to_string(), now + SOLVER_NEGATIVE_TTL);
     }
 
-    /// Why solving should be SKIPPED right now — breaker open or host negative-cached — or None.
-    /// An elapsed breaker half-opens (state cleared, the next attempt probes for real).
-    pub(crate) fn skip_reason(&mut self, host: &str, now: std::time::Instant) -> Option<String> {
+    /// Why solving should be SKIPPED right now — breaker open or host negative-cached — or a decision
+    /// with no reason. An elapsed breaker half-opens (state cleared, the next attempt probes for real)
+    /// and reports `breaker_recovered` so the caller can clear the health-panel stamp.
+    pub(crate) fn skip_reason(&mut self, host: &str, now: std::time::Instant) -> SkipDecision {
+        let mut decision = SkipDecision::default();
         if let Some(until) = self.breaker_until {
             if now < until {
-                return Some(format!(
+                decision.reason = Some(format!(
                     "solver circuit is open after {} consecutive transport failures; solve attempts resume in {}s",
                     self.transport_failures,
                     (until - now).as_secs()
                 ));
+                return decision;
             }
             self.breaker_until = None;
             self.transport_failures = 0;
+            decision.breaker_recovered = true;
         }
         if let Some(until) = self.negative_hosts.get(host) {
             if now < *until {
-                return Some(format!(
+                decision.reason = Some(format!(
                     "solver recently failed to solve this host's challenge (ran its full budget); skipping re-solves for another {}s",
                     (*until - now).as_secs()
                 ));
+                return decision;
             }
             self.negative_hosts.remove(host);
         }
-        None
+        decision
     }
 }
 
@@ -276,7 +422,12 @@ pub(crate) fn is_challenge_timeout_response(data: &serde_json::Value) -> bool {
     status.eq_ignore_ascii_case("error") && message.contains("Error solving the challenge")
 }
 
-async fn fetch_html(client: &Client, db: &sqlx::AnyPool, url: &str, flaresolverr: Option<&str>) -> anyhow::Result<String> {
+async fn fetch_html(
+    client: &Client,
+    db: &sqlx::AnyPool,
+    url: &str,
+    flaresolverr: Option<&str>,
+) -> anyhow::Result<String> {
     // Bounded 429 handling (Kapowarr-parity): honor Retry-After (else exponential backoff), flag
     // the throttle for the UI, and after the budget give up with an error — a rate limit means the
     // source yields nothing THIS round; it is never a blocklist event and never fails the request.
@@ -295,15 +446,27 @@ async fn fetch_html(client: &Client, db: &sqlx::AnyPool, url: &str, flaresolverr
         if wait > 90 {
             // Sleeping out a long ban inside a search would stall the whole queue — bail now and
             // let the scheduled retry sweeps come back later.
-            anyhow::bail!("GetComics rate limited (429) for {}; server asked for {}s — deferring", url, wait);
+            anyhow::bail!(
+                "GetComics rate limited (429) for {}; server asked for {}s — deferring",
+                url,
+                wait
+            );
         }
-        log::warn!("[GetComics] 429 rate limited for {}; backing off {}s (attempt {}/2).", url, wait, attempt + 1);
+        log::warn!(
+            "[GetComics] 429 rate limited for {}; backing off {}s (attempt {}/2).",
+            url,
+            wait,
+            attempt + 1
+        );
         tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         res = client.get(url).send().await?;
     }
     if res.status() == 429 {
         mark_getcomics_rate_limit_flag(db).await;
-        anyhow::bail!("GetComics rate limited (429) for {} after backoff retries", url);
+        anyhow::bail!(
+            "GetComics rate limited (429) for {} after backoff retries",
+            url
+        );
     }
     // 403 is Cloudflare's modern challenge status; 503 is the legacy "Just a moment…" interstitial.
     // The Anna's Archive copy of this fetcher always handled both — the GetComics path only caught
@@ -312,7 +475,12 @@ async fn fetch_html(client: &Client, db: &sqlx::AnyPool, url: &str, flaresolverr
     if res.status() == 403 || res.status() == 503 {
         if let Some(flare_url) = flaresolverr.filter(|f| !f.is_empty()) {
             let sc = solver_config(db).await;
-            log::warn!("[GetComics] {} detected for {}; attempting {} bypass...", res.status(), url, sc.kind);
+            log::warn!(
+                "[GetComics] {} detected for {}; attempting {} bypass...",
+                res.status(),
+                url,
+                sc.kind
+            );
             match solver_request_get(client, db, flare_url, url, &sc).await {
                 Ok(data) => {
                     if let Some(html) = data["solution"]["response"].as_str() {
@@ -353,25 +521,58 @@ pub struct SolverClearance {
 /// Pure (no I/O) so it can be unit-tested.
 fn parse_flaresolverr_clearance(data: &serde_json::Value) -> Option<SolverClearance> {
     let solution = data.get("solution")?;
-    let user_agent = solution.get("userAgent").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let cookie = solution.get("cookies")?.as_array()?
+    let user_agent = solution
+        .get("userAgent")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let cookie = solution
+        .get("cookies")?
+        .as_array()?
         .iter()
-        .filter_map(|c| Some(format!("{}={}", c.get("name")?.as_str()?, c.get("value")?.as_str()?)))
+        .filter_map(|c| {
+            Some(format!(
+                "{}={}",
+                c.get("name")?.as_str()?,
+                c.get("value")?.as_str()?
+            ))
+        })
         .collect::<Vec<_>>()
         .join("; ");
-    if cookie.is_empty() { return None; }
-    let solved_url = solution.get("url").and_then(|v| v.as_str()).map(str::trim)
-        .filter(|s| !s.is_empty()).map(|s| s.to_string());
-    let solved_status = solution.get("status").and_then(|v| v.as_u64()).map(|s| s as u16);
-    Some(SolverClearance { cookie, user_agent, solved_url, solved_status })
+    if cookie.is_empty() {
+        return None;
+    }
+    let solved_url = solution
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let solved_status = solution
+        .get("status")
+        .and_then(|v| v.as_u64())
+        .map(|s| s as u16);
+    Some(SolverClearance {
+        cookie,
+        user_agent,
+        solved_url,
+        solved_status,
+    })
 }
 
 /// POSTs one command to a solver /v1 endpoint and parses the JSON body.
-async fn solver_post(client: &Client, target: &str, payload: &serde_json::Value, timeout_ms: u64) -> anyhow::Result<serde_json::Value> {
-    let res = client.post(target)
+async fn solver_post(
+    client: &Client,
+    target: &str,
+    payload: &serde_json::Value,
+    timeout_ms: u64,
+) -> anyhow::Result<serde_json::Value> {
+    let res = client
+        .post(target)
         .json(payload)
         .timeout(std::time::Duration::from_millis(timeout_ms))
-        .send().await?;
+        .send()
+        .await?;
     Ok(res.json().await?)
 }
 
@@ -382,37 +583,88 @@ async fn solver_post(client: &Client, target: &str, payload: &serde_json::Value,
 /// GetComics' Turnstile (the "status=ok, cookies=0" failures in our logs). Byparr keeps the
 /// sessionless shape (no session API). Session create failure degrades to sessionless; the destroy
 /// is best-effort and runs even when the solve fails so FlareSolverr doesn't leak browsers.
-pub(crate) async fn solver_request_get(client: &Client, db: &sqlx::AnyPool, flare_url: &str, url: &str, sc: &SolverConfig) -> anyhow::Result<serde_json::Value> {
-    let target = if flare_url.ends_with("/v1") { flare_url.to_string() } else { format!("{}/v1", flare_url) };
-    let host = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+pub(crate) async fn solver_request_get(
+    client: &Client,
+    db: &sqlx::AnyPool,
+    flare_url: &str,
+    url: &str,
+    sc: &SolverConfig,
+) -> anyhow::Result<serde_json::Value> {
+    let target = if flare_url.ends_with("/v1") {
+        flare_url.to_string()
+    } else {
+        format!("{}/v1", flare_url)
+    };
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
 
     // Fail fast while the breaker is open or the host's challenge was just declared unsolvable —
     // a wedged solver queues requests forever, and re-solving a definitively failed challenge
     // seconds later burns the full budget for the same verdict.
     {
-        let mut health = solver_health().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(reason) = health.skip_reason(&host, std::time::Instant::now()) {
+        // The std Mutex guard is scoped to this block and never held across an await — a
+        // MutexGuard<..> is not Send, so holding it into `clear_time_flag(..).await` would make the
+        // whole handler future non-Send and break axum's Handler bound.
+        let decision = {
+            let mut health = solver_health().lock().unwrap_or_else(|p| p.into_inner());
+            health.skip_reason(&host, std::time::Instant::now())
+        };
+        // The cooldown elapsed on this very call: the breaker is half-open and we are about to re-probe
+        // the solver, so the "unresponsive" stamp no longer describes reality. (Clearing it only on a
+        // successful response left it latched until health-checker's 30-minute staleness fallback, which
+        // matters far more now that the cooldown is 150s.)
+        if decision.breaker_recovered {
+            log::info!(
+                "[Solver] circuit-breaker cooldown elapsed; re-probing {}.",
+                target
+            );
+            clear_time_flag(db, "solver_unresponsive_time").await;
+        }
+        if let Some(reason) = decision.reason {
             anyhow::bail!("{reason}");
         }
     }
 
     let session_id = if sc.kind == "flaresolverr" {
-        match solver_post(client, &target, &serde_json::json!({ "cmd": "sessions.create" }), 20_000).await {
-            Ok(d) => d.get("session").and_then(|s| s.as_str()).map(|s| s.to_string()),
-            Err(e) => { log::debug!("[Solver] sessions.create failed, degrading to sessionless solve: {e}"); None }
+        match solver_post(
+            client,
+            &target,
+            &serde_json::json!({ "cmd": "sessions.create" }),
+            20_000,
+        )
+        .await
+        {
+            Ok(d) => d
+                .get("session")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string()),
+            Err(e) => {
+                log::debug!("[Solver] sessions.create failed, degrading to sessionless solve: {e}");
+                None
+            }
         }
     } else {
         // Byparr has no session API; Trawl is FlareSolverr-compatible but manages its own
         // session cache internally — both take the sessionless shape.
         None
     };
-    let mut payload = serde_json::json!({ "cmd": "request.get", "url": url, "maxTimeout": sc.payload_timeout });
+    let mut payload =
+        serde_json::json!({ "cmd": "request.get", "url": url, "maxTimeout": sc.payload_timeout });
     if let Some(sid) = &session_id {
         payload["session"] = serde_json::Value::String(sid.clone());
     }
     let result = solver_post(client, &target, &payload, sc.http_timeout_ms).await;
     if let Some(sid) = &session_id {
-        if let Err(e) = solver_post(client, &target, &serde_json::json!({ "cmd": "sessions.destroy", "session": sid }), 20_000).await {
+        if let Err(e) = solver_post(
+            client,
+            &target,
+            &serde_json::json!({ "cmd": "sessions.destroy", "session": sid }),
+            20_000,
+        )
+        .await
+        {
             log::debug!("[Solver] sessions.destroy failed (ignored): {e}");
         }
     }
@@ -439,7 +691,10 @@ pub(crate) async fn solver_request_get(client: &Client, db: &sqlx::AnyPool, flar
                 health.record_healthy_transport()
             };
             if closed {
-                log::info!("[Solver] {} is answering again — solve attempts resume.", sc.kind);
+                log::info!(
+                    "[Solver] {} is answering again — solve attempts resume.",
+                    sc.kind
+                );
                 clear_time_flag(db, "solver_unresponsive_time").await;
             }
             if is_challenge_timeout_response(data) {
@@ -462,7 +717,13 @@ pub(crate) async fn solver_request_get(client: &Client, db: &sqlx::AnyPool, flar
 /// clearance to replay on a direct request — plus the solver's landed URL, which callers should
 /// prefer for one-shot signed links. cf_clearance is IP+UA-bound, so the caller MUST send the
 /// returned User-Agent and run with the same outbound IP as the solver.
-pub async fn flaresolverr_clearance(client: &Client, db: &sqlx::AnyPool, flare_url: &str, url: &str, sc: &SolverConfig) -> anyhow::Result<SolverClearance> {
+pub async fn flaresolverr_clearance(
+    client: &Client,
+    db: &sqlx::AnyPool,
+    flare_url: &str,
+    url: &str,
+    sc: &SolverConfig,
+) -> anyhow::Result<SolverClearance> {
     let data = solver_request_get(client, db, flare_url, url, sc).await?;
     match parse_flaresolverr_clearance(&data) {
         Some(c) => Ok(c),
@@ -470,11 +731,22 @@ pub async fn flaresolverr_clearance(client: &Client, db: &sqlx::AnyPool, flare_u
             // Surface WHY so an unsolved challenge (status=error, no solution) can be told apart from a
             // solver that returns cookies in an unexpected shape (status=ok but cookies=0) — from the
             // engine log alone. The full raw response goes to debug for deeper inspection.
-            let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("none");
+            let status = data
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("none");
             let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            let cookie_count = data.get("solution").and_then(|s| s.get("cookies")).and_then(|c| c.as_array()).map(|a| a.len());
-            log::debug!("[GetComics Debug] FlareSolverr clearance response (no usable cookies): {}",
-                serde_json::to_string(&data).map(|s| s.chars().take(600).collect::<String>()).unwrap_or_default());
+            let cookie_count = data
+                .get("solution")
+                .and_then(|s| s.get("cookies"))
+                .and_then(|c| c.as_array())
+                .map(|a| a.len());
+            log::debug!(
+                "[GetComics Debug] FlareSolverr clearance response (no usable cookies): {}",
+                serde_json::to_string(&data)
+                    .map(|s| s.chars().take(600).collect::<String>())
+                    .unwrap_or_default()
+            );
             Err(anyhow::anyhow!(
                 "FlareSolverr returned no usable cookies (status={status}, cookies={cookie_count:?}{})",
                 if message.is_empty() { String::new() } else { format!(", message=\"{message}\"") }
@@ -494,17 +766,31 @@ pub(crate) fn interactive_query_variants(queries: &[String]) -> Vec<String> {
     let re_trailing_year = regex::Regex::new(r"\s\d{4}$").unwrap();
     let re_trailing_issue = regex::Regex::new(r"\s#?\d+(?:\.\d+)?$").unwrap();
     let re_pad = regex::Regex::new(r"\b0+(\d{1,3})\b").unwrap();
-    let clean_sym = |s: &str| s.replace([':', '-', '&', '/', '\\'], " ").split_whitespace().collect::<Vec<_>>().join(" ");
+    let clean_sym = |s: &str| {
+        s.replace([':', '-', '&', '/', '\\'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     let depad = |s: &str| re_pad.replace_all(s, "$1").to_string();
     let mut seen: HashSet<String> = HashSet::new();
     let mut list: Vec<String> = Vec::new();
     for q in queries {
         let no_year = re_trailing_year.replace(q, "").trim().to_string();
         let no_issue = re_trailing_issue.replace(&no_year, "").trim().to_string();
-        for base in [q.to_string(), clean_sym(q), no_year.clone(), clean_sym(&no_year), no_issue.clone(), clean_sym(&no_issue)] {
+        for base in [
+            q.to_string(),
+            clean_sym(q),
+            no_year.clone(),
+            clean_sym(&no_year),
+            no_issue.clone(),
+            clean_sym(&no_issue),
+        ] {
             for cand in [base.clone(), depad(&base)] {
                 let c = cand.trim().to_string();
-                if !c.is_empty() && seen.insert(c.clone()) { list.push(c); }
+                if !c.is_empty() && seen.insert(c.clone()) {
+                    list.push(c);
+                }
             }
         }
     }
@@ -530,11 +816,21 @@ pub fn parse_issue_range(title: &str) -> Option<(u32, u32)> {
         regex::Regex::new(r"(?i)(?:#|issues?\s*#?|vol(?:ume)?\.?\s*|v\.?\s*)?(\d{1,4})\s*(?:[-–—]|\bto\b)\s*#?(\d{1,4})").unwrap()
     });
     for cap in re.captures_iter(title) {
-        let start = match cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) { Some(v) => v, None => continue };
-        let end = match cap.get(2).and_then(|m| m.as_str().parse::<u32>().ok()) { Some(v) => v, None => continue };
+        let start = match cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let end = match cap.get(2).and_then(|m| m.as_str().parse::<u32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
         let both_look_like_years = (1900..=2099).contains(&start) && (1900..=2099).contains(&end);
-        if both_look_like_years { continue; }
-        if end > start { return Some((start, end)); }
+        if both_look_like_years {
+            continue;
+        }
+        if end > start {
+            return Some((start, end));
+        }
     }
     None
 }
@@ -551,51 +847,118 @@ pub async fn search(
     is_manga: bool,
     allow_packs_override: Option<bool>,
 ) -> anyhow::Result<Vec<ProwlarrResult>> {
-    let ddl_enabled: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'ddl_enabled'"#).fetch_optional(db).await?;
-    if ddl_enabled.as_deref() == Some("false") { return Ok(vec![]); }
+    let ddl_enabled: Option<String> =
+        sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'ddl_enabled'"#)
+            .fetch_optional(db)
+            .await?;
+    if ddl_enabled.as_deref() == Some("false") {
+        return Ok(vec![]);
+    }
 
-    let mut allow_bulk_packs = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'allow_bulk_packs'"#)
-        .fetch_optional(db).await?.unwrap_or_default() == "true";
+    let mut allow_bulk_packs = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'allow_bulk_packs'"#,
+    )
+    .fetch_optional(db)
+    .await?
+    .unwrap_or_default()
+        == "true";
     // Automated isolated-issue requests override the global setting (beta.035).
     if !is_interactive && allow_packs_override == Some(false) {
         allow_bulk_packs = false;
     }
 
     // Admin-tunable page depth (beta.035); safe defaults 4 (interactive) / 5 (automated).
-    let interactive_pages: i32 = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'getcomics_interactive_pages'"#)
-        .fetch_optional(db).await?.and_then(|v| v.trim().parse().ok()).unwrap_or(4);
-    let automated_pages: i32 = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'getcomics_automated_pages'"#)
-        .fetch_optional(db).await?.and_then(|v| v.trim().parse().ok()).unwrap_or(5);
-    let max_pages = if is_interactive { interactive_pages } else { automated_pages };
+    let interactive_pages: i32 = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'getcomics_interactive_pages'"#,
+    )
+    .fetch_optional(db)
+    .await?
+    .and_then(|v| v.trim().parse().ok())
+    .unwrap_or(4);
+    let automated_pages: i32 = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'getcomics_automated_pages'"#,
+    )
+    .fetch_optional(db)
+    .await?
+    .and_then(|v| v.trim().parse().ok())
+    .unwrap_or(5);
+    let max_pages = if is_interactive {
+        interactive_pages
+    } else {
+        automated_pages
+    };
 
-    let flare_url: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#).fetch_optional(db).await?;
+    let flare_url: Option<String> =
+        sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#)
+            .fetch_optional(db)
+            .await?;
     let client = crate::browser_http_client();
 
     let article_sel = Selector::parse("article, .post").unwrap();
-    let a_sel = Selector::parse("h1.post-title a, h2.post-title a, h1 a, h2 a, .post-header a").unwrap();
+    let a_sel =
+        Selector::parse("h1.post-title a, h2.post-title a, h1 a, h2 a, .post-header a").unwrap();
 
     // ---- Query context derived from the ORIGINAL name (parity with performSearch's cleanOriginal). ----
     // Normalize first ("#1: Book One" -> "#1", "….cbz" -> "…"): otherwise a subtitle keyword like "Book"
     // flips this single-issue request into omnibus mode, and a leaked file extension ("cbz") or subtitle
     // word gets enforced as a required title word — rejecting every real single-issue file.
     let core_original = crate::search_engine::normalize_request_name(original_name);
-    let clean_original = core_original.replace([':', '-', '&'], " ")
-        .split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase();
-    let stop_words: HashSet<&str> = ["the", "a", "an", "of", "and", "or", "vol", "volume", "issue", "black", "white", "blood"].into_iter().collect();
-    let open_variant_keywords = ["variant", "special edition", "director's cut", "directors cut", "facsimile", "black and white", "extended"];
+    let clean_original = core_original
+        .replace([':', '-', '&'], " ")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+        .to_lowercase();
+    let stop_words: HashSet<&str> = [
+        "the", "a", "an", "of", "and", "or", "vol", "volume", "issue", "black", "white", "blood",
+    ]
+    .into_iter()
+    .collect();
+    let open_variant_keywords = [
+        "variant",
+        "special edition",
+        "director's cut",
+        "directors cut",
+        "facsimile",
+        "black and white",
+        "extended",
+    ];
     let bounded_variant_keywords = ["noir", "b&w", "sketch", "blank", "virgin", "uncut"];
-    let user_wants_variant = bounded_variant_keywords.iter().any(|k| clean_original.contains(k))
-        || open_variant_keywords.iter().any(|k| clean_original.contains(k));
+    let user_wants_variant = bounded_variant_keywords
+        .iter()
+        .any(|k| clean_original.contains(k))
+        || open_variant_keywords
+            .iter()
+            .any(|k| clean_original.contains(k));
 
     let req_num = crate::search_engine::extract_number(&clean_original, is_manga, false);
 
-    let mut tpb_terms: Vec<&str> = vec!["omnibus", "tpb", "compendium", "collection", "hc", "hardcover", "trade paperback"];
-    if !is_manga { tpb_terms.extend_from_slice(&["vol ", "volume ", "book "]); }
-    let pack_terms = ["story arc", "pack", "complete", "collection", "bundle", "run", "chronological"];
+    let mut tpb_terms: Vec<&str> = vec![
+        "omnibus",
+        "tpb",
+        "compendium",
+        "collection",
+        "hc",
+        "hardcover",
+        "trade paperback",
+    ];
+    if !is_manga {
+        tpb_terms.extend_from_slice(&["vol ", "volume ", "book "]);
+    }
+    let pack_terms = [
+        "story arc",
+        "pack",
+        "complete",
+        "collection",
+        "bundle",
+        "run",
+        "chronological",
+    ];
     let is_looking_for_omnibus = tpb_terms.iter().any(|t| clean_original.contains(t));
     let is_looking_for_annual = clean_original.contains("annual");
 
-    let original_query_words: Vec<String> = clean_original.chars()
+    let original_query_words: Vec<String> = clean_original
+        .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect::<String>()
         .split_whitespace()
@@ -616,7 +979,8 @@ pub async fn search(
     };
 
     // Detects broad/pack queries (no issue number) so they search against the series year.
-    let re_issue_marker = regex::Regex::new(r"(?i)(?:#|issue\s*#?|ch(?:apter)?\s*\.?)\s*\d+").unwrap();
+    let re_issue_marker =
+        regex::Regex::new(r"(?i)(?:#|issue\s*#?|ch(?:apter)?\s*\.?)\s*\d+").unwrap();
     let re_word_num = regex::Regex::new(r"\d+(?:\.\d+)?").unwrap();
     // A 4-digit year is NOT an issue number — strip years before the bare-digit issue check below.
     let re_year = regex::Regex::new(r"\b(?:19|20)\d{2}\b").unwrap();
@@ -631,7 +995,9 @@ pub async fn search(
         let q_stripped = re_pad.replace_all(q, "$1").into_owned();
         let q = &q_stripped;
         log::info!("[GetComics] Searching for: \"{}\"", q);
-        let safe_query_words: Vec<String> = q.to_lowercase().split(' ')
+        let safe_query_words: Vec<String> = q
+            .to_lowercase()
+            .split(' ')
             .filter(|&w| !w.is_empty() && !stop_words.contains(w))
             .map(|s| s.to_string())
             .collect();
@@ -644,22 +1010,44 @@ pub async fn search(
         // collection isn't rejected for a 2026 issue. Parity with automation.ts queryTargetsIssue.
         let targets_issue =
             re_issue_marker.is_match(q) || re_word_num.is_match(&re_year.replace_all(q, " "));
-        let active_year = if targets_issue { dynamic_year } else { series_year };
+        let active_year = if targets_issue {
+            dynamic_year
+        } else {
+            series_year
+        };
         let req_year: Option<String> = crate::search_engine::find_title_year(&clean_original)
             .or_else(|| active_year.map(|s| s.to_string()));
 
         let mut q_results: Vec<ProwlarrResult> = Vec::new();
 
         for page in 1..=max_pages {
-            limiter.enforce("getcomics", if is_interactive { 2500 } else { 4000 }).await;
+            limiter
+                .enforce("getcomics", if is_interactive { 2500 } else { 4000 })
+                .await;
 
-            let page_path = if page == 1 { "/".to_string() } else { format!("/page/{}/", page) };
-            let search_url = format!("https://getcomics.org{}?s={}", page_path, urlencoding::encode(q));
-            log::debug!("[GetComics Debug] Searching page {}/{}: {}", page, max_pages, search_url);
+            let page_path = if page == 1 {
+                "/".to_string()
+            } else {
+                format!("/page/{}/", page)
+            };
+            let search_url = format!(
+                "https://getcomics.org{}?s={}",
+                page_path,
+                urlencoding::encode(q)
+            );
+            log::debug!(
+                "[GetComics Debug] Searching page {}/{}: {}",
+                page,
+                max_pages,
+                search_url
+            );
 
             let html = match fetch_html(&client, db, &search_url, flare_url.as_deref()).await {
                 Ok(h) => h,
-                Err(e) => { log::warn!("[GetComics] Fetch failed for \"{}\": {}", q, e); break; }
+                Err(e) => {
+                    log::warn!("[GetComics] Fetch failed for \"{}\": {}", q, e);
+                    break;
+                }
             };
 
             // Extract (title, link, size) first so the non-Send scraper types are dropped before any
@@ -668,17 +1056,23 @@ pub async fn search(
             let posts_data: Vec<(String, String, i64)> = {
                 let document = Html::parse_document(&html);
                 let posts: Vec<_> = document.select(&article_sel).collect();
-                if posts.is_empty() { break; } // reached the end of pagination
-                posts.iter().filter_map(|article| {
-                    article.select(&a_sel).next().map(|a| {
-                        let teaser = article.text().collect::<Vec<_>>().join(" ");
-                        (
-                            a.inner_html().trim().to_string(),
-                            a.value().attr("href").unwrap_or("").to_string(),
-                            parse_size_bytes(&teaser).unwrap_or(0),
-                        )
+                if posts.is_empty() {
+                    break;
+                } // reached the end of pagination
+                posts
+                    .iter()
+                    .filter_map(|article| {
+                        article.select(&a_sel).next().map(|a| {
+                            let teaser = article.text().collect::<Vec<_>>().join(" ");
+                            (
+                                a.inner_html().trim().to_string(),
+                                a.value().attr("href").unwrap_or("").to_string(),
+                                parse_size_bytes(&teaser).unwrap_or(0),
+                            )
+                        })
                     })
-                }).filter(|(t, l, _)| !t.is_empty() && !l.is_empty()).collect()
+                    .filter(|(t, l, _)| !t.is_empty() && !l.is_empty())
+                    .collect()
             };
 
             for (title, link, size) in posts_data {
@@ -698,14 +1092,18 @@ pub async fn search(
                 // single-issue request only the series name (words before the issue number) is
                 // enforced, so a subtitle GetComics omitted doesn't fail an otherwise-correct match.
                 {
-                    let mut words_to_enforce: Vec<String> = if req_num.is_some() && !is_looking_for_omnibus {
-                        safe_query_words.clone()
-                    } else {
-                        original_query_words.clone()
-                    };
+                    let mut words_to_enforce: Vec<String> =
+                        if req_num.is_some() && !is_looking_for_omnibus {
+                            safe_query_words.clone()
+                        } else {
+                            original_query_words.clone()
+                        };
                     if req_num.is_some() && !is_looking_for_omnibus {
                         if let Some(idx) = safe_query_words.iter().position(|w| {
-                            re_word_num.find(w).and_then(|m| m.as_str().parse::<f32>().ok()) == req_num
+                            re_word_num
+                                .find(w)
+                                .and_then(|m| m.as_str().parse::<f32>().ok())
+                                == req_num
                         }) {
                             words_to_enforce = safe_query_words[..idx].to_vec();
                         }
@@ -729,12 +1127,18 @@ pub async fn search(
                     let anchor_year = if is_interactive {
                         req_year.clone()
                     } else {
-                        crate::search_engine::pack_anchor_year(is_pack_shaped, series_year, req_year.as_deref())
+                        crate::search_engine::pack_anchor_year(
+                            is_pack_shaped,
+                            series_year,
+                            req_year.as_deref(),
+                        )
                     };
                     if let Some(ry) = &anchor_year {
                         if let Some(ty) = crate::search_engine::find_title_year(&title_lower) {
                             if let (Ok(ryn), Ok(tyn)) = (ry.parse::<i32>(), ty.parse::<i32>()) {
-                                if (ryn - tyn).abs() > 1 { is_relevant = false; }
+                                if (ryn - tyn).abs() > 1 {
+                                    is_relevant = false;
+                                }
                             }
                         }
                     }
@@ -749,15 +1153,20 @@ pub async fn search(
 
                     // TPB guard: reject collected editions when a single issue was requested.
                     if req_num.is_some() && !is_looking_for_omnibus && !is_pack {
-                        let has_unexpected_tpb = tpb_terms.iter()
+                        let has_unexpected_tpb = tpb_terms
+                            .iter()
                             .any(|t| !clean_original.contains(*t) && title_lower.contains(*t));
-                        if has_unexpected_tpb { is_relevant = false; }
+                        if has_unexpected_tpb {
+                            is_relevant = false;
+                        }
                     }
 
                     // Variant guard (only when the user didn't ask for a variant).
                     if is_relevant
                         && !user_wants_variant
-                        && (open_variant_keywords.iter().any(|k| title_lower.contains(k))
+                        && (open_variant_keywords
+                            .iter()
+                            .any(|k| title_lower.contains(k))
                             || crate::search_engine::matches_bounded_variant(&title_lower))
                     {
                         is_relevant = false;
@@ -766,7 +1175,10 @@ pub async fn search(
                     // Issue-number guard.
                     if is_relevant && !is_looking_for_omnibus && !is_pack {
                         if let Some(rn) = &req_num {
-                            match &crate::search_engine::extract_title_number(&title_lower, is_manga) {
+                            match &crate::search_engine::extract_title_number(
+                                &title_lower,
+                                is_manga,
+                            ) {
                                 Some(tn) if tn != rn => is_relevant = false,
                                 None => is_relevant = false,
                                 _ => {}
@@ -786,13 +1198,19 @@ pub async fn search(
                     // picks stay unrestricted.
                     if is_relevant && req_num.is_some() && !reverse_guard_words.is_empty() {
                         if !is_pack {
-                            let extra = crate::search_engine::off_series_extra_words(&title_lower, &reverse_guard_words);
+                            let extra = crate::search_engine::off_series_extra_words(
+                                &title_lower,
+                                &reverse_guard_words,
+                            );
                             if !extra.is_empty() {
                                 log::debug!("[GetComics Debug] Discarding off-series post \"{}\" — extra series words {:?} not in requested \"{}\".", title, extra, clean_original);
                                 is_relevant = false;
                             }
                         } else {
-                            let extra = crate::search_engine::off_series_pack_extra_words(&title_lower, &reverse_guard_words);
+                            let extra = crate::search_engine::off_series_pack_extra_words(
+                                &title_lower,
+                                &reverse_guard_words,
+                            );
                             if !extra.is_empty() {
                                 log::debug!("[GetComics Debug] Discarding off-series PACK \"{}\" — extra series words {:?} not in requested \"{}\".", title, extra, clean_original);
                                 is_relevant = false;
@@ -808,17 +1226,30 @@ pub async fn search(
 
                 if is_relevant {
                     q_results.push(ProwlarrResult {
-                        guid: link.clone(), title, size, indexer: "GetComics".to_string(),
-                        seeders: 100, peers: 0, info_url: link.clone(), download_url: link,
-                        protocol: "ddl".to_string(), publish_date: "N/A".to_string(), info_hash: None,
-                        matched_query: None, query_rung: None,
+                        guid: link.clone(),
+                        title,
+                        size,
+                        indexer: "GetComics".to_string(),
+                        seeders: 100,
+                        peers: 0,
+                        info_url: link.clone(),
+                        download_url: link,
+                        protocol: "ddl".to_string(),
+                        publish_date: "N/A".to_string(),
+                        info_hash: None,
+                        matched_query: None,
+                        query_rung: None,
                     });
                 }
             }
 
             // Only halt pagination early for background automation; interactive captures every page.
             if !q_results.is_empty() && !is_interactive {
-                log::debug!("[GetComics Debug] Found {} valid matches on page {}. Halting pagination.", q_results.len(), page);
+                log::debug!(
+                    "[GetComics Debug] Found {} valid matches on page {}. Halting pagination.",
+                    q_results.len(),
+                    page
+                );
                 break;
             }
         }
@@ -828,7 +1259,9 @@ pub async fn search(
             if let Some(ry) = &req_year {
                 let a_has = a.title.contains(ry.as_str());
                 let b_has = b.title.contains(ry.as_str());
-                if a_has != b_has { return b_has.cmp(&a_has); }
+                if a_has != b_has {
+                    return b_has.cmp(&a_has);
+                }
             }
             a.title.len().cmp(&b.title.len())
         });
@@ -836,7 +1269,11 @@ pub async fn search(
         if !q_results.is_empty() {
             if !is_interactive {
                 // Automation takes the absolute best match instantly (upstream returns [results[0]]).
-                log::info!("[GetComics] Found {} relevant result(s) for query: \"{}\" — taking the best.", q_results.len(), q);
+                log::info!(
+                    "[GetComics] Found {} relevant result(s) for query: \"{}\" — taking the best.",
+                    q_results.len(),
+                    q
+                );
                 results.push(q_results.remove(0));
                 break 'queries;
             }
@@ -858,14 +1295,22 @@ pub async fn search(
             .or_else(|| dynamic_year.map(|s| s.to_string()));
         results.sort_by(|a, b| {
             if let Some(rn) = req_num {
-                let am = crate::search_engine::extract_title_number(&a.title.to_lowercase(), is_manga) == Some(rn);
-                let bm = crate::search_engine::extract_title_number(&b.title.to_lowercase(), is_manga) == Some(rn);
-                if am != bm { return bm.cmp(&am); }
+                let am =
+                    crate::search_engine::extract_title_number(&a.title.to_lowercase(), is_manga)
+                        == Some(rn);
+                let bm =
+                    crate::search_engine::extract_title_number(&b.title.to_lowercase(), is_manga)
+                        == Some(rn);
+                if am != bm {
+                    return bm.cmp(&am);
+                }
             }
             if let Some(ry) = &sort_year {
                 let ah = a.title.contains(ry.as_str());
                 let bh = b.title.contains(ry.as_str());
-                if ah != bh { return bh.cmp(&ah); }
+                if ah != bh {
+                    return bh.cmp(&ah);
+                }
             }
             a.title.len().cmp(&b.title.len())
         });
@@ -883,17 +1328,35 @@ pub async fn search(
 fn get_hoster_from_url(url: &str, is_main_btn: bool) -> String {
     let u = url.to_lowercase();
     // Fast GetComics file CDN — never Cloudflare-gated. Keep high priority.
-    if u.contains("comicfiles") || u.contains("comic-files") { return "getcomics_direct".to_string(); }
+    if u.contains("comicfiles") || u.contains("comic-files") {
+        return "getcomics_direct".to_string();
+    }
     // GetComics' own "main server" endpoint sits behind Cloudflare. Last resort.
-    if u.contains("/dls/") && u.contains("getcomics") { return "getcomics_main".to_string(); }
-    if u.contains("mediafire.com") { return "mediafire".to_string(); }
-    if u.contains("mega.nz") || u.contains("mega.co.nz") { return "mega".to_string(); }
-    if u.contains("pixeldrain.com") { return "pixeldrain".to_string(); }
-    if u.contains("terabox.com") || u.contains("teraboxapp.com") { return "terabox".to_string(); }
-    if u.contains("rootz") { return "rootz".to_string(); }
-    if u.contains("vikingfile") { return "vikingfile".to_string(); }
+    if u.contains("/dls/") && u.contains("getcomics") {
+        return "getcomics_main".to_string();
+    }
+    if u.contains("mediafire.com") {
+        return "mediafire".to_string();
+    }
+    if u.contains("mega.nz") || u.contains("mega.co.nz") {
+        return "mega".to_string();
+    }
+    if u.contains("pixeldrain.com") {
+        return "pixeldrain".to_string();
+    }
+    if u.contains("terabox.com") || u.contains("teraboxapp.com") {
+        return "terabox".to_string();
+    }
+    if u.contains("rootz") {
+        return "rootz".to_string();
+    }
+    if u.contains("vikingfile") {
+        return "vikingfile".to_string();
+    }
     // A "main server / download now" button we couldn't classify by URL is GetComics' gated path.
-    if is_main_btn { return "getcomics_main".to_string(); }
+    if is_main_btn {
+        return "getcomics_main".to_string();
+    }
 
     "unknown".to_string()
 }
@@ -933,32 +1396,56 @@ fn classify_anchor(a_tag: ElementRef) -> Option<DeepLinkResult> {
         // The base64 payload ends at the query separator; a trailing &hoster=… suffix is not
         // part of it. Strict base64 would reject the whole string, so truncate first — the
         // correct read of the wrapped URL (Node decoded leniently and kept the leading run).
-        if let Some(amp) = encoded.find(['&', '#']) { encoded.truncate(amp); }
+        if let Some(amp) = encoded.find(['&', '#']) {
+            encoded.truncate(amp);
+        }
         encoded = encoded.replace("%3D", "=").replace("%3d", "=");
-        while !encoded.len().is_multiple_of(4) { encoded.push('='); }
+        while !encoded.len().is_multiple_of(4) {
+            encoded.push('=');
+        }
 
         if let Ok(bytes) = STANDARD.decode(&encoded) {
-            if let Ok(s) = String::from_utf8(bytes) { decoded = s; }
+            if let Ok(s) = String::from_utf8(bytes) {
+                decoded = s;
+            }
         }
     }
 
-    if decoded.is_empty() { return None; }
+    if decoded.is_empty() {
+        return None;
+    }
 
-    let is_main_btn = text.contains("main server") ||
-                      title_attr.contains("main server") ||
-                      text.contains("download now") ||
-                      text.contains("direct download") ||
-                      (btn_class.contains("aio-button") && text.contains("download"));
+    let is_main_btn = text.contains("main server")
+        || title_attr.contains("main server")
+        || text.contains("download now")
+        || text.contains("direct download")
+        || (btn_class.contains("aio-button") && text.contains("download"));
 
-    if is_main_btn && !raw_href.contains("go.php") && !decoded.to_lowercase().ends_with(".cbz") && !decoded.to_lowercase().ends_with(".zip") && !decoded.to_lowercase().ends_with(".cbr")
-        && !decoded.contains("comicfiles") && !decoded.contains("comic-files") && !decoded.contains("getcomics") {
-            return None;
-        }
+    if is_main_btn
+        && !raw_href.contains("go.php")
+        && !decoded.to_lowercase().ends_with(".cbz")
+        && !decoded.to_lowercase().ends_with(".zip")
+        && !decoded.to_lowercase().ends_with(".cbr")
+        && !decoded.contains("comicfiles")
+        && !decoded.contains("comic-files")
+        && !decoded.contains("getcomics")
+    {
+        return None;
+    }
 
     let hoster = get_hoster_from_url(&decoded, is_main_btn);
-    if hoster == "unknown" { return None; }
-    log::debug!("[GetComics Debug] Decoded deep link -> {} (hoster: {})", decoded, hoster);
-    Some(DeepLinkResult { url: decoded, hoster })
+    if hoster == "unknown" {
+        return None;
+    }
+    log::debug!(
+        "[GetComics Debug] Decoded deep link -> {} (hoster: {})",
+        decoded,
+        hoster
+    );
+    Some(DeepLinkResult {
+        url: decoded,
+        hoster,
+    })
 }
 
 /// Parse the article HTML into the FLAT anchor sweep (the single-page default the scraper always used)
@@ -971,28 +1458,47 @@ fn extract_article_links(html: &str) -> (Vec<DeepLinkResult>, Vec<(String, Vec<D
 
     let mut flat = Vec::new();
     for a_tag in document.select(&a_sel) {
-        if let Some(l) = classify_anchor(a_tag) { flat.push(l); }
+        if let Some(l) = classify_anchor(a_tag) {
+            flat.push(l);
+        }
     }
 
     let scope_sel = Selector::parse(".post-contents, .entry-content, article").unwrap();
-    let scope = document.select(&scope_sel).next().unwrap_or_else(|| document.root_element());
+    let scope = document
+        .select(&scope_sel)
+        .next()
+        .unwrap_or_else(|| document.root_element());
     let mut sections: Vec<(String, Vec<DeepLinkResult>)> = Vec::new();
     let mut label = String::new();
     let mut links: Vec<DeepLinkResult> = Vec::new();
     for node in scope.descendants() {
-        let Some(el) = ElementRef::wrap(node) else { continue };
+        let Some(el) = ElementRef::wrap(node) else {
+            continue;
+        };
         match el.value().name() {
             "h1" | "h2" | "h3" | "h4" | "h5" => {
-                if !links.is_empty() { sections.push((label.clone(), std::mem::take(&mut links))); }
-                label = el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+                if !links.is_empty() {
+                    sections.push((label.clone(), std::mem::take(&mut links)));
+                }
+                label = el
+                    .text()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
             }
             "a" => {
-                if let Some(l) = classify_anchor(el) { links.push(l); }
+                if let Some(l) = classify_anchor(el) {
+                    links.push(l);
+                }
             }
             _ => {}
         }
     }
-    if !links.is_empty() { sections.push((label, links)); }
+    if !links.is_empty() {
+        sections.push((label, links));
+    }
 
     (flat, sections)
 }
@@ -1001,7 +1507,9 @@ fn extract_article_links(html: &str) -> (Vec<DeepLinkResult>, Vec<(String, Vec<D
 fn find_label_year(label: &str) -> Option<i32> {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| regex::Regex::new(r"\b((?:19|20)\d{2})\b").unwrap());
-    re.captures(label).and_then(|c| c.get(1)).and_then(|m| m.as_str().parse().ok())
+    re.captures(label)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse().ok())
 }
 
 /// Sort by enabled-priority position, then de-dupe to one link per hoster (keep the highest-priority
@@ -1018,14 +1526,26 @@ fn demote_getcomics_hosters(enabled_order: &[String]) -> Vec<String> {
     rest.into_iter().chain(gc).collect()
 }
 
-fn rank_and_dedupe(mut links: Vec<DeepLinkResult>, enabled_order: &[String]) -> Vec<DeepLinkResult> {
+fn rank_and_dedupe(
+    mut links: Vec<DeepLinkResult>,
+    enabled_order: &[String],
+) -> Vec<DeepLinkResult> {
     links.sort_by(|a, b| {
-        let pos_a = enabled_order.iter().position(|x| x == &a.hoster).unwrap_or(usize::MAX);
-        let pos_b = enabled_order.iter().position(|x| x == &b.hoster).unwrap_or(usize::MAX);
+        let pos_a = enabled_order
+            .iter()
+            .position(|x| x == &a.hoster)
+            .unwrap_or(usize::MAX);
+        let pos_b = enabled_order
+            .iter()
+            .position(|x| x == &b.hoster)
+            .unwrap_or(usize::MAX);
         pos_a.cmp(&pos_b)
     });
     let mut seen_hosters: HashSet<String> = HashSet::new();
-    links.into_iter().filter(|l| seen_hosters.insert(l.hoster.clone())).collect()
+    links
+        .into_iter()
+        .filter(|l| seen_hosters.insert(l.hoster.clone()))
+        .collect()
 }
 
 enum SectionSelection {
@@ -1047,26 +1567,45 @@ fn select_pack_section(
     target: &DeepLinkTarget,
     enabled_order: &[String],
 ) -> SectionSelection {
-    let mut packs: Vec<(String, Vec<DeepLinkResult>, (u32, u32))> = sections.into_iter()
+    let mut packs: Vec<(String, Vec<DeepLinkResult>, (u32, u32))> = sections
+        .into_iter()
         .filter_map(|(label, links)| {
             let range = parse_issue_range(&label)?;
-            let enabled: Vec<DeepLinkResult> = links.into_iter().filter(|l| enabled_order.contains(&l.hoster)).collect();
-            if enabled.is_empty() { return None; }
+            let enabled: Vec<DeepLinkResult> = links
+                .into_iter()
+                .filter(|l| enabled_order.contains(&l.hoster))
+                .collect();
+            if enabled.is_empty() {
+                return None;
+            }
             Some((label, enabled, range))
         })
         .collect();
-    if packs.len() < 2 { return SectionSelection::NotMultiPack; }
+    if packs.len() < 2 {
+        return SectionSelection::NotMultiPack;
+    }
 
-    log::info!("[GetComics] Multi-pack page detected ({} archive sections). Targeting issue #{}{}.",
-        packs.len(), target.issue_num,
-        target.year.as_deref().map(|y| format!(" ({})", y)).unwrap_or_default());
+    log::info!(
+        "[GetComics] Multi-pack page detected ({} archive sections). Targeting issue #{}{}.",
+        packs.len(),
+        target.issue_num,
+        target
+            .year
+            .as_deref()
+            .map(|y| format!(" ({})", y))
+            .unwrap_or_default()
+    );
 
     let target_year: Option<i32> = target.year.as_deref().and_then(|y| y.parse().ok());
     packs.retain(|(label, _, (start, end))| {
-        if target.issue_num < *start as f32 || target.issue_num > *end as f32 { return false; }
+        if target.issue_num < *start as f32 || target.issue_num > *end as f32 {
+            return false;
+        }
         // A section labeled with a year far from the requested issue's year is a different volume.
         if let (Some(ty), Some(ly)) = (target_year, find_label_year(label)) {
-            if (ty - ly).abs() > 1 { return false; }
+            if (ty - ly).abs() > 1 {
+                return false;
+            }
         }
         true
     });
@@ -1080,7 +1619,11 @@ fn select_pack_section(
     // order for ties.
     packs.sort_by_key(|(_, _, (start, end))| end - start);
     let (label, links, _) = packs.swap_remove(0);
-    log::info!("[GetComics] Selected archive \"{}\" for issue #{}.", label, target.issue_num);
+    log::info!(
+        "[GetComics] Selected archive \"{}\" for issue #{}.",
+        label,
+        target.issue_num
+    );
     SectionSelection::Section(links)
 }
 
@@ -1098,7 +1641,10 @@ pub async fn scrape_deep_link(
 ) -> anyhow::Result<DeepLinkOutcome> {
     limiter.enforce("getcomics", 2500).await;
 
-    let flare_url: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#).fetch_optional(db).await?;
+    let flare_url: Option<String> =
+        sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#)
+            .fetch_optional(db)
+            .await?;
     let client = crate::browser_http_client();
 
     let html = match fetch_html(&client, db, article_url, flare_url.as_deref()).await {
@@ -1106,7 +1652,11 @@ pub async fn scrape_deep_link(
         Err(e) => {
             // Graceful empty list (parity with Node's catch-all) so the caller falls back to a manual
             // hold / Prowlarr instead of erroring.
-            log::warn!("[GetComics] Failed to scrape deep link {}: {}", article_url, e);
+            log::warn!(
+                "[GetComics] Failed to scrape deep link {}: {}",
+                article_url,
+                e
+            );
             return Ok(DeepLinkOutcome::Links(Vec::new()));
         }
     };
@@ -1117,8 +1667,16 @@ pub async fn scrape_deep_link(
     // list entirely, is never tried. An explicit empty array means "no preference", so fall back to the
     // default order.
     let prefs = hoster_prefs(db).await;
-    let prefs = if prefs.is_empty() { default_hoster_prefs() } else { prefs };
-    let enabled_order: Vec<String> = prefs.iter().filter(|p| p.enabled).map(|p| p.hoster.clone()).collect();
+    let prefs = if prefs.is_empty() {
+        default_hoster_prefs()
+    } else {
+        prefs
+    };
+    let enabled_order: Vec<String> = prefs
+        .iter()
+        .filter(|p| p.enabled)
+        .map(|p| p.hoster.clone())
+        .collect();
 
     // Large-download demotion (Kapowarr #77 parity, gc_avoid_large_downloads — default ON):
     // GetComics' own servers throttle/choke on big files, so when the page's LARGEST advertised
@@ -1126,10 +1684,21 @@ pub async fn scrape_deep_link(
     // third-party mirrors get tried first. Demote, never exclude: if the mirrors fail, the GC
     // servers remain the last-resort fallback exactly as before.
     const LARGE_DOWNLOAD_BYTES: i64 = 400 * 1024 * 1024;
-    let avoid_large = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'gc_avoid_large_downloads'"#)
-        .fetch_optional(db).await.ok().flatten().as_deref() != Some("false");
+    let avoid_large = sqlx::query_scalar::<_, String>(
+        r#"SELECT value FROM "SystemSetting" WHERE key = 'gc_avoid_large_downloads'"#,
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .as_deref()
+        != Some("false");
     let article_size = max_size_bytes(&html);
-    let ranking_order: Vec<String> = if avoid_large && article_size.map(|s| s >= LARGE_DOWNLOAD_BYTES).unwrap_or(false) {
+    let ranking_order: Vec<String> = if avoid_large
+        && article_size
+            .map(|s| s >= LARGE_DOWNLOAD_BYTES)
+            .unwrap_or(false)
+    {
         log::info!(
             "[GetComics] Article advertises {} MB — demoting GetComics-hosted links behind third-party mirrors.",
             article_size.unwrap_or(0) / (1024 * 1024)
@@ -1147,7 +1716,11 @@ pub async fn scrape_deep_link(
             SectionSelection::Section(links) => {
                 let candidates = rank_and_dedupe(links, &ranking_order);
                 if let Some(top) = candidates.first() {
-                    log::info!("[GetComics] Selected hoster: {} (+{} fallback(s)).", top.hoster, candidates.len() - 1);
+                    log::info!(
+                        "[GetComics] Selected hoster: {} (+{} fallback(s)).",
+                        top.hoster,
+                        candidates.len() - 1
+                    );
                 }
                 return Ok(DeepLinkOutcome::Links(candidates));
             }
@@ -1157,12 +1730,21 @@ pub async fn scrape_deep_link(
 
     // --- FLAT BEHAVIOR (single page / no target) — unchanged from the original scraper. ---
     let available: Vec<String> = found_links.iter().map(|l| l.hoster.clone()).collect();
-    log::info!("[GetComics] Found {} valid links. Available hosters: {}", found_links.len(), available.join(", "));
-    log::debug!("[GetComics Debug] Enabled hoster priority: [{}]", enabled_order.join(", "));
+    log::info!(
+        "[GetComics] Found {} valid links. Available hosters: {}",
+        found_links.len(),
+        available.join(", ")
+    );
+    log::debug!(
+        "[GetComics Debug] Enabled hoster priority: [{}]",
+        enabled_order.join(", ")
+    );
 
     // Keep only links from an explicitly present+enabled hoster (drops both disabled and unlisted ones).
     found_links.retain(|l| enabled_order.contains(&l.hoster));
-    if found_links.is_empty() { return Ok(DeepLinkOutcome::Links(Vec::new())); }
+    if found_links.is_empty() {
+        return Ok(DeepLinkOutcome::Links(Vec::new()));
+    }
 
     // getcomics_main (the /dls/ main server) sits high by default because its direct download succeeds
     // for most issues; only the subset behind a live Cloudflare challenge falls through to the
@@ -1173,7 +1755,11 @@ pub async fn scrape_deep_link(
         if &top.hoster != pref {
             log::warn!("[GetComics] Preferred hoster '{}' not available; top candidate '{}' (+{} fallback(s)).", pref, top.hoster, candidates.len() - 1);
         } else {
-            log::info!("[GetComics] Selected hoster: {} (+{} fallback(s)).", top.hoster, candidates.len() - 1);
+            log::info!(
+                "[GetComics] Selected hoster: {} (+{} fallback(s)).",
+                top.hoster,
+                candidates.len() - 1
+            );
         }
     }
     Ok(DeepLinkOutcome::Links(candidates))
@@ -1192,22 +1778,152 @@ mod tests {
         use std::time::{Duration, Instant};
         let mut h = super::SolverHealth::default();
         let t0 = Instant::now();
-        assert!(!h.record_transport_failure(t0), "first failure must not open the breaker");
-        assert!(h.skip_reason("getcomics.org", t0).is_none());
-        assert!(h.record_transport_failure(t0), "failure #{} opens the breaker exactly once", super::SOLVER_BREAKER_THRESHOLD);
-        assert!(!h.record_transport_failure(t0), "already-open breaker must not re-report the transition");
-        let reason = h.skip_reason("getcomics.org", t0 + Duration::from_secs(1));
-        assert!(reason.is_some(), "solves are skipped while the breaker is open");
-        assert!(reason.unwrap().contains("circuit"), "reason names the breaker");
-        // Cooldown elapsed → half-open: attempts flow again.
-        assert!(h.skip_reason("getcomics.org", t0 + super::SOLVER_BREAKER_COOLDOWN + Duration::from_secs(1)).is_none());
+        assert!(
+            !h.record_transport_failure(t0),
+            "first failure must not open the breaker"
+        );
+        assert!(h.skip_reason("getcomics.org", t0).reason.is_none());
+        // Failure #1 is recorded above, so failures #2..#THRESHOLD-1 must stay below the bar and
+        // #THRESHOLD is the one that opens it.
+        for n in 2..super::SOLVER_BREAKER_THRESHOLD {
+            assert!(
+                !h.record_transport_failure(t0),
+                "failure #{n} must be below the threshold"
+            );
+            assert!(
+                h.skip_reason("getcomics.org", t0).reason.is_none(),
+                "below-threshold failures must not open the breaker"
+            );
+        }
+        assert!(
+            h.record_transport_failure(t0),
+            "failure #{} opens the breaker exactly once",
+            super::SOLVER_BREAKER_THRESHOLD
+        );
+        assert!(
+            !h.record_transport_failure(t0),
+            "already-open breaker must not re-report the transition"
+        );
+        let reason = h
+            .skip_reason("getcomics.org", t0 + Duration::from_secs(1))
+            .reason;
+        assert!(
+            reason.is_some(),
+            "solves are skipped while the breaker is open"
+        );
+        assert!(
+            reason.unwrap().contains("circuit"),
+            "reason names the breaker"
+        );
+        // Cooldown elapsed → half-open: attempts flow again, and the recovery is reported exactly once
+        // so the caller can clear the health-panel stamp.
+        let half_open = h.skip_reason(
+            "getcomics.org",
+            t0 + super::SOLVER_BREAKER_COOLDOWN + Duration::from_secs(1),
+        );
+        assert!(
+            half_open.reason.is_none(),
+            "elapsed cooldown lets attempts through"
+        );
+        assert!(
+            half_open.breaker_recovered,
+            "half-open must report the recovery"
+        );
+        assert!(
+            !h.skip_reason("getcomics.org", t0).breaker_recovered,
+            "recovery is reported only on the transition"
+        );
         // A healthy response closes an open breaker exactly once (the caller clears the flag on that transition).
         let mut h2 = super::SolverHealth::default();
-        h2.record_transport_failure(t0);
-        h2.record_transport_failure(t0);
+        for _ in 0..super::SOLVER_BREAKER_THRESHOLD {
+            h2.record_transport_failure(t0);
+        }
         assert!(h2.record_healthy_transport(), "closing transition reported");
-        assert!(!h2.record_healthy_transport(), "no transition when already closed");
-        assert!(h2.skip_reason("getcomics.org", t0 + Duration::from_secs(1)).is_none());
+        assert!(
+            !h2.record_healthy_transport(),
+            "no transition when already closed"
+        );
+        assert!(h2
+            .skip_reason("getcomics.org", t0 + Duration::from_secs(1))
+            .reason
+            .is_none());
+    }
+
+    #[test]
+    fn breaker_cooldown_boundary_is_exact_and_short() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut h = super::SolverHealth::default();
+        for _ in 0..super::SOLVER_BREAKER_THRESHOLD {
+            h.record_transport_failure(t0);
+        }
+        // The cooldown is deliberately minutes, not tens of minutes: a self-healed solver must be
+        // picked back up quickly instead of stalling every gated download for 600s. Checked at compile
+        // time so a future edit that moves these out of the intended bands fails the build, not CI.
+        const {
+            assert!(
+                super::SOLVER_BREAKER_COOLDOWN.as_secs() >= 120
+                    && super::SOLVER_BREAKER_COOLDOWN.as_secs() <= 180,
+                "cooldown must sit in the 120-180s band"
+            );
+            assert!(
+                super::SOLVER_BREAKER_THRESHOLD >= 4 && super::SOLVER_BREAKER_THRESHOLD <= 5,
+                "breaker threshold must sit in the 4-5 band"
+            );
+        };
+        // One tick before the cooldown the breaker still holds...
+        assert!(h
+            .skip_reason(
+                "getcomics.org",
+                t0 + super::SOLVER_BREAKER_COOLDOWN - Duration::from_millis(1)
+            )
+            .reason
+            .is_some());
+        // ...and the next tick half-opens.
+        assert!(h
+            .skip_reason("getcomics.org", t0 + super::SOLVER_BREAKER_COOLDOWN)
+            .reason
+            .is_none());
+    }
+
+    #[test]
+    fn half_open_probe_that_fails_reopens_from_a_fresh_count() {
+        use std::time::Instant;
+        let t0 = Instant::now();
+        let mut h = super::SolverHealth::default();
+        for _ in 0..super::SOLVER_BREAKER_THRESHOLD {
+            h.record_transport_failure(t0);
+        }
+        let after = t0 + super::SOLVER_BREAKER_COOLDOWN;
+        let d = h.skip_reason("getcomics.org", after);
+        assert!(d.reason.is_none() && d.breaker_recovered);
+        // The half-open cleared the counter, so the next probe gets a FULL budget of attempts before
+        // the breaker opens again — a single failure right after recovery must not re-trip it.
+        for n in 1..super::SOLVER_BREAKER_THRESHOLD {
+            assert!(
+                !h.record_transport_failure(after),
+                "post-recovery failure #{n} must not reopen"
+            );
+        }
+        assert!(
+            h.record_transport_failure(after),
+            "a fresh run of {} failures reopens",
+            super::SOLVER_BREAKER_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn negative_ttl_stays_long_because_each_entry_costs_a_full_solve_budget() {
+        // SolverConfig's default budget is 300s. The negative cache holds a DEFINITIVE "cannot solve"
+        // verdict, which does not become false by waiting, so shortening it would only re-buy more
+        // 300s timeouts on the same link. It is tuned independently of the breaker cooldown.
+        const {
+            assert!(
+                super::SOLVER_NEGATIVE_TTL.as_secs()
+                    >= super::SOLVER_BREAKER_COOLDOWN.as_secs() * 2,
+                "the negative TTL must outlive the breaker cooldown"
+            );
+        };
     }
 
     #[test]
@@ -1216,11 +1932,29 @@ mod tests {
         let mut h = super::SolverHealth::default();
         let t0 = Instant::now();
         h.mark_unsolvable("getcomics.org", t0);
-        let reason = h.skip_reason("getcomics.org", t0 + Duration::from_secs(5));
+        let reason = h
+            .skip_reason("getcomics.org", t0 + Duration::from_secs(5))
+            .reason;
         assert!(reason.is_some(), "the failed host is skipped");
-        assert!(reason.unwrap().contains("failed to solve"), "reason names the unsolved challenge");
-        assert!(h.skip_reason("annas-archive.org", t0 + Duration::from_secs(5)).is_none(), "other hosts are unaffected");
-        assert!(h.skip_reason("getcomics.org", t0 + super::SOLVER_NEGATIVE_TTL + Duration::from_secs(1)).is_none(), "expires after the TTL");
+        assert!(
+            reason.unwrap().contains("failed to solve"),
+            "reason names the unsolved challenge"
+        );
+        assert!(
+            h.skip_reason("annas-archive.org", t0 + Duration::from_secs(5))
+                .reason
+                .is_none(),
+            "other hosts are unaffected"
+        );
+        assert!(
+            h.skip_reason(
+                "getcomics.org",
+                t0 + super::SOLVER_NEGATIVE_TTL + Duration::from_secs(1)
+            )
+            .reason
+            .is_none(),
+            "expires after the TTL"
+        );
     }
 
     #[test]
@@ -1244,15 +1978,24 @@ mod tests {
         // (it manages its own session cache internally).
         let trawl = super::derive_solver_config(Some("Trawl".into()), Some("120".into()));
         assert_eq!(trawl.kind, "trawl");
-        assert_eq!(trawl.payload_timeout, 120_000, "trawl takes milliseconds like FlareSolverr");
+        assert_eq!(
+            trawl.payload_timeout, 120_000,
+            "trawl takes milliseconds like FlareSolverr"
+        );
         assert_eq!(trawl.http_timeout_ms, 120_000 + 15_000);
         let byparr = super::derive_solver_config(Some("byparr".into()), Some("120".into()));
         assert_eq!(byparr.payload_timeout, 120, "byparr takes seconds");
         let junk = super::derive_solver_config(Some("selenium".into()), None);
-        assert_eq!(junk.kind, "flaresolverr", "unknown backends fall back to the default");
+        assert_eq!(
+            junk.kind, "flaresolverr",
+            "unknown backends fall back to the default"
+        );
         assert_eq!(junk.payload_timeout, 300_000);
         let clamped = super::derive_solver_config(None, Some("5".into()));
-        assert_eq!(clamped.payload_timeout, 30_000, "budget clamps to the 30s floor");
+        assert_eq!(
+            clamped.payload_timeout, 30_000,
+            "budget clamps to the 30s floor"
+        );
     }
 
     use super::*;
@@ -1262,10 +2005,19 @@ mod tests {
     #[test]
     fn parse_size_bytes_reads_getcomics_size_strings() {
         assert_eq!(parse_size_bytes("Size : 350 MB"), Some(350 * 1024 * 1024));
-        assert_eq!(parse_size_bytes("size: 1.2 GB"), Some((1.2f64 * 1024.0 * 1024.0 * 1024.0) as i64));
+        assert_eq!(
+            parse_size_bytes("size: 1.2 GB"),
+            Some((1.2f64 * 1024.0 * 1024.0 * 1024.0) as i64)
+        );
         assert_eq!(parse_size_bytes("Size : 900 kb"), Some(900 * 1024));
-        assert_eq!(parse_size_bytes("Size : 1.5 GiB"), Some((1.5f64 * 1024.0 * 1024.0 * 1024.0) as i64));
-        assert_eq!(parse_size_bytes("Size : 1,024 MB"), Some(1024 * 1024 * 1024));
+        assert_eq!(
+            parse_size_bytes("Size : 1.5 GiB"),
+            Some((1.5f64 * 1024.0 * 1024.0 * 1024.0) as i64)
+        );
+        assert_eq!(
+            parse_size_bytes("Size : 1,024 MB"),
+            Some(1024 * 1024 * 1024)
+        );
         // Teaser text around it doesn't confuse the parser.
         assert_eq!(
             parse_size_bytes("Language : English | Year : 2024 | Size : 62 MB | Format: CBR"),
@@ -1280,7 +2032,10 @@ mod tests {
     fn max_size_bytes_takes_the_largest_section() {
         // Multi-part post: demotion keys on the biggest advertised archive.
         let article = "Vol. 1 Size : 250 MB ... Vol. 2 Size : 1.1 GB ... Vol. 3 Size : 800 MB";
-        assert_eq!(max_size_bytes(article), Some((1.1f64 * 1024.0 * 1024.0 * 1024.0) as i64));
+        assert_eq!(
+            max_size_bytes(article),
+            Some((1.1f64 * 1024.0 * 1024.0 * 1024.0) as i64)
+        );
         assert_eq!(max_size_bytes("no sizes here"), None);
     }
 
@@ -1288,22 +2043,51 @@ mod tests {
 
     #[test]
     fn demote_getcomics_hosters_moves_gc_to_the_end_keeping_relative_order() {
-        let order: Vec<String> = ["getcomics_direct", "getcomics_main", "mediafire", "mega", "pixeldrain"]
-            .iter().map(|s| s.to_string()).collect();
+        let order: Vec<String> = [
+            "getcomics_direct",
+            "getcomics_main",
+            "mediafire",
+            "mega",
+            "pixeldrain",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let demoted = demote_getcomics_hosters(&order);
-        assert_eq!(demoted, vec!["mediafire", "mega", "pixeldrain", "getcomics_direct", "getcomics_main"]);
+        assert_eq!(
+            demoted,
+            vec![
+                "mediafire",
+                "mega",
+                "pixeldrain",
+                "getcomics_direct",
+                "getcomics_main"
+            ]
+        );
 
         // Ranking a link set with the demoted order puts the mirror first, GC as fallback.
         let links = vec![
-            DeepLinkResult { url: "https://getcomics.org/dls/x".into(), hoster: "getcomics_main".into() },
-            DeepLinkResult { url: "https://comicfiles.ru/y".into(), hoster: "getcomics_direct".into() },
-            DeepLinkResult { url: "https://mediafire.com/z".into(), hoster: "mediafire".into() },
+            DeepLinkResult {
+                url: "https://getcomics.org/dls/x".into(),
+                hoster: "getcomics_main".into(),
+            },
+            DeepLinkResult {
+                url: "https://comicfiles.ru/y".into(),
+                hoster: "getcomics_direct".into(),
+            },
+            DeepLinkResult {
+                url: "https://mediafire.com/z".into(),
+                hoster: "mediafire".into(),
+            },
         ];
         let ranked = rank_and_dedupe(links, &demoted);
         assert_eq!(ranked[0].hoster, "mediafire");
         assert_eq!(ranked[1].hoster, "getcomics_direct");
         // GC-only pages still work — demotion never excludes.
-        let gc_only = vec![DeepLinkResult { url: "https://getcomics.org/dls/x".into(), hoster: "getcomics_main".into() }];
+        let gc_only = vec![DeepLinkResult {
+            url: "https://getcomics.org/dls/x".into(),
+            hoster: "getcomics_main".into(),
+        }];
         assert_eq!(rank_and_dedupe(gc_only, &demoted).len(), 1);
     }
 
@@ -1351,7 +2135,10 @@ mod tests {
         let enabled = vec!["getcomics_direct".to_string()];
         // Issue #22 is only in Vol. 2's range (10–30).
         let (_, sections) = extract_article_links(MULTI_PACK_HTML);
-        let t = DeepLinkTarget { issue_num: 22.0, year: None };
+        let t = DeepLinkTarget {
+            issue_num: 22.0,
+            year: None,
+        };
         match select_pack_section(sections, &t, &enabled) {
             SectionSelection::Section(links) => assert!(links[0].url.contains("crossed-v2")),
             _ => panic!("expected the Vol. 2 section"),
@@ -1364,7 +2151,10 @@ mod tests {
         // Issue #15 is inside BOTH Vol. 2 (10–30, width 20) and +100 (1–18, width 17); the
         // narrowest (most specific) range wins.
         let (_, sections) = extract_article_links(MULTI_PACK_HTML);
-        let t = DeepLinkTarget { issue_num: 15.0, year: None };
+        let t = DeepLinkTarget {
+            issue_num: 15.0,
+            year: None,
+        };
         match select_pack_section(sections, &t, &enabled) {
             SectionSelection::Section(links) => assert!(links[0].url.contains("crossed-100")),
             _ => panic!("expected the +100 section"),
@@ -1377,20 +2167,35 @@ mod tests {
 
         // Issue #50 is outside every section's range → no clean match → ambiguous, never an arbitrary grab.
         let (_, sections) = extract_article_links(MULTI_PACK_HTML);
-        let t = DeepLinkTarget { issue_num: 50.0, year: None };
-        assert!(matches!(select_pack_section(sections, &t, &enabled), SectionSelection::Ambiguous));
+        let t = DeepLinkTarget {
+            issue_num: 50.0,
+            year: None,
+        };
+        assert!(matches!(
+            select_pack_section(sections, &t, &enabled),
+            SectionSelection::Ambiguous
+        ));
 
         // Issue #5 (2016): Vol. 1 (2010) and +100 (2014) both contain #5 by range but fail the ±1 year
         // window; Vol. 2 doesn't contain #5 at all → ambiguous rather than a wrong-volume grab.
         let (_, sections) = extract_article_links(MULTI_PACK_HTML);
-        let t = DeepLinkTarget { issue_num: 5.0, year: Some("2016".to_string()) };
-        assert!(matches!(select_pack_section(sections, &t, &enabled), SectionSelection::Ambiguous));
+        let t = DeepLinkTarget {
+            issue_num: 5.0,
+            year: Some("2016".to_string()),
+        };
+        assert!(matches!(
+            select_pack_section(sections, &t, &enabled),
+            SectionSelection::Ambiguous
+        ));
     }
 
     #[test]
     fn section_targeting_never_diverts_ordinary_pages() {
         let enabled = vec!["getcomics_direct".to_string()];
-        let t = DeepLinkTarget { issue_num: 3.0, year: None };
+        let t = DeepLinkTarget {
+            issue_num: 3.0,
+            year: None,
+        };
 
         // A single-download page (one range-labeled section) is NOT a multi-pack — flat behavior.
         let single = r#"<html><body><article>
@@ -1398,12 +2203,18 @@ mod tests {
             <a class="aio-button" href="https://comicfiles.ru/wolverine.zip">Download Now</a>
         </article></body></html>"#;
         let (_, sections) = extract_article_links(single);
-        assert!(matches!(select_pack_section(sections, &t, &enabled), SectionSelection::NotMultiPack));
+        assert!(matches!(
+            select_pack_section(sections, &t, &enabled),
+            SectionSelection::NotMultiPack
+        ));
 
         // Sections whose hosters are all disabled don't count toward the multi-pack signature either.
         let (_, sections) = extract_article_links(MULTI_PACK_HTML);
         let none_enabled = vec!["mediafire".to_string()];
-        assert!(matches!(select_pack_section(sections, &t, &none_enabled), SectionSelection::NotMultiPack));
+        assert!(matches!(
+            select_pack_section(sections, &t, &none_enabled),
+            SectionSelection::NotMultiPack
+        ));
     }
 
     // The modal pads issue numbers ("003") but GetComics titles them "#3" — the fan-out must also
@@ -1411,10 +2222,26 @@ mod tests {
     #[test]
     fn interactive_variants_depad_issue_but_keep_year() {
         let v = interactive_query_variants(&["Wolverine 003 2024".to_string()]);
-        assert!(v.contains(&"Wolverine 003 2024".to_string()), "padded form kept: {:?}", v);
-        assert!(v.contains(&"Wolverine 3 2024".to_string()), "de-padded form added: {:?}", v);
-        assert!(v.contains(&"Wolverine 003".to_string()), "year-stripped form: {:?}", v);
-        assert!(v.contains(&"Wolverine".to_string()), "name-only broad form: {:?}", v);
+        assert!(
+            v.contains(&"Wolverine 003 2024".to_string()),
+            "padded form kept: {:?}",
+            v
+        );
+        assert!(
+            v.contains(&"Wolverine 3 2024".to_string()),
+            "de-padded form added: {:?}",
+            v
+        );
+        assert!(
+            v.contains(&"Wolverine 003".to_string()),
+            "year-stripped form: {:?}",
+            v
+        );
+        assert!(
+            v.contains(&"Wolverine".to_string()),
+            "name-only broad form: {:?}",
+            v
+        );
         // "Wolverine 3 2024" being present already proves 003→3 de-padded while the 2024 year stays intact.
     }
 
@@ -1423,8 +2250,16 @@ mod tests {
         // Discussion #177: "Hack/Slash" never matched — GetComics/CV searches choke on the slash.
         // The symbol-cleaned variant must fold '/' to a space like it already does for ':', '-', '&'.
         let v = interactive_query_variants(&["Hack/Slash 003".to_string()]);
-        assert!(v.contains(&"Hack Slash 003".to_string()), "slash folded: {:?}", v);
-        assert!(v.contains(&"Hack Slash 3".to_string()), "slash folded + de-padded: {:?}", v);
+        assert!(
+            v.contains(&"Hack Slash 003".to_string()),
+            "slash folded: {:?}",
+            v
+        );
+        assert!(
+            v.contains(&"Hack Slash 3".to_string()),
+            "slash folded + de-padded: {:?}",
+            v
+        );
     }
 
     // Builds the Cookie header + UA the engine replays to get past Cloudflare on a getcomics.org/dls/ download.
@@ -1445,7 +2280,10 @@ mod tests {
         // No solution.url in the payload -> None, caller keeps the original request URL.
         assert!(c.solved_url.is_none());
         // No cookies (or no solution) -> None, so the caller falls back to a direct fetch.
-        assert!(parse_flaresolverr_clearance(&serde_json::json!({ "solution": { "cookies": [] } })).is_none());
+        assert!(parse_flaresolverr_clearance(
+            &serde_json::json!({ "solution": { "cookies": [] } })
+        )
+        .is_none());
         assert!(parse_flaresolverr_clearance(&serde_json::json!({ "status": "error" })).is_none());
     }
 
@@ -1463,46 +2301,106 @@ mod tests {
             }
         });
         let c = parse_flaresolverr_clearance(&data).unwrap();
-        assert_eq!(c.solved_url.as_deref(), Some("https://cdn.example.net/file/signed-abc.cbz"));
+        assert_eq!(
+            c.solved_url.as_deref(),
+            Some("https://cdn.example.net/file/signed-abc.cbz")
+        );
         assert_eq!(c.solved_status, Some(200));
         // An empty url string is treated as absent, not as a navigable target.
         let empty = serde_json::json!({
             "solution": { "url": "", "userAgent": "ua", "cookies": [ { "name": "a", "value": "b" } ] }
         });
-        assert!(parse_flaresolverr_clearance(&empty).unwrap().solved_url.is_none());
+        assert!(parse_flaresolverr_clearance(&empty)
+            .unwrap()
+            .solved_url
+            .is_none());
     }
 
     // Pure URL→hoster classifier gating the entire DDL routing.
     #[test]
     fn hoster_classification_from_urls() {
         // A main-server button with an unclassifiable URL is GetComics' Cloudflare-gated path.
-        assert_eq!(get_hoster_from_url("https://anything.example/x", true), "getcomics_main");
+        assert_eq!(
+            get_hoster_from_url("https://anything.example/x", true),
+            "getcomics_main"
+        );
         // getcomics.org/dls/ "main server" links are gated, regardless of the button flag.
-        assert_eq!(get_hoster_from_url("https://getcomics.org/dls/12345/", true), "getcomics_main");
-        assert_eq!(get_hoster_from_url("https://getcomics.org/dls/12345/", false), "getcomics_main");
+        assert_eq!(
+            get_hoster_from_url("https://getcomics.org/dls/12345/", true),
+            "getcomics_main"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://getcomics.org/dls/12345/", false),
+            "getcomics_main"
+        );
         // The comicfiles CDN is the fast, non-gated direct download — even on a main-server button.
-        assert_eq!(get_hoster_from_url("https://comicfiles.ru/file.cbz", false), "getcomics_direct");
-        assert_eq!(get_hoster_from_url("https://comicfiles.ru/file.cbz", true), "getcomics_direct");
-        assert_eq!(get_hoster_from_url("https://www.mediafire.com/file/abc", false), "mediafire");
-        assert_eq!(get_hoster_from_url("https://mega.nz/file/xyz", false), "mega");
-        assert_eq!(get_hoster_from_url("https://mega.co.nz/#!old", false), "mega");
-        assert_eq!(get_hoster_from_url("https://pixeldrain.com/u/abc", false), "pixeldrain");
-        assert_eq!(get_hoster_from_url("https://terabox.com/s/abc", false), "terabox");
-        assert_eq!(get_hoster_from_url("https://www.teraboxapp.com/s/abc", false), "terabox");
-        assert_eq!(get_hoster_from_url("https://rootz.example/abc", false), "rootz");
-        assert_eq!(get_hoster_from_url("https://vikingfile.com/f/abc", false), "vikingfile");
+        assert_eq!(
+            get_hoster_from_url("https://comicfiles.ru/file.cbz", false),
+            "getcomics_direct"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://comicfiles.ru/file.cbz", true),
+            "getcomics_direct"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://www.mediafire.com/file/abc", false),
+            "mediafire"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://mega.nz/file/xyz", false),
+            "mega"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://mega.co.nz/#!old", false),
+            "mega"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://pixeldrain.com/u/abc", false),
+            "pixeldrain"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://terabox.com/s/abc", false),
+            "terabox"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://www.teraboxapp.com/s/abc", false),
+            "terabox"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://rootz.example/abc", false),
+            "rootz"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://vikingfile.com/f/abc", false),
+            "vikingfile"
+        );
         // zippyshare (defunct) and userscloud (no resolver) are no longer classified.
-        assert_eq!(get_hoster_from_url("https://www.zippyshare.com/v/abc", false), "unknown");
-        assert_eq!(get_hoster_from_url("https://userscloud.com/abc", false), "unknown");
-        assert_eq!(get_hoster_from_url("https://random-host.io/file", false), "unknown");
+        assert_eq!(
+            get_hoster_from_url("https://www.zippyshare.com/v/abc", false),
+            "unknown"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://userscloud.com/abc", false),
+            "unknown"
+        );
+        assert_eq!(
+            get_hoster_from_url("https://random-host.io/file", false),
+            "unknown"
+        );
     }
 
     // Legacy single `getcomics` entry splits into direct (in place) + gated main (appended last).
     #[test]
     fn migrates_legacy_getcomics_to_split() {
         let mut prefs = vec![
-            HosterPref { hoster: "getcomics".into(), enabled: true },
-            HosterPref { hoster: "mediafire".into(), enabled: false },
+            HosterPref {
+                hoster: "getcomics".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "mediafire".into(),
+                enabled: false,
+            },
         ];
         migrate_legacy_getcomics(&mut prefs);
         // getcomics_direct keeps the slot; getcomics_main is inserted right after it (both high-priority).
@@ -1512,16 +2410,25 @@ mod tests {
         assert!(prefs[1].enabled);
         assert_eq!(prefs[2].hoster, "mediafire");
         // Idempotent: a second pass changes nothing.
-        let before: Vec<_> = prefs.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        let before: Vec<_> = prefs
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
         migrate_legacy_getcomics(&mut prefs);
-        let after: Vec<_> = prefs.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        let after: Vec<_> = prefs
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
         assert_eq!(before, after);
     }
 
     // The migration preserves the legacy entry's enabled flag on BOTH split keys.
     #[test]
     fn migrate_preserves_disabled_getcomics() {
-        let mut prefs = vec![HosterPref { hoster: "getcomics".into(), enabled: false }];
+        let mut prefs = vec![HosterPref {
+            hoster: "getcomics".into(),
+            enabled: false,
+        }];
         migrate_legacy_getcomics(&mut prefs);
         assert_eq!(prefs[0].hoster, "getcomics_direct");
         assert!(!prefs[0].enabled);
@@ -1533,13 +2440,273 @@ mod tests {
     #[test]
     fn migrate_leaves_split_scheme_untouched() {
         let mut prefs = vec![
-            HosterPref { hoster: "getcomics_direct".into(), enabled: true },
-            HosterPref { hoster: "mega".into(), enabled: true },
-            HosterPref { hoster: "getcomics_main".into(), enabled: false },
+            HosterPref {
+                hoster: "getcomics_direct".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "mega".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "getcomics_main".into(),
+                enabled: false,
+            },
         ];
-        let before: Vec<_> = prefs.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        let before: Vec<_> = prefs
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
         migrate_legacy_getcomics(&mut prefs);
-        let after: Vec<_> = prefs.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        let after: Vec<_> = prefs
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
         assert_eq!(before, after);
+    }
+
+    // The only hoster that needs a browser solver must not outrank the ones that plain scraping can
+    // resolve — otherwise the bulk of downloads are funnelled at the sole MANUAL_DDL-capable path.
+    #[test]
+    fn default_order_tries_scraping_mirrors_before_the_gated_main_server() {
+        let names: Vec<_> = default_hoster_prefs()
+            .iter()
+            .map(|p| p.hoster.clone())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "getcomics_direct",
+                "mediafire",
+                "mega",
+                "pixeldrain",
+                "getcomics_main",
+                "rootz",
+                "vikingfile",
+                "terabox"
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+        );
+        // getcomics_main is still ENABLED (many issues only expose a /dls/ link) — just tried last.
+        let prefs = default_hoster_prefs();
+        assert!(prefs
+            .iter()
+            .any(|p| p.hoster == "getcomics_main" && p.enabled));
+        // The unresolvable-by-scraping hosters stay off out of the box.
+        for off in ["rootz", "vikingfile", "terabox"] {
+            assert!(
+                prefs.iter().any(|p| p.hoster == off && !p.enabled),
+                "{off} must stay disabled by default"
+            );
+        }
+    }
+
+    // A stored config that is byte-for-byte what we shipped IS an untouched config, so it gets the
+    // new default order — that's the only way existing installs benefit from this change at all.
+    #[test]
+    fn migrate_pristine_default_order_reorders_the_untouched_config() {
+        let legacy: Vec<HosterPref> = LEGACY_DEFAULT_ORDER
+            .iter()
+            .map(|(h, en)| HosterPref {
+                hoster: h.to_string(),
+                enabled: *en,
+            })
+            .collect();
+        let migrated = migrate_pristine_default_order(legacy);
+        assert_eq!(
+            migrated
+                .iter()
+                .map(|p| p.hoster.clone())
+                .collect::<Vec<_>>(),
+            default_hoster_prefs()
+                .iter()
+                .map(|p| p.hoster.clone())
+                .collect::<Vec<_>>()
+        );
+        // Idempotent: a second pass finds a list that no longer matches the legacy fingerprint.
+        let before: Vec<_> = migrated
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
+        let again = migrate_pristine_default_order(migrated);
+        let after: Vec<_> = again
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    // The whole point of the pristine check: anything that isn't exactly the shipped default is a
+    // DELIBERATE config and must survive byte-for-byte. Silently reordering someone's tuning would be
+    // a worse regression than the MANUAL_DDL flood we are fixing.
+    #[test]
+    fn migrate_pristine_default_order_never_clobbers_custom_configs() {
+        let base: Vec<HosterPref> = LEGACY_DEFAULT_ORDER
+            .iter()
+            .map(|(h, en)| HosterPref {
+                hoster: h.to_string(),
+                enabled: *en,
+            })
+            .collect();
+        let names = |p: &Vec<HosterPref>| {
+            p.iter()
+                .map(|x| (x.hoster.clone(), x.enabled))
+                .collect::<Vec<_>>()
+        };
+
+        // A user who deliberately put getcomics_main first.
+        let mut deliberate = base.clone();
+        deliberate.swap(1, 3);
+        let before = names(&deliberate);
+        assert_eq!(
+            names(&migrate_pristine_default_order(deliberate)),
+            before,
+            "reordered config must be untouched"
+        );
+
+        // A user who toggled a hoster.
+        let toggled = base
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if p.hoster == "getcomics_main" {
+                    p.enabled = false;
+                }
+                p
+            })
+            .collect::<Vec<_>>();
+        let before = names(&toggled);
+        assert_eq!(
+            names(&migrate_pristine_default_order(toggled)),
+            before,
+            "toggled config must be untouched"
+        );
+
+        // A user who dropped a hoster / added their own.
+        let trimmed = base[..base.len() - 1].to_vec();
+        let before = names(&trimmed);
+        assert_eq!(names(&migrate_pristine_default_order(trimmed)), before);
+        let extended = {
+            let mut v = base.clone();
+            v.push(HosterPref {
+                hoster: "custom".into(),
+                enabled: true,
+            });
+            v
+        };
+        let before = names(&extended);
+        assert_eq!(names(&migrate_pristine_default_order(extended)), before);
+        // An explicitly empty config means "no hosters" — never reinterpreted as "use the defaults".
+        assert!(migrate_pristine_default_order(Vec::new()).is_empty());
+    }
+
+    // The legacy `getcomics` split and the pristine reorder compose. A PRE-SPLIT install sitting on
+    // defaults, once split, lands on exactly the old shipped default — so it also matches the pristine
+    // fingerprint and is upgraded to the new order. This is the realistic "existing install benefits"
+    // path (idempotent: the new order no longer matches the fingerprint).
+    #[test]
+    fn legacy_split_then_pristine_reorder() {
+        let mut legacy_key = vec![
+            HosterPref {
+                hoster: "getcomics".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "mediafire".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "mega".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "pixeldrain".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "rootz".into(),
+                enabled: false,
+            },
+            HosterPref {
+                hoster: "vikingfile".into(),
+                enabled: false,
+            },
+            HosterPref {
+                hoster: "terabox".into(),
+                enabled: false,
+            },
+        ];
+        migrate_legacy_getcomics(&mut legacy_key);
+        assert_eq!(legacy_key[0].hoster, "getcomics_direct");
+        assert_eq!(legacy_key[1].hoster, "getcomics_main");
+        let out = migrate_pristine_default_order(legacy_key);
+        let after: Vec<_> = out.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        assert_eq!(
+            after,
+            default_hoster_prefs()
+                .iter()
+                .map(|p| (p.hoster.clone(), p.enabled))
+                .collect::<Vec<_>>()
+        );
+        // Idempotent on a second pass.
+        assert_eq!(
+            migrate_pristine_default_order(out.clone())
+                .iter()
+                .map(|p| (p.hoster.clone(), p.enabled))
+                .collect::<Vec<_>>(),
+            after
+        );
+    }
+
+    // ...but a pre-split config the user had ALREADY reordered is not the shipped default, so neither
+    // migration may touch its ordering.
+    #[test]
+    fn legacy_split_leaves_deliberate_ordering_alone() {
+        let mut deliberate = vec![
+            HosterPref {
+                hoster: "mediafire".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "getcomics".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "mega".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "pixeldrain".into(),
+                enabled: true,
+            },
+            HosterPref {
+                hoster: "rootz".into(),
+                enabled: false,
+            },
+            HosterPref {
+                hoster: "vikingfile".into(),
+                enabled: false,
+            },
+            HosterPref {
+                hoster: "terabox".into(),
+                enabled: false,
+            },
+        ];
+        migrate_legacy_getcomics(&mut deliberate);
+        let before: Vec<_> = deliberate
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
+        let after: Vec<_> = migrate_pristine_default_order(deliberate)
+            .iter()
+            .map(|p| (p.hoster.clone(), p.enabled))
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(
+            after[0].0, "mediafire",
+            "the user's own top choice is preserved"
+        );
     }
 }

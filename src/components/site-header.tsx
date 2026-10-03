@@ -347,6 +347,16 @@ export function SiteHeader() {
                 </Button>
               )}
 
+              {/* Smart Matcher. Sparkles is the icon the Admin Dashboard card and the page's own
+                  <h1> both use, so it reads the same wherever an admin meets it. */}
+              {session?.user?.role === "ADMIN" && (
+                <Button asChild variant="ghost" size="icon" className="relative h-10 w-10 group hover:bg-primary/10 transition-colors">
+                  <Link href="/admin/smart-match" aria-label="Smart Matcher">
+                    <Sparkles className="h-5 w-5 text-muted-foreground group-hover:text-primary transition-colors" />
+                  </Link>
+                </Button>
+              )}
+
               <button
                 onClick={() => setTheme(isDark ? "light" : "dark")}
                 className={`relative flex items-center w-14 h-7 rounded-full p-1 cursor-pointer transition-colors duration-200 ease-out motion-reduce:transition-none active:scale-95 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 shadow-inner hidden lg:flex bg-muted border border-border hover:border-primary/50`}

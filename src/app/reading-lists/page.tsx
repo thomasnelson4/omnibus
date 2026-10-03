@@ -77,6 +77,7 @@ function ReadingListsContent() {
 
   // Refresh affordances (fork review #1)
   const [isRefreshingList, setIsRefreshingList] = useState(false)
+  const [isSavingVisibility, setIsSavingVisibility] = useState(false)
   const [refreshingItemIds, setRefreshingItemIds] = useState<Set<string>>(new Set())
   const [resyncingSeriesIds, setResyncingSeriesIds] = useState<Set<string>>(new Set())
 
@@ -587,6 +588,47 @@ function ReadingListsContent() {
     }
   }
 
+  // Visibility. No optimistic write: the server is the authority (it can refuse a promotion, and a
+  // list with no owner stays visible whatever the flag says), so the switch only ever moves to the
+  // value the response carried — it cannot drift away from what the database actually holds.
+  const handleToggleVisibility = async (next: boolean) => {
+      const listId = activeListId;
+      if (!listId || isSavingVisibility) return;
+      setIsSavingVisibility(true);
+      try {
+          const res = await fetch('/api/reading-lists', {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: listId, isGlobal: next })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+              toast({
+                  title: next ? "Couldn't make this list public" : "Couldn't make this list private",
+                  description: data.error || "The server refused the change.",
+                  variant: "destructive"
+              });
+              return;
+          }
+          // Patch the local copy in place: only these two fields can have moved, and replacing the
+          // list wholesale would throw away the loaded items.
+          setLists(prev => prev.map(l => (l.id === listId
+              ? { ...l, isGlobal: data.list?.isGlobal, shareId: data.list?.shareId ?? null }
+              : l)));
+          toast({
+              title: data.list?.isGlobal ? "List is now public" : "List is now private",
+              description: [
+                  data.notice,
+                  data.shareRevoked ? "The existing share link has been disabled — Share mints a new one." : null
+              ].filter(Boolean).join(' ') || undefined
+          });
+      } catch (e) {
+          toast({ title: "Error", description: "Failed to update list visibility.", variant: "destructive" });
+      } finally {
+          setIsSavingVisibility(false);
+      }
+  }
+
   const confirmDeleteList = async () => {
     if (!activeListId) return;
     setIsDeleting(true);
@@ -816,6 +858,18 @@ function ReadingListsContent() {
   const activeList = lists.find(l => l.id === activeListId);
   // Mirrors the server's edit rule (owner or ADMIN; system lists are ADMIN-only).
   const canEditActiveList = !!activeList && (isAdmin || activeList.userId === session?.user?.id);
+  // Visibility affordances, derived so the switch is only ever rendered where it can do something:
+  //  - a list with no owner is visible to every user whatever the flag says (GET's OR filter and
+  //    share/route.ts's isPublic both test userId === null on their own) — shown disabled, because
+  //    the honest answer is "this cannot be made private", not a switch that lies;
+  //  - going public needs canCreateGlobalLists (promotion is gated, demotion is not), so a private
+  //    list the viewer may not publish renders nothing rather than a dead control.
+  const canMakeGlobal = isAdmin || (session?.user as any)?.canCreateGlobalLists === true;
+  const isSystemActiveList = !!activeList && activeList.userId === null;
+  const canToggleVisibility = canEditActiveList
+      && !isSystemActiveList
+      && (activeList?.isGlobal === true || canMakeGlobal);
+  const showVisibilityControl = canToggleVisibility || (isSystemActiveList && canEditActiveList);
   // "Missing" = nothing to read: unlinked entries AND entries linked to an issue without a file.
   const missingItems = activeList ? activeList.items.filter((i: any) => !isDownloaded(i)) : [];
 
@@ -937,6 +991,43 @@ function ReadingListsContent() {
                               <div className="flex flex-wrap items-center gap-3 min-w-0 flex-1">
                                 <CardTitle className="text-2xl sm:text-3xl font-black text-primary leading-tight break-words">{activeList.name}</CardTitle>
                                 {activeList.isGlobal && <Badge variant="outline" className="shrink-0 bg-emerald-50 text-emerald-600 border-emerald-200 dark:bg-emerald-900/20 dark:border-emerald-800"><Globe className="w-3 h-3 mr-1"/> Global ({activeList.user?.username || 'Unknown'})</Badge>}
+                                {/* --- VISIBILITY TOGGLE ---
+                                    Placed beside the Global badge because that badge IS the state this
+                                    control reports. Hidden entirely when nothing it could do is
+                                    permitted (see canToggleVisibility); the system-list case is the
+                                    one thing worth showing even when disabled, because the flag is
+                                    inert there and that is not obvious. */}
+                                {showVisibilityControl && (
+                                    <div
+                                        className="flex items-center gap-2 shrink-0"
+                                        title={isSystemActiveList
+                                            ? "This list has no owner, so it stays visible to every user — the switch cannot change that."
+                                            : activeList.isGlobal
+                                                ? "Make private. Only you (and admins) will see this list. The existing share link will be disabled."
+                                                : "Make public. It will appear on every user's profile."}
+                                    >
+                                        <Switch
+                                            id="visibility-toggle"
+                                            checked={activeList.isGlobal === true}
+                                            disabled={isSystemActiveList || isSavingVisibility}
+                                            onCheckedChange={handleToggleVisibility}
+                                            aria-describedby="visibility-toggle-hint"
+                                            className={activeList.isGlobal
+                                                ? "data-[state=checked]:bg-emerald-500 data-[state=checked]:border-emerald-500 transition-colors duration-200"
+                                                : "transition-colors duration-200"}
+                                        />
+                                        <Label htmlFor="visibility-toggle" className="text-[10px] font-black uppercase tracking-wider text-muted-foreground cursor-pointer select-none">
+                                            Public
+                                        </Label>
+                                        <span id="visibility-toggle-hint" className="sr-only">
+                                            {isSystemActiveList
+                                                ? "Unavailable: this list has no owner and is visible to everyone regardless."
+                                                : activeList.isGlobal
+                                                    ? "Currently public to all users."
+                                                    : "Currently private to you."}
+                                        </span>
+                                    </div>
+                                )}
                               </div>
                               
                               <div className="flex flex-wrap items-center gap-3 shrink-0 w-full xl:w-auto justify-start xl:justify-end">

@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button"
 import {
   ShieldAlert, LogOut, User as UserIcon, Sun, Moon, Key, Loader2,
   Bell, Image as ImageIcon, Trophy, Wrench, Menu, UserPlus, AlertTriangle,
-  FolderSearch, Search, Sparkles, RefreshCw
+  FolderSearch, Search, Sparkles, RefreshCw, UploadCloud
 } from "lucide-react"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
@@ -336,6 +336,16 @@ export function SiteHeader() {
               )}
 
               {session && <NotificationBell />}
+
+              {/* Admin-only shortcut to the Manual Upload screen. Middleware already blocks
+                  non-admins server-side; this keeps the header from advertising an unusable link. */}
+              {session?.user?.role === "ADMIN" && (
+                <Button asChild variant="ghost" size="icon" className="relative h-10 w-10 group hover:bg-primary/10 transition-colors">
+                  <Link href="/admin/upload" aria-label="Manual Upload">
+                    <UploadCloud className="h-5 w-5 text-muted-foreground group-hover:text-primary transition-colors" />
+                  </Link>
+                </Button>
+              )}
 
               <button
                 onClick={() => setTheme(isDark ? "light" : "dark")}

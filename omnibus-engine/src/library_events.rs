@@ -78,11 +78,23 @@ pub fn emit(reason: &str, paths: Vec<String>, series_ids: Vec<String>) {
 /// routinely touches the same path twice (temp file + final rename). Returns `true` once the batch
 /// is full enough to send without waiting for the window to close.
 pub fn coalesce(batch: LibraryEvent, incoming: LibraryEvent) -> (LibraryEvent, bool) {
-    let LibraryEvent { reason: batch_reason, mut paths, mut series_ids } = batch;
-    let LibraryEvent { reason: incoming_reason, paths: new_paths, series_ids: new_series } = incoming;
+    let LibraryEvent {
+        reason: batch_reason,
+        mut paths,
+        mut series_ids,
+    } = batch;
+    let LibraryEvent {
+        reason: incoming_reason,
+        paths: new_paths,
+        series_ids: new_series,
+    } = incoming;
 
     // Keep the first reason: a batch is one logical change, and the first caller names it best.
-    let reason = if batch_reason.is_empty() { incoming_reason } else { batch_reason };
+    let reason = if batch_reason.is_empty() {
+        incoming_reason
+    } else {
+        batch_reason
+    };
 
     // Owned keys: the sets must not borrow from the vectors they are also being appended to.
     let mut seen: std::collections::HashSet<String> = paths.iter().cloned().collect();
@@ -99,7 +111,14 @@ pub fn coalesce(batch: LibraryEvent, incoming: LibraryEvent) -> (LibraryEvent, b
     }
 
     let full = paths.len() >= MAX_BATCH_PATHS;
-    (LibraryEvent { reason, paths, series_ids }, full)
+    (
+        LibraryEvent {
+            reason,
+            paths,
+            series_ids,
+        },
+        full,
+    )
 }
 
 /// Split an oversized batch into POST-sized chunks, so one huge job cannot produce a body Node's
@@ -153,7 +172,12 @@ async fn komga_enabled(db: &Db) -> bool {
 ///
 /// Returns Ok(()) on success. Retries are short and bounded: a Node restart should not lose the
 /// whole burst, but an outage must not hold the task open either.
-async fn post_batch(client: &reqwest::Client, endpoint: &str, secret: &str, events: &[serde_json::Value]) {
+async fn post_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    secret: &str,
+    events: &[serde_json::Value],
+) {
     let body = serde_json::json!({ "events": events });
     let mut delay = Duration::from_secs(2);
 
@@ -180,13 +204,20 @@ async fn post_batch(client: &reqwest::Client, endpoint: &str, secret: &str, even
                 }
                 // 4xx is a contract bug, not a blip: retrying cannot fix it.
                 if status.is_client_error() {
-                    log::warn!("[LibraryEvents] Node rejected the batch with {}; not retrying.", status);
+                    log::warn!(
+                        "[LibraryEvents] Node rejected the batch with {}; not retrying.",
+                        status
+                    );
                     return;
                 }
             }
             Err(e) => {
                 if attempt == MAX_ATTEMPTS {
-                    log::warn!("[LibraryEvents] Could not reach Node after {} attempt(s): {}", attempt, e);
+                    log::warn!(
+                        "[LibraryEvents] Could not reach Node after {} attempt(s): {}",
+                        attempt,
+                        e
+                    );
                     return;
                 }
             }
@@ -214,12 +245,17 @@ async fn drain_loop(db: Db, mut rx: UnboundedReceiver<LibraryEvent>) {
     // attempt would be a wasted connection. Warn once at startup rather than per event.
     let secret = std::env::var("NEXTAUTH_SECRET").unwrap_or_default();
     if secret.is_empty() {
-        log::warn!("[LibraryEvents] NEXTAUTH_SECRET unset; engine library changes will not reach Node.");
+        log::warn!(
+            "[LibraryEvents] NEXTAUTH_SECRET unset; engine library changes will not reach Node."
+        );
         return;
     }
     let node_url =
         std::env::var("OMNIBUS_NODE_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
-    let endpoint = format!("{}/api/internal/library-changed", node_url.trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/api/internal/library-changed",
+        node_url.trim_end_matches('/')
+    );
 
     let client = match reqwest::Client::builder().timeout(POST_TIMEOUT).build() {
         Ok(c) => c,
@@ -262,7 +298,10 @@ async fn drain_loop(db: Db, mut rx: UnboundedReceiver<LibraryEvent>) {
         };
 
         if !still_enabled {
-            log::debug!("[LibraryEvents] komga_enabled is off; dropping {} path(s).", batch.paths.len());
+            log::debug!(
+                "[LibraryEvents] komga_enabled is off; dropping {} path(s).",
+                batch.paths.len()
+            );
             continue;
         }
 
@@ -296,18 +335,30 @@ mod tests {
 
     #[test]
     fn coalesce_keeps_the_first_reason() {
-        let (batch, _) = coalesce(ev("watched-import", &[], &[]), ev("metadata-embed", &[], &[]));
+        let (batch, _) = coalesce(
+            ev("watched-import", &[], &[]),
+            ev("metadata-embed", &[], &[]),
+        );
         assert_eq!(batch.reason, "watched-import");
     }
 
     #[test]
     fn coalesce_reports_full_at_the_cap() {
-        let many: Vec<String> = (0..MAX_BATCH_PATHS).map(|i| format!("/a/{}.cbz", i)).collect();
+        let many: Vec<String> = (0..MAX_BATCH_PATHS)
+            .map(|i| format!("/a/{}.cbz", i))
+            .collect();
         let (_, full) = coalesce(
             ev("import", &[], &[]),
-            LibraryEvent { reason: "import".into(), paths: many, series_ids: vec![] },
+            LibraryEvent {
+                reason: "import".into(),
+                paths: many,
+                series_ids: vec![],
+            },
         );
-        assert!(full, "a batch at the cap must be sent without waiting for the window");
+        assert!(
+            full,
+            "a batch at the cap must be sent without waiting for the window"
+        );
     }
 
     #[test]
@@ -325,14 +376,19 @@ mod tests {
 
     #[test]
     fn chunk_event_splits_an_oversized_batch() {
-        let many: Vec<String> = (0..MAX_BATCH_PATHS + 7).map(|i| format!("/a/{}.cbz", i)).collect();
+        let many: Vec<String> = (0..MAX_BATCH_PATHS + 7)
+            .map(|i| format!("/a/{}.cbz", i))
+            .collect();
         let chunks = chunk_event(&LibraryEvent {
             reason: "cbr-convert".into(),
             paths: many,
             series_ids: vec!["s1".into()],
         });
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0]["paths"].as_array().map(Vec::len), Some(MAX_BATCH_PATHS));
+        assert_eq!(
+            chunks[0]["paths"].as_array().map(Vec::len),
+            Some(MAX_BATCH_PATHS)
+        );
         assert_eq!(chunks[1]["paths"].as_array().map(Vec::len), Some(7));
     }
 
@@ -373,7 +429,8 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.expect("accept");
                 let mut buf = vec![0u8; 8192];
                 let n = socket.read(&mut buf).await.unwrap_or(0);
-                seen.set(String::from_utf8_lossy(&buf[..n]).to_string()).ok();
+                seen.set(String::from_utf8_lossy(&buf[..n]).to_string())
+                    .ok();
                 socket
                     .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n")
                     .await
@@ -381,25 +438,44 @@ mod tests {
             }
         });
 
-        let client = reqwest::Client::builder().timeout(POST_TIMEOUT).build().expect("client");
+        let client = reqwest::Client::builder()
+            .timeout(POST_TIMEOUT)
+            .build()
+            .expect("client");
         post_batch(
             &client,
             &format!("http://{}/api/internal/library-changed", addr),
             "s3cret",
-            &[to_payload(&ev("metadata-embed", &["/lib/Series/1.cbz"], &["s1"]))],
+            &[to_payload(&ev(
+                "metadata-embed",
+                &["/lib/Series/1.cbz"],
+                &["s1"],
+            ))],
         )
         .await;
 
         server.await.expect("server task");
         // HTTP/1.1 header names are case-insensitive and hyper lowercases them on the wire.
         let request = seen.get().expect("captured request").to_lowercase();
-        assert!(request.contains("post /api/internal/library-changed"), "got: {}", request);
-        assert!(request.contains("x-internal-secret: s3cret"), "got: {}", request);
+        assert!(
+            request.contains("post /api/internal/library-changed"),
+            "got: {}",
+            request
+        );
+        assert!(
+            request.contains("x-internal-secret: s3cret"),
+            "got: {}",
+            request
+        );
         assert!(request.contains("metadata-embed"), "got: {}", request);
         assert!(request.contains("/lib/series/1.cbz"), "got: {}", request);
         // Node's route reads `seriesIds` (camelCase) in the JSON body — not the snake_case the
         // Rust struct field uses.
-        assert!(request.contains("\"seriesids\":[\"s1\"]"), "got: {}", request);
+        assert!(
+            request.contains("\"seriesids\":[\"s1\"]"),
+            "got: {}",
+            request
+        );
     }
 
     /// A non-2xx must not panic and must not retry a 4xx (a contract bug cannot be fixed by waiting).
@@ -419,7 +495,10 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     let accepted = listener.accept().await;
-                    let (mut socket, _) = match accepted { Ok(v) => v, Err(_) => break };
+                    let (mut socket, _) = match accepted {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
                     hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = socket.read(&mut buf).await;
                     let _ = socket
@@ -429,7 +508,10 @@ mod tests {
             }
         });
 
-        let client = reqwest::Client::builder().timeout(POST_TIMEOUT).build().expect("client");
+        let client = reqwest::Client::builder()
+            .timeout(POST_TIMEOUT)
+            .build()
+            .expect("client");
         post_batch(
             &client,
             &format!("http://{}/api/internal/library-changed", addr),

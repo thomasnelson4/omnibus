@@ -82,6 +82,11 @@ export async function POST(request: Request) {
             await restoreTable(backup.data.series, tx.series);
             await restoreTable(backup.data.collections, tx.collection);
             await restoreTable(backup.data.readingLists, tx.readingList);
+            // Komga* tables are rebuildable caches: a backup carries none of them and none are
+            // restored here. That is correct on both sides of the round-trip — readingLists above
+            // carries ReadingList.komgaSync (so a list stays opted in), and the first reconcile after a
+            // restore rebuilds the library cache and identity map from Komga itself, re-adopting the
+            // read lists it pushed before by their ownership marker.
             await restoreTable(backup.data.issues, tx.issue);
             await restoreTable(backup.data.requests, tx.request);
             await restoreTable(backup.data.userTrophies, tx.userTrophy);

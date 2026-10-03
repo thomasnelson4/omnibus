@@ -56,6 +56,21 @@ export const KOMGA_VERIFY_MTIME_SLACK_MS = 2_000;
 export const KOMGA_OVERFLOW_STAT_LIMIT = 500;
 export const KOMGA_DB_CHUNK = 500;
 
+/**
+ * The first words of the JobLog message verify.ts writes when it stops retrying. The Phase 5 health
+ * check counts these rows to spot files Komga never picked up, so the literal lives here instead of
+ * being copied into the query (one place to change, and no silent drift into a query that matches
+ * nothing).
+ */
+export const KOMGA_VERIFY_GIVEUP_PREFIX = 'Komga did not pick up';
+
+/**
+ * The prefix of `KomgaSyncState.lastError` when a reconcile aborted on its safety valve. Same
+ * reason: the health check finds tripped valves with `startsWith`, so the valve's own write and the
+ * query share one constant.
+ */
+export const KOMGA_VALVE_ERROR_PREFIX = 'reconcile safety valve';
+
 // --- Read lists (Phase 4) ---
 export const KOMGA_READLIST_DEBOUNCE_MS = 10_000;
 export const KOMGA_DELETE_REMOTE_ON_UNSYNC = true;

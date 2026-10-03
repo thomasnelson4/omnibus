@@ -14,7 +14,7 @@ import {
     Activity, RefreshCw, FileText, ExternalLink, Download, 
     UploadCloud, TrendingUp, FileArchive, FileJson, Mail, Layers, Globe, Settings, Trash2,
     FolderInput, HeartPulse, // <-- ADDED new icons
-    Sparkles
+    Sparkles, Server
 } from "lucide-react"
 import { getErrorMessage } from "@/lib/utils/error"
 
@@ -42,6 +42,9 @@ export default function ScheduledJobsPage() {
   // only reflects their state so a scheduled job that would skip is explained, never flips them.
   const [seriesJsonEnabled, setSeriesJsonEnabled] = useState(true) // default ON (discussion #182)
   const [cbrConversionEnabled, setCbrConversionEnabled] = useState(true) // default ON
+  // Same rule for Komga: read-only here. The integration is owned by Settings → Media Servers; this
+  // page only reflects it so a "Run Now" that would be skipped is explained, never silently green.
+  const [komgaEnabled, setKomgaEnabled] = useState(false)
   const [librarySyncSchedule, setLibrarySyncSchedule] = useState("12") 
   const [monitorSyncSchedule, setMonitorSyncSchedule] = useState("24") 
   const [diagnosticsSyncSchedule, setDiagnosticsSyncSchedule] = useState("168")
@@ -154,6 +157,8 @@ export default function ScheduledJobsPage() {
         setSeriesJsonEnabled(seriesJsonEnabledItem?.value !== 'false');
         const cbrEnabledItem = data.settings.find((c: any) => c.key === 'cbr_conversion_enabled');
         setCbrConversionEnabled(cbrEnabledItem?.value !== 'false');
+        // Komga defaults OFF when the row is absent, so unlike the two above this is an explicit read.
+        setKomgaEnabled(data.settings.find((c: any) => c.key === 'komga_enabled')?.value === 'true');
         if (libItem) setLibrarySyncSchedule(libItem.value);
         if (monitorItem) setMonitorSyncSchedule(monitorItem.value);
         if (diagItem) setDiagnosticsSyncSchedule(diagItem.value);
@@ -176,7 +181,7 @@ export default function ScheduledJobsPage() {
   };
 
   // --- ADDED: Updated signature payload to accept the two new job triggers ---
-  const handleRunJob = async (job: 'metadata' | 'library' | 'monitor' | 'diagnostics' | 'backup' | 'popular' | 'for_you' | 'converter' | 'embed_metadata' | 'export_series_json' | 'weekly_digest' | 'watched_sync' | 'health_check' | 'cache_cleanup') => {
+  const handleRunJob = async (job: 'metadata' | 'library' | 'monitor' | 'diagnostics' | 'backup' | 'popular' | 'for_you' | 'converter' | 'embed_metadata' | 'export_series_json' | 'weekly_digest' | 'watched_sync' | 'health_check' | 'cache_cleanup' | 'komga_sync' | 'komga_rebuild_id_map' | 'komga_readlist_push') => {
       setRunningJob(job);
       toast({ title: "Job Started", description: `The ${job} process has been triggered in the background.` });
       try {
@@ -640,6 +645,32 @@ export default function ScheduledJobsPage() {
                         <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('diagnostics')} disabled={runningJob === 'diagnostics'}>
                             {runningJob === 'diagnostics' ? <Loader2 className="w-4 h-4 mr-2 animate-spin"/> : <Play className="w-4 h-4 mr-2"/>} Run Now
                         </Button>
+                    </CardContent>
+                </Card>
+
+                <Card className="shadow-sm border-border bg-background transition-all hover:shadow-md">
+                    <CardHeader className="pb-3">
+                        <CardTitle className="flex items-center gap-2 text-lg text-foreground"><Server className="w-5 h-5 text-primary" /> Komga</CardTitle>
+                        <CardDescription className="text-muted-foreground">Asks your Komga server to rescan, rebuilds the Omnibus&nbsp;&harr;&nbsp;Komga ID map, and pushes opted-in reading lists. Manual runs only; the daily reconcile is automatic.</CardDescription>
+                    </CardHeader>
+                    <CardContent className="space-y-4">
+                        {!komgaEnabled && (
+                            <p className="text-[11px] text-amber-600 dark:text-amber-500 font-medium leading-snug">
+                                The Komga integration is turned off, so these runs will be skipped. Turn it on in{' '}
+                                <Link href="/admin/settings" className="underline font-bold hover:text-amber-700 dark:hover:text-amber-400">Settings &rarr; Media Servers</Link>.
+                            </p>
+                        )}
+                        <div className="space-y-2">
+                            <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('komga_sync')} disabled={runningJob === 'komga_sync'} aria-label="Scan every mapped Komga library now">
+                                {runningJob === 'komga_sync' ? <Loader2 className="w-4 h-4 mr-2 animate-spin"/> : <Play className="w-4 h-4 mr-2"/>} Sync Mapped Libraries
+                            </Button>
+                            <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('komga_rebuild_id_map')} disabled={runningJob === 'komga_rebuild_id_map'} aria-label="Rebuild the Omnibus and Komga ID map now">
+                                {runningJob === 'komga_rebuild_id_map' ? <Loader2 className="w-4 h-4 mr-2 animate-spin"/> : <RefreshCw className="w-4 h-4 mr-2"/>} Rebuild ID Map
+                            </Button>
+                            <Button className="w-full font-bold border-border hover:bg-muted" variant="outline" onClick={() => handleRunJob('komga_readlist_push')} disabled={runningJob === 'komga_readlist_push'} aria-label="Push every opted-in reading list to Komga now">
+                                {runningJob === 'komga_readlist_push' ? <Loader2 className="w-4 h-4 mr-2 animate-spin"/> : <UploadCloud className="w-4 h-4 mr-2"/>} Push Reading Lists
+                            </Button>
+                        </div>
                     </CardContent>
                 </Card>
 

@@ -93,6 +93,8 @@ fn backup_tables() -> Vec<(&'static str, &'static str)> {
         // User data + config previously omitted (silent loss on migration/restore) — kept in
         // lock-step with the Node backup route (admin/backup/route.ts). jobLogs and jobLocks are
         // intentionally excluded (ephemeral diagnostics / runtime locks that regenerate).
+        // Komga* tables are rebuildable caches (excluded the same way: this is an allowlist, and the
+        // engine never writes them). ReadingList.komgaSync does round-trip via the readingLists row.
         ("hosterAccounts", "HosterAccount"),
         ("apiKeys", "ApiKey"),
         ("opdsKeys", "OpdsKey"),

@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
     deleteKomgaReadList: vi.fn(),
     sweepOrphanedReadLists: vi.fn(),
     flushDueLibraries: vi.fn(),
+    jobLogCreate: vi.fn().mockResolvedValue({ id: 'jl-1' }),
 }));
 
 vi.unmock('@/lib/komga/changes');
@@ -47,7 +48,11 @@ vi.mock('@/lib/komga/readlist-push', () => ({
     deleteKomgaReadList: mocks.deleteKomgaReadList,
     sweepOrphanedReadLists: mocks.sweepOrphanedReadLists,
 }));
-vi.mock('@/lib/db', () => ({ prisma: { komgaLibrary: { findMany: mocks.komgaLibraryFindMany }, library: { findMany: mocks.libraryFindMany } } }));
+vi.mock('@/lib/db', () => ({ prisma: {
+    komgaLibrary: { findMany: mocks.komgaLibraryFindMany },
+    library: { findMany: mocks.libraryFindMany },
+    jobLog: { create: mocks.jobLogCreate },
+} }));
 
 import { initKomgaWorker, processKomgaJob, scheduleKomgaReconcile } from '@/lib/komga/worker';
 import { KOMGA_RECONCILE_INTERVAL_MS, KOMGA_FLUSH_INTERVAL_MS } from '@/lib/komga/constants';
@@ -85,6 +90,34 @@ describe('processKomgaJob dispatch', () => {
     it('routes KOMGA_READLIST_PUSH to pushReadList', async () => {
         await processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: { readingListId: 'rl-1' } });
         expect(mocks.pushReadList).toHaveBeenCalledWith('rl-1');
+    });
+
+    it('writes a KOMGA_READLIST_SYNC JobLog for a push — the admin Logs page filters by jobType', async () => {
+        mocks.pushReadList.mockResolvedValue({
+            status: 'pushed', readingListId: 'rl-1', komgaReadListId: 'KL1', name: 'My List (alice)',
+            bookCount: 4, pushedCount: 3, skipped: { notDownloaded: 1 },
+        });
+        await processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: { readingListId: 'rl-1' } });
+
+        expect(mocks.jobLogCreate).toHaveBeenCalledTimes(1);
+        const row = mocks.jobLogCreate.mock.calls[0][0].data;
+        expect(row.jobType).toBe('KOMGA_READLIST_SYNC');
+        expect(row.status).toBe('COMPLETED');
+        expect(row.relatedItem).toBe('My List (alice)');
+        expect(JSON.parse(row.message)).toMatchObject({ pushedCount: 3, bookCount: 4 });
+    });
+
+    it('marks a failed push FAILED, and never lets the JobLog write change the outcome', async () => {
+        mocks.pushReadList.mockResolvedValue({ status: 'error', readingListId: 'rl-1', error: 'Komga said no' });
+        await processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: { readingListId: 'rl-1' } });
+        expect(mocks.jobLogCreate.mock.calls[0][0].data.status).toBe('FAILED');
+
+        mocks.jobLogCreate.mockRejectedValueOnce(new Error('db down'));
+        mocks.pushReadList.mockResolvedValue({ status: 'pushed', readingListId: 'rl-2' });
+        await expect(processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: { readingListId: 'rl-2' } })).resolves.toBeUndefined();
+        expect(mocks.jobLogCreate).toHaveBeenCalledTimes(2);
+        // The push succeeded, so the failure must NOT be reported as a failed job.
+        expect(loggerLog).not.toHaveBeenCalledWith(expect.stringContaining('job KOMGA_READLIST_PUSH failed'), 'warn');
     });
 
     it('routes KOMGA_READLIST_DELETE to deleteKomgaReadList with both ids', async () => {

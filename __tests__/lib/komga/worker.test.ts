@@ -11,6 +11,9 @@ const mocks = vi.hoisted(() => ({
     enqueueKomgaSync: vi.fn(),
     enqueueKomgaReconcile: vi.fn(),
     runLibrarySync: vi.fn(),
+    pushReadList: vi.fn(),
+    deleteKomgaReadList: vi.fn(),
+    sweepOrphanedReadLists: vi.fn(),
     flushDueLibraries: vi.fn(),
 }));
 
@@ -39,6 +42,11 @@ vi.mock('@/lib/komga/queue', () => ({
     KOMGA_JOB: { SYNC: 'KOMGA_SYNC', RECONCILE: 'KOMGA_RECONCILE', READLIST_PUSH: 'KOMGA_READLIST_PUSH', READLIST_DELETE: 'KOMGA_READLIST_DELETE' },
 }));
 vi.mock('@/lib/komga/sync', () => ({ runLibrarySync: mocks.runLibrarySync }));
+vi.mock('@/lib/komga/readlist-push', () => ({
+    pushReadList: mocks.pushReadList,
+    deleteKomgaReadList: mocks.deleteKomgaReadList,
+    sweepOrphanedReadLists: mocks.sweepOrphanedReadLists,
+}));
 vi.mock('@/lib/db', () => ({ prisma: { komgaLibrary: { findMany: mocks.komgaLibraryFindMany }, library: { findMany: mocks.libraryFindMany } } }));
 
 import { initKomgaWorker, processKomgaJob, scheduleKomgaReconcile } from '@/lib/komga/worker';
@@ -74,10 +82,27 @@ describe('processKomgaJob dispatch', () => {
         expect(mocks.runLibrarySync).toHaveBeenCalledWith({ omnibusLibraryId: 'lib-1' });
     });
 
-    it('logs and returns for the read-list jobs (Phase 4)', async () => {
+    it('routes KOMGA_READLIST_PUSH to pushReadList', async () => {
         await processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: { readingListId: 'rl-1' } });
-        expect(mocks.runLibrarySync).not.toHaveBeenCalled();
-        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('not implemented until Phase 4'), 'debug');
+        expect(mocks.pushReadList).toHaveBeenCalledWith('rl-1');
+    });
+
+    it('routes KOMGA_READLIST_DELETE to deleteKomgaReadList with both ids', async () => {
+        await processKomgaJob({ name: 'KOMGA_READLIST_DELETE', data: { komgaReadListId: 'KL1', readingListId: 'rl-1' } });
+        expect(mocks.deleteKomgaReadList).toHaveBeenCalledWith({ komgaReadListId: 'KL1', readingListId: 'rl-1' });
+    });
+
+    it('ignores a read-list job that is missing its ids instead of pushing nothing', async () => {
+        await processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: {} });
+        await processKomgaJob({ name: 'KOMGA_READLIST_DELETE', data: { readingListId: 'rl-1' } });
+        expect(mocks.pushReadList).not.toHaveBeenCalled();
+        expect(mocks.deleteKomgaReadList).not.toHaveBeenCalled();
+    });
+
+    it('never lets a read-list failure kill the job loop', async () => {
+        mocks.pushReadList.mockRejectedValue(new Error('boom'));
+        await expect(processKomgaJob({ name: 'KOMGA_READLIST_PUSH', data: { readingListId: 'rl-1' } })).resolves.toBeUndefined();
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('job KOMGA_READLIST_PUSH failed'), 'warn');
     });
 
     it('never throws "Unknown job type" — attempts is 1, so a throw is just a dead job', async () => {
@@ -95,6 +120,19 @@ describe('processKomgaJob dispatch', () => {
         mocks.runLibrarySync.mockRejectedValue(new Error('boom'));
         await expect(processKomgaJob({ name: 'KOMGA_SYNC', data: {} })).resolves.toBeUndefined();
         expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('job KOMGA_SYNC failed'), 'warn');
+    });
+
+    it('sweeps orphaned read lists as part of a reconcile, even when nothing is mapped', async () => {
+        // A read list outlives the library it was built from, so the sweep runs on every reconcile.
+        mocks.libraryFindMany.mockResolvedValue([]);
+        await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
+        expect(mocks.sweepOrphanedReadLists).toHaveBeenCalled();
+    });
+
+    it('skips the orphan sweep when read lists are disabled', async () => {
+        mocks.settings.mockResolvedValue({ ...ENABLED, readListsEnabled: false });
+        await processKomgaJob({ name: 'KOMGA_RECONCILE', data: { reason: 'daily' } });
+        expect(mocks.sweepOrphanedReadLists).not.toHaveBeenCalled();
     });
 });
 

@@ -55,9 +55,9 @@ table in §3 for what exists and what does not.
 
 | Gate | Phase 0 baseline (`BASELINE.md`) | After Phase 3 | Verdict |
 | --- | --- | --- | --- |
-| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **213 files, 2220 passed / 2 skipped, 0 failed** | ✅ no regressions; +1125 vs baseline, +86 from Phase 3 |
+| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **220 files, 2358 passed / 2 skipped, 0 failed** | ✅ no regressions; +1263 vs baseline, +138 from Phase 4 |
 | `npx tsc --noEmit` | clean | **0 errors** | ✅ |
-| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2139 warnings** | ✅ |
+| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2178 warnings** | ✅ |
 | `npx prisma validate` | — | **valid** | ✅ |
 | `npx next build` | — | **succeeds** | ✅ |
 
@@ -71,7 +71,7 @@ Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — ther
 | **1** | Komga client, settings, connection test, library discovery | ✅ **complete, committed** |
 | **2** | Change tracking + debounced scan trigger (req 1) | ✅ **complete, committed** |
 | **3** | Identity map + post-scan verification | ✅ **complete, committed** |
-| **4** | Reading-list push (req 2) | ❌ not started |
+| **4** | Reading-list push (req 2) | ✅ **complete, committed** |
 | **5** | Admin jobs, health, docs | ❌ not started |
 
 ### Phase 1 — done
@@ -135,16 +135,38 @@ now takes one extra `series.findMany` snapshot query.
 `fake-komga.ts`'s `makeKomgaBook` gained an optional metadata shorthand (shared helper, extended
 not forked).
 
-### Phases 4–5 — nothing exists
+### Phase 4 — complete
 
-Every module is absent: `health.ts`, `readlist-resolver.ts`, `readlist-push.ts`,
-`readlist-trigger.ts`, plus the `PATCH|GET /api/reading-lists/komga` route and `docs/KOMGA.md`.
+| File | Role |
+| --- | --- |
+| `readlist-resolver.ts` | pure `resolveReadList(ctx)` (ordering, the six skip buckets, dedupe) + the async `resolveReadListForPush` loader. Never writes the item's `issueId` back |
+| `readlist-push.ts` | `pushReadList` (PLAN steps 1-6), `checkReadListDrift`, `deleteKomgaReadList`, `sweepOrphanedReadLists`, the naming rule and the ownership marker |
+| `readlist-trigger.ts` | the only bridge from routes to the queue; `komgaSync`-gated, queue imported lazily |
+| `../api/reading-lists/komga/route.ts` | ADMIN `PATCH {listId, komgaSync}` + `GET ?listId=` with `skippedSummary` parsed |
+| `../../components/reading-list-komga-sync.tsx` | the admin switch and the status line on the reading-list page |
+| `reading-list-links.ts` | gained `pickIssueForProviderId` / `findIssueForProviderId` — the shared `cvIssueId` rule |
+| `sync.ts` / `worker.ts` | `readlists` appended to `SYNC_STEPS`; both read-list jobs routed; orphan sweep in `KOMGA_RECONCILE` |
 
-**The Prisma models for all of it already exist** (`KomgaLibrary`, `KomgaSyncState`, `KomgaBookLink`,
-`KomgaSeriesLink`, `KomgaReadListLink`) and are generated — but they are currently **dead weight**,
-written and unused until Phase 3 wires them up. This was a deliberate choice (see `DEVIATIONS.md`:
-one additive schema edit up front, so parallel agents never collide on `schema.prisma`). Do not
-"clean them up".
+**138 new cases** across 6 new test files plus additions to `sync`, `worker` and `import-anilist`.
+`readlist-trigger-callsites.test.ts` derives the trigger inventory from the source (every module that
+writes a `ReadingList`/`ReadingListItem`, plus `prisma.user.delete` as a cascade) so a new mutation
+route that forgets the trigger fails a test instead of silently going stale.
+
+Two findings worth carrying forward:
+
+- **A route must never `await` a queue enqueue.** It blocks on the BullMQ connection when Redis is
+  unreachable, stalling the user's response (see `DEVIATIONS.md` D4.2).
+- **The delete job now also checks `marker.readingListId`**, not just the instance, so a re-import's
+  push and its delete job cannot destroy the list the replacement adopted (D4.7).
+
+### Phases 5 — nothing exists
+
+Every remaining module is absent: `health.ts`, plus the admin jobs buttons and `docs/KOMGA.md`.
+The `health.ts` inputs it needs are already written by Phases 3 and 4 and nothing else writes them:
+`KomgaSyncState.lastError LIKE 'reconcile safety valve%'`, `lastReconciledAt` older than 48 h, and
+the verification give-up `JobLog` (`jobType: 'KOMGA_SCAN'` with a `Komga did not pick up` message).
+
+**Do not "clean them up"** the Komga tables: all of them are now live.
 
 ## 4. The live Komga instance is still running
 
@@ -203,9 +225,11 @@ read-only Komga reference checkout at `/Users/thomas/repos/sbx/omnibus-reference
    - `stepSettle` returns `{next: 'reconcile'}` now (it used to end the pipeline), and
      `stepVerify` is what releases the lease. If you add a stage, keep the lease held for the whole
      pipeline — see `DEVIATIONS.md`.
-3. **Phase 4** — reading-list push. `readlists` is still absent from `SYNC_STEPS`; append it after
-   `verify`. `isBookLinkValid` (exported from `reconcile.ts`) is already what classifies an issue
-   as `awaitingScan`. The push must treat `KomgaBookLink` as read-only.
+3. ~~**Phase 4**~~ — **done**, see §3. Three notes for whoever picks up Phase 5:
+   - `pushReadList` treats `KomgaBookLink` as read-only, as Phase 3 required.
+   - The orphan sweep lives at the TOP of `runKomgaReconcile`, before the "nothing mapped" early
+     return — moving it below silently disables it (D4.6).
+   - `enqueueKomgaReadListDeleteNow` is intentionally non-blocking; do not make it `await` (D4.2).
 4. **Phase 5** — admin jobs, health check, `docs/KOMGA.md`. `health.ts` should read
    `lastReconciledAt` staleness and the `reconcile safety valve` prefix in `lastError`, both of which
    Phase 3 now writes and nothing else does.

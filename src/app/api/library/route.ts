@@ -14,6 +14,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { recordLibraryChange } from '@/lib/komga/changes';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 import { LibraryScanner } from '@/lib/library-scanner';
 import { getAccessibleLibraryIds } from '@/lib/library-access';
 
@@ -413,6 +414,8 @@ export async function POST(request: Request) {
             await prisma.readingListItem.deleteMany({
                 where: { listId, issueId: { in: issueIds } }
             });
+            // Removing series from a list removes books from the pushed read list too.
+            triggerReadListPushSoon(listId);
             return NextResponse.json({ success: true });
         }
 

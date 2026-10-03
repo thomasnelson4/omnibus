@@ -7,12 +7,15 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger';
 import { getAccessibleLibraryIds, canAccessLibraryId, type AccessibleLibraries } from '@/lib/library-access';
 import { linkAccessForList } from '@/lib/reading-list-links';
-import { parseReadingListTitle, pickPreferredIssue } from '@/lib/utils/reading-list-match';
-import { isSameIssue } from '@/lib/utils/issue-parser';
+import { parseReadingListTitle } from '@/lib/utils/reading-list-match';
+import { pickIssueForProviderId } from '@/lib/reading-list-links';
+import { triggerReadListPushSoon, triggerReadListRemoteDelete } from '@/lib/komga/readlist-trigger';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET(request: Request) {
+// `_request`: kept for the arity Next.js passes (and that the tests rely on), but the auto-link
+// needs no request state. Named with the underscore so the unused-arg lint allows it.
+export async function GET(_request: Request) {
     try {
         const authOptions = await getAuthOptions();
         const session = await getServerSession(authOptions);
@@ -70,6 +73,7 @@ export async function GET(request: Request) {
             });
 
             const linkUpdates = [];
+            const linkedLists = new Set<string>();
 
             for (const list of lists) {
                 const unlinked = list.items.filter(i => !i.issueId && i.cvIssueId);
@@ -81,11 +85,11 @@ export async function GET(request: Request) {
                     // mislabeled copy (sync race) — linking it would undo a Fix match on reload.
                     // Attached-lane numbers are user curation, so those rows are id-anchored only.
                     const expected = parseReadingListTitle(item.title).number;
-                    const candidates = potentialIssues.filter(i =>
-                        i.metadataId === String(item.cvIssueId) && i.metadataSource === source
-                        && canAccessLibraryId(access, i.series?.libraryId)
-                        && (!expected || !!i.attachedVolumeId || isSameIssue(i.number, expected)));
-                    const validIssue = pickPreferredIssue(candidates);
+                    const candidates = potentialIssues.filter(i => canAccessLibraryId(access, i.series?.libraryId));
+                    // The shared rule (reading-list-links): metadata id + source, the #194 title
+                    // veto, file-backed copies first. The Komga resolver uses the same helper, so a
+                    // list cannot resolve to a different issue in Komga than it does on screen.
+                    const validIssue = pickIssueForProviderId(candidates, Number(item.cvIssueId), source, expected);
 
                     if (validIssue) {
                         // Conditional write: a concurrent rematch/clear (or another GET) wins.
@@ -95,6 +99,7 @@ export async function GET(request: Request) {
                                 data: { issueId: validIssue.id }
                             })
                         );
+                        linkedLists.add(list.id);
                     }
                 }
             }
@@ -102,6 +107,9 @@ export async function GET(request: Request) {
             if (linkUpdates.length > 0) {
                 const results = await prisma.$transaction(linkUpdates);
                 requiresRefresh = results.some((r: { count: number }) => r.count > 0);
+                // Only a list that ACTUALLY changed is worth re-pushing, and only when it is synced.
+                // Fire-and-forget: an auto-link must never slow the page load or fail on Redis.
+                if (requiresRefresh) for (const listId of linkedLists) triggerReadListPushSoon(listId);
             }
         }
 
@@ -139,8 +147,6 @@ export async function POST(request: Request) {
         if (!name) return NextResponse.json({ error: "Name is required" }, { status: 400 });
 
         // Ensure only admins can set the global flag
-        const isAdmin = (session.user as any).role === 'ADMIN';
-
         const canMakeGlobal = (session.user as any).role === 'ADMIN' || (session.user as any).canCreateGlobalLists === true;
 
         const newList = await prisma.readingList.create({
@@ -154,6 +160,9 @@ export async function POST(request: Request) {
         });
 
         // Provide both id and listId for unified compatibility with the Library page creation flow
+        // A brand new list never has komgaSync (admin opt-in), so this is normally a no-op — but it
+        // costs one cached flag read and keeps every list-creation path honest if that ever changes.
+        triggerReadListPushSoon(newList.id);
         return NextResponse.json({ success: true, id: newList.id, listId: newList.id, list: newList });
     } catch (error: unknown) {
         Logger.log(`[Reading Lists API] Error: ${getErrorMessage(error)}`, 'error');
@@ -178,6 +187,11 @@ export async function DELETE(request: Request) {
         if (list.userId !== (session.user as any).id && (session.user as any).role !== 'ADMIN') {
             return NextResponse.json({ error: "Forbidden" }, { status: 403 });
         }
+
+        // Komga BEFORE the delete: the link row cascades away with the list, so the Komga id has to
+        // be read while it still exists. Awaited (not fire-and-forget) precisely because the read
+        // races the delete below. The job itself re-checks the ownership marker before deleting.
+        await triggerReadListRemoteDelete(id);
 
         // Clean up items before deleting the list
         await prisma.readingListItem.deleteMany({ where: { listId: id } });

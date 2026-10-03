@@ -16,6 +16,7 @@ import { prisma } from '@/lib/db';
 import { Logger } from '@/lib/logger';
 import { getAccessibleLibraryIds, nestedSeriesAccessWhere, type AccessibleLibraries } from '@/lib/library-access';
 import { issueIdentityMismatch } from '@/lib/metadata/issue-identity';
+import { isSameIssue } from '@/lib/utils/issue-parser';
 import {
     pickPreferredIssue,
     type LocalIssueMatch,
@@ -40,7 +41,7 @@ export async function linkAccessForList(
     const access: Promise<AccessibleLibraries> = ownerId === viewer.id
         ? getAccessibleLibraryIds(viewer.id, viewer.role)
         : prisma.user.findUnique({ where: { id: ownerId }, select: { role: true } })
-            .then(owner => (owner ? getAccessibleLibraryIds(ownerId, owner.role) : []));
+            .then((owner: { role?: string | null } | null) => (owner ? getAccessibleLibraryIds(ownerId, owner.role) : []));
     cache?.set(ownerId, access);
     return access;
 }
@@ -53,6 +54,66 @@ export interface LocalIssueCandidate {
     attachedVolumeId: string | null;
     attachedVolume: { volumeId: string; metadataSource: string } | null;
     series: { id: string; name: string; metadataId: string | null; metadataSource: string };
+}
+
+/**
+ * THE shared rule for an UNLINKED reading-list entry (issueId null, provider id set): which local
+ * Issue stands for it. Both the GET /api/reading-lists auto-link and the Komga read-list resolver
+ * go through here, so a list can never resolve to a different issue in Komga than it does on screen.
+ *
+ * The rule (unchanged from the auto-link it came out of): match `{metadataId, metadataSource}`,
+ * veto a copy whose number contradicts the entry title's "#N" (unless it is an attached lane, whose
+ * number is user curation), then prefer a file-backed copy and the oldest. Access filtering is NOT
+ * part of it — who may link is the caller's decision (the auto-link follows the list OWNER).
+ */
+export interface ProviderIdCandidate {
+    id: string;
+    metadataId?: string | null;
+    metadataSource?: string | null;
+    number?: string | null;
+    filePath?: string | null;
+    attachedVolumeId?: string | null;
+    series?: { libraryId?: string | null } | null;
+}
+
+/** The column default is COMICVINE; an absent/blank source must not become a different provider. */
+export function normalizeMetadataSource(source?: string | null): string {
+    return source && source.trim() ? source : 'COMICVINE';
+}
+
+export function pickIssueForProviderId<T extends ProviderIdCandidate>(
+    rows: readonly T[],
+    providerIssueId: number,
+    metadataSource?: string | null,
+    /** The "#N" parsed off the entry title; null/undefined disables the veto (the resolver has none). */
+    expectedNumber?: string | number | null,
+): T | null {
+    const wanted = String(providerIssueId);
+    const source = normalizeMetadataSource(metadataSource);
+    const candidates = rows.filter(r =>
+        r.metadataId === wanted && normalizeMetadataSource(r.metadataSource) === source);
+    const allowed = expectedNumber
+        ? candidates.filter(c => !!c.attachedVolumeId || isSameIssue(c.number ?? '', expectedNumber))
+        : candidates;
+    return pickPreferredIssue(allowed);
+}
+
+/**
+ * The same rule against the database, for callers that hold one unlinked entry rather than a
+ * batch (the Komga resolver). Ordered oldest-first so the tie-break matches pickPreferredIssue.
+ */
+export async function findIssueForProviderId(
+    providerIssueId: number,
+    metadataSource?: string | null,
+): Promise<{ id: string; filePath: string | null; libraryId: string | null } | null> {
+    const rows = await prisma.issue.findMany({
+        where: { metadataId: String(providerIssueId), metadataSource: normalizeMetadataSource(metadataSource) },
+        select: { id: true, metadataId: true, metadataSource: true, number: true, filePath: true, attachedVolumeId: true, series: { select: { libraryId: true } } },
+        orderBy: { createdAt: 'asc' },
+        take: 20,
+    });
+    const pick = pickIssueForProviderId(rows, providerIssueId, metadataSource);
+    return pick ? { id: pick.id, filePath: pick.filePath ?? null, libraryId: pick.series?.libraryId ?? null } : null;
 }
 
 /** A stored parent id is provider evidence only when it is a real numeric provider id. */

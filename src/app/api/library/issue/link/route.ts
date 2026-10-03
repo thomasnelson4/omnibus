@@ -9,6 +9,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { moveFileSafe } from '@/lib/utils/safe-fs';
 import { countArchivePages } from '@/lib/utils/archive-pages';
+import { recordLibraryChange } from '@/lib/komga/changes';
 
 export async function POST(request: NextRequest) {
     try {
@@ -128,6 +129,18 @@ export async function POST(request: NextRequest) {
         } catch (err: any) {
             Logger.log(`[Issue Link Debug] OS RENAME FAILED: ${err.message}`, 'error');
             finalFilePath = oldFilePath;
+        }
+
+        // Same-folder rename (activeFolderPath = dirname(oldFilePath)), not a move into the
+        // official series folder. Only the success case emits.
+        if (finalFilePath !== oldFilePath) {
+            void recordLibraryChange({
+                paths: [oldFilePath, finalFilePath],
+                seriesIds: [series.id],
+                issueIds: [targetId],
+                reason: 'issue-link',
+                source: 'api/library/issue/link',
+            });
         }
 
         // 6. Update the target issue with the new file path and delete the unmatched record

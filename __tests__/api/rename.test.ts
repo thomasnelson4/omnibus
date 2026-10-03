@@ -94,7 +94,14 @@ describe('API Route: Bulk Library Renamer', () => {
             // name a trade identically. null = the engine's built-in default.
             collected_file_pattern: null
         });
-        expect(mocks.seriesFindMany).not.toHaveBeenCalled();
+        // Phase 2: the engine branch now takes ONE extra snapshot query for the pre-rename
+        // folderPaths. The engine moves the files itself and its response carries only counts plus
+        // the LAST new path, so without this the old paths would be lost and Komga would never
+        // learn the series moved. It is a separate query (not the seriesList load) precisely so a
+        // part-way engine failure cannot feed us post-move paths.
+        expect(mocks.seriesFindMany).toHaveBeenCalledWith(
+            expect.objectContaining({ select: { folderPath: true } }),
+        );
         expect(mocks.fsMove).not.toHaveBeenCalled();
         // The audit entry still records the engine-reported counts.
         expect(auditLog).toHaveBeenCalledWith('BULK_RENAME_FILES', expect.objectContaining({ filesRenamed: 7, conflicts: 1 }), 'admin_1');

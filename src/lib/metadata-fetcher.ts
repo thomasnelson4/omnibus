@@ -8,6 +8,7 @@ import { parseComicVineCredits } from '@/lib/utils';
 import { getErrorMessage } from './utils/error';
 import { MetronProvider } from './metadata/providers/metron';
 import { omnibusQueue } from './queue';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { markSystemFlag, countApiUsage } from './utils/system-flags';
 import { cachedCvGet } from './metadata/metadata-cache';
 import { isSameIssue } from '@/lib/utils/issue-parser';
@@ -87,6 +88,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
                     const coverFileName = `cover${ext}`;
                     await fs.writeFile(path.join(folderPath, coverFileName), Buffer.from(imgRes.data));
+                    void recordLibraryChange({ paths: [path.join(folderPath, coverFileName)], seriesIds: [series.id], reason: 'series-cover', source: 'metadata-fetcher:metron' });
                     metronFinalCover = `/api/library/cover?path=${encodeURIComponent(path.join(folderPath, coverFileName))}`;
                     
                 } catch (e: unknown) {
@@ -307,7 +309,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                     removeOnFail: true
                 });
                 Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
-            } catch(e) {}
+            } catch(e) {
+                Logger.log(`[Metadata] Could not queue XML injection for ${series.name}: ${getErrorMessage(e)}`, 'warn');
+            }
 
             Logger.log(`[Metadata] Successfully synced ${syncedCount} Metron issues.`, 'success');
             return { success: true, count: syncedCount };
@@ -382,6 +386,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
             const coverFileName = `cover${ext}`;
             await fs.writeFile(path.join(folderPath, coverFileName), Buffer.from(imgRes.data));
+            void recordLibraryChange({ paths: [path.join(folderPath, coverFileName)], seriesIds: [series.id], reason: 'series-cover', source: 'metadata-fetcher:comicvine' });
             cvFinalCover = `/api/library/cover?path=${encodeURIComponent(path.join(folderPath, coverFileName))}`;
             
         } catch (e: unknown) {
@@ -429,7 +434,6 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
     let totalResults = 1;
     let loopCount = 0;
     let syncedCount = 0;
-    let issuesCallsMade = 0;
 
     Logger.log(`[Metadata Fetcher Debug] Fetching issues for volume "${series.name}" (ID: ${metadataId}, Offset: ${offset}, Limit: 100)`, 'debug');
     let latestDateMs = 0;
@@ -451,7 +455,6 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 headers: { 'User-Agent': 'Omnibus/1.0' },
                 timeout: 15000
             });
-            issuesCallsMade++;
         } catch (e: any) {
             if (isCvRateLimited(e.response?.status)) {
                 await markSystemFlag('cv_rate_limit_time');
@@ -597,7 +600,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                     removeOnFail: true
                 });
                 Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
-            } catch(e) {}
+            } catch(e) {
+                Logger.log(`[Metadata] Could not queue XML injection for ${series.name}: ${getErrorMessage(e)}`, 'warn');
+            }
 
     Logger.log(`[Metadata] Successfully synced ${syncedCount} ComicVine issues.`, 'success');
     return { success: true, count: syncedCount };

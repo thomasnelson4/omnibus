@@ -13,6 +13,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { UNMATCHED_DIR, isPathWithinRoots } from '@/lib/utils/paths';
+import { recordLibraryChange } from '@/lib/komga/changes';
 
 const MAX_BYTES = 15 * 1024 * 1024; // 15MB
 
@@ -59,6 +60,7 @@ export async function POST(req: NextRequest) {
       if (await fs.pathExists(vp)) { try { await fs.remove(vp); } catch { /* best effort */ } }
     }
     await fs.writeFile(coverPath, buffer);
+    void recordLibraryChange({ paths: [coverPath], seriesIds: [series.id], reason: 'series-cover', source: 'api/library/cover-upload:POST' });
 
     const coverUrl = `/api/library/cover?path=${encodeURIComponent(coverPath)}&v=${Date.now()}`;
     await prisma.series.update({ where: { id: series.id }, data: { coverUrl, hasCustomCover: true } });
@@ -83,7 +85,12 @@ export async function DELETE(req: NextRequest) {
     // Revert to automatic: remove the custom cover so the next scan extracts an archive cover (or the
     // provider sync downloads one), and clear coverUrl so nothing points at the now-deleted file.
     const coverPath = path.join(currentPath, 'cover.jpg');
-    if (await fs.pathExists(coverPath)) { try { await fs.remove(coverPath); } catch { /* best effort */ } }
+    // Only emit if a cover actually existed — reverting with nothing there is a no-op on disk.
+    const hadCover = await fs.pathExists(coverPath);
+    if (hadCover) { try { await fs.remove(coverPath); } catch { /* best effort */ } }
+    if (hadCover) {
+      void recordLibraryChange({ paths: [coverPath], seriesIds: [series.id], reason: 'series-cover-revert', source: 'api/library/cover-upload:DELETE' });
+    }
     await prisma.series.update({ where: { id: series.id }, data: { coverUrl: null, hasCustomCover: false } });
 
     await AuditLogger.log('REVERT_SERIES_COVER', { seriesName: series.name, path: currentPath }, (token.id || token.sub) as string);

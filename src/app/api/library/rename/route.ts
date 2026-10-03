@@ -11,6 +11,7 @@ import { Logger } from '@/lib/logger';
 import { sanitizeFilename as sanitize } from '@/lib/utils/sanitize';
 import { cleanupEmptyDirs } from '@/lib/utils/safe-fs';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
+import { recordLibraryChange } from '@/lib/komga/changes';
 
 export async function POST(request: NextRequest) {
   try {
@@ -37,6 +38,24 @@ export async function POST(request: NextRequest) {
     // be hundreds of moves. Synchronous by design: the UI needs the summary + newPath from the
     // response. engineFetchLong disables undici's idle timeouts for large jobs. Any failure falls
     // through to the identical local loop below.
+    // Snapshot the pre-rename folders BEFORE the engine runs. The engine moves the files itself and
+    // the response only carries counts plus the LAST folder path, so without this the old paths
+    // would be lost. Deliberately a separate query rather than reusing seriesList: that one is
+    // loaded after the engine and would hand us post-engine folderPaths if the engine failed
+    // part-way. Best-effort: a failure here costs a less precise scan, never a failed rename.
+    let preRenameFolders: string[] = [];
+    try {
+        const rows = await prisma.series.findMany({
+            where: { id: { in: seriesIds } },
+            select: { folderPath: true },
+        });
+        preRenameFolders = (Array.isArray(rows) ? rows : [])
+            .map((s: { folderPath: string | null }) => s.folderPath)
+            .filter((p: unknown): p is string => typeof p === 'string' && p.length > 0);
+    } catch (e) {
+        Logger.log(`[Library Rename] Could not snapshot pre-rename folders: ${getErrorMessage(e)}`, 'warn');
+    }
+
     try {
         const engineRes = await engineFetchLong(ENGINE_URL + '/api/library/rename', {
             method: 'POST',
@@ -45,6 +64,14 @@ export async function POST(request: NextRequest) {
         });
         if (engineRes.ok) {
             const data = await engineRes.json();
+            if ((data.filesRenamed || 0) + (data.foldersRenamed || 0) > 0) {
+                void recordLibraryChange({
+                    paths: [...preRenameFolders, ...(data.newPath ? [data.newPath] : [])],
+                    seriesIds,
+                    reason: 'rename',
+                    source: 'api/library/rename:engine',
+                });
+            }
             await AuditLogger.log('BULK_RENAME_FILES', {
                 seriesRenamed: data.foldersRenamed,
                 filesRenamed: data.filesRenamed,
@@ -87,6 +114,8 @@ export async function POST(request: NextRequest) {
     let foldersRenamed = 0;
     let conflicts = 0;
     let lastProcessedPath = "";
+    // Accumulated so a throw part-way still reports the files that already moved.
+    const changedPaths: string[] = [];
 
     for (const s of seriesList) {
         const lib = libraries.find(l => l.id === s.libraryId) || libraries.find(l => l.isDefault && l.isManga === s.isManga) || libraries[0];
@@ -255,6 +284,9 @@ export async function POST(request: NextRequest) {
 
             try {
                 await fs.move(sourcePath, newFilePath); // overwrite defaults to false — and we guarded above
+                // Push straight after the move: the Issue update below can throw into the outer
+                // catch, and moved files must still be recorded.
+                changedPaths.push(sourcePath, newFilePath);
                 sourceDirs.add(path.normalize(path.dirname(sourcePath)));
                 await prisma.issue.update({
                     where: { id: issue.id },
@@ -283,6 +315,10 @@ export async function POST(request: NextRequest) {
         }
 
         lastProcessedPath = targetFolder;
+    }
+
+    if (changedPaths.length) {
+        void recordLibraryChange({ paths: changedPaths, seriesIds, reason: 'rename', source: 'api/library/rename:local' });
     }
 
     await AuditLogger.log('BULK_RENAME_FILES', {

@@ -9,6 +9,7 @@ import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { parseComicVineCredits } from '@/lib/utils';
 import { sanitizeDescription, providerWikiBase } from '@/lib/utils/sanitize';
 import { safeParse } from '@/lib/utils/safe-parse';
@@ -19,7 +20,15 @@ import { issueIdentityMismatch } from '@/lib/metadata/issue-identity';
 import { normalizeCoverage } from '@/lib/utils/coverage';
 
 export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
+  // `request.url` is built by Next.js and is normally always absolute, so this never throws in
+  // practice — but a defensive guard costs nothing and keeps a malformed URL from rejecting the
+  // whole handler with a 500.
+  let searchParams: URLSearchParams;
+  try {
+    searchParams = new URL(request.url).searchParams;
+  } catch {
+    return NextResponse.json({ error: 'Invalid request URL' }, { status: 400 });
+  }
   const id = searchParams.get('id');
 
   if (!id) return NextResponse.json({ error: "Missing issue ID" }, { status: 400 });
@@ -461,7 +470,11 @@ export async function PATCH(request: Request) {
                     jobId: `EMBED_META_ISSUE_${issueId}_${Date.now()}`
                 });
                 Logger.log(`[Metadata] Queued ComicInfo.xml embed for edited issue: ${issueName}`, 'info');
-            } catch (e) {}
+            } catch (e) {
+                // Pre-existing behaviour (inherited from main): a failed enqueue is not fatal to the
+                // metadata edit. Logged so it is no longer silent.
+                Logger.log(`[Metadata] Could not queue the ComicInfo.xml embed for issue ${issueId}: ${getErrorMessage(e)}`, 'warn');
+            }
         }
 
         await AuditLogger.log('UPDATE_ISSUE_METADATA', {
@@ -494,6 +507,8 @@ export async function DELETE(request: Request) {
             const fs = await import('fs');
             if (fs.existsSync(fullPath)) {
                 await fs.promises.unlink(fullPath);
+                // The row is already gone, so paths only — the issue id would not resolve.
+                void recordLibraryChange({ paths: [fullPath], reason: 'issue-delete', source: 'api/library/issue:DELETE' });
             }
         }
 

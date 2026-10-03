@@ -7,6 +7,7 @@ import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger'; 
 import { getErrorMessage } from '@/lib/utils/error';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { AuditLogger } from '@/lib/audit-logger';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 import { UNMATCHED_DIR } from '@/lib/utils/paths';
@@ -82,7 +83,9 @@ export async function POST(request: Request) {
                 try {
                     const parsed = JSON.parse(configSetting.value);
                     if (Array.isArray(parsed)) ignoredPaths = new Set(parsed.map(p => path.normalize(p).toLowerCase()));
-                } catch(e) {}
+                } catch(e) {
+                    Logger.log(`[Diagnostics API] Could not parse diagnostic_ignore_paths; treating it as empty: ${getErrorMessage(e)}`, 'warn');
+                }
             }
 
             const filteredOrphans = physicalOrphans.filter(p => {
@@ -144,18 +147,24 @@ export async function POST(request: Request) {
             };
 
             let filesDeleted = 0;
+            const deletedFiles: string[] = [];
             for (const id of idsToDelete) {
                 const issue = await prisma.issue.findUnique({ where: { id } });
                 if (!issue) continue;
                 if (deletePhysical && issue.filePath && fs.existsSync(issue.filePath)) {
                     if (isAuthorizedChild(issue.filePath)) {
                         await fs.remove(issue.filePath);
+                        deletedFiles.push(issue.filePath);
                         filesDeleted++;
                     } else {
                         Logger.log(`[Diagnostics API] Blocked duplicate file deletion outside library roots: ${issue.filePath}`, 'warn');
                     }
                 }
                 await prisma.issue.delete({ where: { id } });
+            }
+
+            if (deletedFiles.length) {
+                void recordLibraryChange({ paths: deletedFiles, reason: 'delete-duplicates', source: 'api/admin/diagnostics:delete-duplicates' });
             }
 
             await AuditLogger.log('DELETE_DUPLICATE_ISSUES', { issuesDeleted: idsToDelete, filesDeleted }, userId);
@@ -205,6 +214,10 @@ export async function POST(request: Request) {
                 }
             }
 
+            if (deletedPaths.length) {
+                void recordLibraryChange({ paths: deletedPaths, reason: 'delete-orphans', source: 'api/admin/diagnostics:delete-orphans' });
+            }
+
             await AuditLogger.log('DELETE_ORPHANED_FILES', { filesDeleted: deletedPaths }, userId);
             Logger.log(`Deleted physical orphaned files from disk.`, "success");
             return NextResponse.json({ success: true });
@@ -215,7 +228,9 @@ export async function POST(request: Request) {
             const ignoredSetting = await prisma.systemSetting.findUnique({ where: { key: 'ignored_orphans' } });
             let ignored: string[] = [];
             if (ignoredSetting?.value) {
-                try { ignored = JSON.parse(ignoredSetting.value); } catch(e) {}
+                try { ignored = JSON.parse(ignoredSetting.value); } catch(e) {
+                    Logger.log(`[Diagnostics API] Could not parse ignored_orphans; treating it as empty: ${getErrorMessage(e)}`, 'warn');
+                }
             }
             
             const newIgnored = Array.from(new Set([...ignored, ...paths]));

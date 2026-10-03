@@ -8,6 +8,9 @@ import { prisma } from './db';
 const TTL_MS = 30_000;
 
 let cache: { roots: string[]; at: number } | null = null;
+// Same TTL and same query shape, kept in one cache slot: the Komga hot path needs id+path (to map a
+// changed path to a library), the cover route needs path only.
+let idCache: { entries: { id: string; path: string }[]; at: number } | null = null;
 
 export async function getLibraryRoots(): Promise<string[]> {
   if (cache && Date.now() - cache.at < TTL_MS) return cache.roots;
@@ -16,7 +19,20 @@ export async function getLibraryRoots(): Promise<string[]> {
   return cache.roots;
 }
 
+/**
+ * Library id + path, for callers that must attribute a path to a library (Komga change tracking).
+ * Shares the 30 s TTL with getLibraryRoots so a library edit cannot leave the two views disagreeing
+ * for long.
+ */
+export async function getLibraryRootEntries(): Promise<{ id: string; path: string }[]> {
+  if (idCache && Date.now() - idCache.at < TTL_MS) return idCache.entries;
+  const libraries = await prisma.library.findMany({ select: { id: true, path: true } });
+  idCache = { entries: libraries.map(l => ({ id: l.id, path: l.path })), at: Date.now() };
+  return idCache.entries;
+}
+
 // Test hook — module-level cache would otherwise leak between vitest cases.
 export function resetLibraryRootsCache(): void {
   cache = null;
+  idCache = null;
 }

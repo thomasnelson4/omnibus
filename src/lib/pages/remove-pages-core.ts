@@ -18,6 +18,7 @@ import { prisma } from '@/lib/db';
 import { AuditLogger } from '@/lib/audit-logger';
 import { Logger } from '@/lib/logger';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
+import { recordLibraryChange } from '@/lib/komga/changes';
 
 export type RemovePagesOutcome =
     | { ok: true; newPageCount: number; removed: number; convertedToCbz: boolean; issueName: string }
@@ -90,6 +91,16 @@ export async function removePagesFromIssue(
     } catch (e) {
         return { ok: false, status: 502, error: "The Rust engine is unreachable — page removal needs it. Check the engine container and try again." };
     }
+
+    // The archive is already rewritten at this point, whether in place or repacked to a sibling
+    // .cbz. Emitted before the index fixups below, which can throw.
+    void recordLibraryChange({
+        paths: newFilePath ? [issue.filePath, newFilePath] : [issue.filePath],
+        seriesIds: [issue.seriesId],
+        issueIds: [issueId],
+        reason: 'remove-pages',
+        source: `remove-pages-core:${context}`,
+    });
 
     // --- Index fixups. The file is already rewritten; these must not be skippable, so they run
     // as one batch transaction (array form — no interleaved work, per the #195 rule).

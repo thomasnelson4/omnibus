@@ -177,6 +177,23 @@ export async function applyKomgaSettingsChange(
             }
         }
 
+        // A fixed URL / API key / path mapping is the usual answer to "Komga stopped syncing".
+        // Without this the backoff keeps every library parked behind nextEligibleAt for up to
+        // 30 minutes after the operator has already fixed the thing, which reads as "still broken".
+        if (isEnabled && changed.length > 0) {
+            try {
+                const { count } = await prisma.komgaSyncState.updateMany({
+                    where: { nextEligibleAt: { not: null }, OR: [{ consecutiveFailures: { gt: 0 } }, { lastError: { not: null } }] },
+                    data: { consecutiveFailures: 0, nextEligibleAt: null, lastError: null },
+                });
+                if (count > 0) {
+                    Logger.log(`[Komga] Reset scan backoff for ${count} librar${count === 1 ? 'y' : 'ies'} after ${changed.join(', ')} changed.`, 'info');
+                }
+            } catch (e) {
+                Logger.log(`[Komga] Could not reset scan backoff after a settings change: ${errText(e)}`, 'warn');
+            }
+        }
+
         let reason: string | null = null;
         if (isEnabled && !wasEnabled) reason = 'enabled';
         else if (isEnabled && changed.length > 0) reason = `settings changed (${changed.join(', ')})`;

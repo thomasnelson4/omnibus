@@ -32,6 +32,12 @@ export interface KomgaSyncJobData {
     deep?: boolean;
     full?: boolean;
     reason?: string;
+    /** Which Komga libraries serve this Omnibus library, resolved once at 'start'. */
+    komgaLibraryIds?: string[];
+    /** When the settle stage began — separate from stageStartedAt so a settle recheck does not reset it. */
+    settleStartedAt?: number;
+    /** How settle concluded ('sse' | 'metrics' | 'fixed' | 'timeout'); Phase 3 verify reads this. */
+    settleOutcome?: string;
 }
 export interface KomgaReconcileJobData { reason: string }
 export interface KomgaReadListPushJobData { readingListId: string }
@@ -46,6 +52,9 @@ export const komgaReadListDedupId = (readingListId: string) => `komga-rl-${readi
 
 // Route bundles and the instrumentation bundle each load their own copy of this module; one queue
 // (and one Redis connection) per process.
+// SAFETY: module state must survive across module instances (Next.js gives route bundles and the
+// instrumentation bundle separate copies), and `globalThis` has no index signature for these
+// private keys. This cast is the documented pattern for that, not a type escape hatch.
 const g = globalThis as unknown as { __komgaQueue?: Queue; __komgaRedis?: IORedis; __komgaQueueErrorAt?: number };
 
 /** The shared Redis connection for the Komga queue (the P2 worker may reuse it; BullMQ duplicates it for blocking reads). */

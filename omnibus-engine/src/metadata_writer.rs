@@ -173,11 +173,11 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
             tokio::task::spawn_blocking(move || {
-                let ok = inject_xml_into_zip(&task.file_path, &task.xml_content);
-                (ok, task.series_id)
+                let outcome = inject_xml_into_zip(&task.file_path, &task.xml_content);
+                (outcome, task.series_id, task.file_path)
             })
             .await
-            .unwrap_or((false, String::new()))
+            .unwrap_or((None, String::new(), String::new()))
         });
     }
 
@@ -185,10 +185,22 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
     let mut fail_count = 0;
     let mut series_json_count = 0;
     let mut seen_series: HashSet<String> = HashSet::new();
+    // Collected across the join loop and emitted ONCE at the end, so Komga never scans a library
+    // this job is still rewriting.
+    let mut changed_paths: Vec<String> = Vec::new();
+    let mut changed_series: HashSet<String> = HashSet::new();
 
     while let Some(res) = join_set.join_next().await {
-        if let Ok((ok, series_id)) = res {
-            if ok { success_count += 1; } else { fail_count += 1; }
+        if let Ok((outcome, series_id, file_path)) = res {
+            match outcome {
+                Some(EmbedOutcome::Written) => {
+                    success_count += 1;
+                    changed_series.insert(series_id.clone());
+                    changed_paths.push(file_path);
+                }
+                Some(EmbedOutcome::Unchanged) => success_count += 1,
+                None => fail_count += 1,
+            }
 
             // Write series.json once per series (gated by the export flag).
             if seen_series.insert(series_id.clone())
@@ -196,6 +208,10 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
                     series_json_count += 1;
                 }
         }
+    }
+
+    if !changed_paths.is_empty() {
+        crate::library_events::emit("metadata-embed", changed_paths, changed_series.into_iter().collect());
     }
 
     Ok((success_count, fail_count, series_json_count))
@@ -891,7 +907,16 @@ fn archive_write_lock(path: &Path) -> Arc<Mutex<()>> {
 /// Serialize writers targeting the same archive, including the read/merge phase: two jobs must
 /// never truncate or rename each other's .cbz.tmp file. Unrelated archives still run in parallel.
 /// Rewrites the ZIP to include the new ComicInfo.xml, preserving source compression.
-fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> bool {
+/// What an embed did. `Unchanged` matters: a re-embed of an identical ComicInfo.xml writes
+/// nothing, and reporting it as `Written` would make Komga rescan a library that did not change.
+/// It still counts as success for the job's return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbedOutcome {
+    Written,
+    Unchanged,
+}
+
+fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> Option<EmbedOutcome> {
     let path = Path::new(file_path);
     let lock = archive_write_lock(path);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -902,7 +927,7 @@ fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> bool {
         // RUST_LOG=debug plus manual DB/disk cross-checking. Always worth a log line: it's cheap and
         // this path should be rare in normal operation.
         log::warn!("[Writer] Embed skipped -- file does not exist at recorded path: {}", file_path);
-        return false;
+        return None;
     }
 
     // Skip the full repack when the archive already holds byte-identical ComicInfo.xml. A metadata
@@ -921,7 +946,7 @@ fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> bool {
     if let Some(existing) = existing_xml.as_deref() {
         if existing == xml_content {
             log::debug!("[Embed Debug] ComicInfo.xml unchanged for {} — skipping repack.", file_path);
-            return true;
+            return Some(EmbedOutcome::Unchanged);
         }
     }
 
@@ -958,18 +983,18 @@ fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> bool {
             // a failure here (e.g. cross-device rename, permissions) left the .tmp file orphaned on
             // disk with no trace in any log.
             match std::fs::rename(&tmp_path, path) {
-                Ok(_) => true,
+                Ok(_) => Some(EmbedOutcome::Written),
                 Err(e) => {
                     log::error!("[Writer] Failed to rename {} into place over {}: {}", tmp_path.display(), file_path, e);
                     let _ = std::fs::remove_file(&tmp_path);
-                    false
+                    None
                 }
             }
         }
         Err(e) => {
             log::error!("[Writer] Failed to inject XML into {}: {}", file_path, e);
             let _ = std::fs::remove_file(&tmp_path);
-            false
+            None
         }
     }
 }
@@ -999,7 +1024,7 @@ mod tests {
                     &format!("<ComicInfo><Series>Updated {i}</Series></ComicInfo>"))
             })
         }).collect();
-        for thread in threads { assert!(thread.join().unwrap()); }
+        for thread in threads { assert!(thread.join().unwrap().is_some()); }
         let xml = read_comicinfo_from_zip(&path).unwrap().unwrap();
         assert!(xml.contains("<Count>6</Count>"));
         let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
@@ -1034,11 +1059,18 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
 
         // Same XML → skipped: the file bytes are untouched (no repack).
-        assert!(inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>OLD</ComicInfo>"));
+        assert_eq!(
+            inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>OLD</ComicInfo>"),
+            Some(EmbedOutcome::Unchanged),
+            "re-embedding identical XML must not report a written file"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before, "unchanged XML must not rewrite the archive");
 
         // Different XML → repacked: the embedded ComicInfo.xml now reflects the new content.
-        assert!(inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"));
+        assert_eq!(
+            inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"),
+            Some(EmbedOutcome::Written)
+        );
         assert_eq!(
             read_comicinfo_from_zip(&path).unwrap().as_deref(),
             Some("<ComicInfo>NEW</ComicInfo>")
@@ -1192,7 +1224,7 @@ mod tests {
         // changes still reach files that already have an Imprint tag.
         let extras = "<Count>6</Count><PageCount>17</PageCount><Pages><Page Image=\"0\" Type=\"FrontCover\" /></Pages><CustomTag />";
         let with_extras = xml3.replace("</ComicInfo>", &format!("{extras}</ComicInfo>"));
-        assert!(inject_xml_into_zip(cbz.to_str().unwrap(), &with_extras));
+        assert!(inject_xml_into_zip(cbz.to_str().unwrap(), &with_extras).is_some());
         for priority in ["true", "false"] {
             sqlx::query(r#"INSERT INTO "SystemSetting" (key,value) VALUES ('file_metadata_priority',$1)
                 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"#)

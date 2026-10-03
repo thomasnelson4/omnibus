@@ -10,6 +10,7 @@ import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { describeIssueFromFilename, normalizeFractionNumbers } from '@/lib/utils/issue-parser';
 import { attachmentForFilename } from '@/lib/utils/attachment-name';
 import { expandCoverage, isCovered } from '@/lib/utils/coverage';
@@ -19,7 +20,14 @@ import { safeParse } from '@/lib/utils/safe-parse';
 import { getAccessibleLibraryPaths, canAccessPath } from '@/lib/library-access';
 
 export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
+  // `request.url` is absolute by construction in Next.js, but guard anyway so a malformed URL
+  // returns a 400 instead of rejecting the handler.
+  let searchParams: URLSearchParams;
+  try {
+    searchParams = new URL(request.url).searchParams;
+  } catch {
+    return NextResponse.json({ error: 'Invalid request URL' }, { status: 400 });
+  }
   const folderPath = searchParams.get('path');
   if (!folderPath) return NextResponse.json({ error: "Missing path parameter" }, { status: 400 });
 
@@ -330,7 +338,10 @@ export async function GET(request: Request) {
         await Promise.all(
             existingIssues
                 .filter(i => i.filePath)
-                .map(async (i) => { try { await fs.promises.access(i.filePath!); existingPaths.add(i.filePath!); } catch { /* gone */ } })
+                .map(async (i: { filePath: string | null }) => {
+                    try { await fs.promises.access(i.filePath!); existingPaths.add(i.filePath!); return i.filePath!; }
+                    catch { return null; /* the file is gone */ }
+                })
         );
 
         for (const issue of existingIssues) {
@@ -529,6 +540,10 @@ export async function DELETE(request: Request) {
                     await fs.remove(series.folderPath);
                     deletedPaths.push(series.folderPath);
                 }
+            }
+            // Rows are already deleted above, so paths only — the ids would not resolve.
+            if (deletedPaths.length) {
+                void recordLibraryChange({ paths: deletedPaths, reason: 'series-delete', source: 'api/library/series:DELETE' });
             }
         }
 

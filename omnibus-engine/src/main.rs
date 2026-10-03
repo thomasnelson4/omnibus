@@ -23,6 +23,7 @@ mod coverage;
 mod monitor;
 mod download;
 mod log_forward;
+mod library_events;
 mod renamer;
 mod secret_crypto;
 
@@ -452,6 +453,11 @@ async fn run(db_url: String, db_connections: u32) -> anyhow::Result<()> {
     let db = connect_with_retry(&db_url, db_connections).await?;
 
     log::info!("✅ Connected to the database ({:?})!", db.dialect);
+
+    // Engine-side library writes (watched imports, ComicInfo embeds, CBR conversions, repacks,
+    // cover downloads) now report to Node so it can ask Komga to rescan. Cloned because `db` is
+    // moved into AppState below. Must come after the connect: the drain reads a setting from it.
+    library_events::spawn_drain(db.clone());
 
     let limiter = Arc::new(rate_limiter::RateLimiter::new());
 
@@ -1143,7 +1149,11 @@ async fn handle_repack(
 
         // Collect every issue across all requested series, then process them through one bounded pool.
         // This fixes the previously strictly-sequential repack (P-2) without going unbounded (P-1).
-        let mut targets: Vec<(String, String)> = Vec::new();
+        // Collected and emitted once after the job, so Komga scans a fully-repacked library rather
+        // than one this job is still rewriting.
+        let mut changed_paths: Vec<String> = Vec::new();
+        let mut changed_series: std::collections::HashSet<String> = Default::default();
+        let mut targets: Vec<(String, String, String)> = Vec::new();
         for series_id in &payload.series_ids {
             let issues = sqlx::query(r#"SELECT id, "filePath" FROM "Issue" WHERE "seriesId" = $1 AND "filePath" IS NOT NULL"#)
                 .bind(series_id)
@@ -1151,7 +1161,7 @@ async fn handle_repack(
                 .await
                 .unwrap_or_default();
             for issue in issues {
-                targets.push((issue.get("id"), issue.get("filePath")));
+                targets.push((series_id.clone(), issue.get("id"), issue.get("filePath")));
             }
         }
         log::info!("[Repack] Processing {} archives across {} series.", targets.len(), payload.series_ids.len());
@@ -1159,24 +1169,32 @@ async fn handle_repack(
         let cfg = engine_config::EngineConfig::load(&db.pool).await;
         let sem = Arc::new(tokio::sync::Semaphore::new(cfg.convert_workers));
         let mut join_set = tokio::task::JoinSet::new();
-        for (issue_id, file_path) in targets {
+        for (series_id, issue_id, file_path) in targets {
             let sem = sem.clone();
             join_set.spawn(async move {
                 let _permit = sem.acquire_owned().await.ok();
                 let path = PathBuf::from(&file_path);
                 let result = tokio::task::spawn_blocking(move || converter::process_archive(&path, convert_to_webp, webp_quality)).await;
-                (issue_id, file_path, result)
+                // series_id is returned rather than used inside: the changed-series set is built
+                // on this side of the join.
+                (series_id, issue_id, file_path, result)
             });
         }
 
         while let Some(res) = join_set.join_next().await {
-            let (issue_id, file_path, result) = match res {
+            let (series_id, issue_id, file_path, result) = match res {
                 Ok(t) => t,
                 Err(e) => { log::error!("[Repack] task join error: {:?}", e); fail_count += 1; continue; }
             };
             match result {
                 Ok(Ok(new_path)) => {
                     let new_path_str = new_path.to_string_lossy().to_string();
+                    // process_archive may rewrite in place or produce a new .cbz; both paths matter.
+                    if file_path != new_path_str {
+                        changed_paths.push(file_path.clone());
+                    }
+                    changed_paths.push(new_path_str.clone());
+                    changed_series.insert(series_id.clone());
                     // Flattening can drop junk entries, so refresh the pageCount the OPDS feed
                     // advertises (parity with Node repackArchive); the CASE keeps an unreadable
                     // result from zeroing a previously-known count.
@@ -1205,6 +1223,10 @@ async fn handle_repack(
                 Ok(Err(e)) => { log::error!("Failed to repack {}: {:?}", file_path, e); fail_count += 1; }
                 Err(e) => { log::error!("[Repack] conversion task panicked for {}: {:?}", file_path, e); fail_count += 1; }
             }
+        }
+
+        if !changed_paths.is_empty() {
+            library_events::emit("repack", changed_paths, changed_series.into_iter().collect());
         }
 
         let duration_ms = start_time.elapsed().as_millis() as i32;

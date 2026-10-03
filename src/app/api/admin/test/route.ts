@@ -101,7 +101,11 @@ export async function POST(request: Request) {
                      } 
                  });
             }
-        } catch (e) { }
+        } catch (e) {
+            // Pre-existing behaviour (inherited from main): a malformed custom_headers value is
+            // ignored rather than failing the whole connection test. Logged so it is not silent.
+            Logger.log(`[AdminTest] Ignoring malformed custom_headers: ${getErrorMessage(e)}`, 'debug');
+        }
     }
 
     const getRealValue = async (key: string, providedValue: string) => {

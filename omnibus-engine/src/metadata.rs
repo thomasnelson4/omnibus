@@ -623,7 +623,7 @@ async fn fetch_comicvine(
     // format hints in the volume name, or a finished single-issue volume = one-shot.
     let guessed_book_type: Option<&'static str> = guess_book_type_from_cv_volume(vol_data);
 
-    let final_cover = resolve_cover(client, image_url.as_deref(), folder_path, current_cover, has_custom_cover, cover_source).await;
+    let final_cover = resolve_cover(client, series_id, image_url.as_deref(), folder_path, current_cover, has_custom_cover, cover_source).await;
 
     // remoteCoverUrl keeps the original provider URL for external consumers (series.json) —
     // coverUrl becomes a local path. The bookType heuristic only fills a blank (never clobbers
@@ -1294,7 +1294,7 @@ async fn fetch_metron(
     let book_type = map_series_type(&series_data["series_type"]);
 
     if !series_unchanged {
-    let final_cover = resolve_cover(client, cover_remote.as_deref(), folder_path, current_cover, has_custom_cover, cover_source).await;
+    let final_cover = resolve_cover(client, series_id, cover_remote.as_deref(), folder_path, current_cover, has_custom_cover, cover_source).await;
 
     // A manually curated series keeps its narrative fields; only the cover + blank-fills update.
     let update_res = if series_is_locked(db, series_id).await || file_priority {
@@ -1760,7 +1760,7 @@ fn map_series_type(v: &serde_json::Value) -> Option<&'static str> {
 
 /// Downloads the cover to `<folder>/cover.<ext>` and returns the `/api/library/cover` URL,
 /// falling back to an existing cover file or the prior cover. Parity with metadata-fetcher.ts.
-async fn resolve_cover(client: &Client, image_url: Option<&str>, folder_path: &str, current_cover: Option<String>, has_custom_cover: bool, cover_source: &str) -> Option<String> {
+async fn resolve_cover(client: &Client, series_id: &str, image_url: Option<&str>, folder_path: &str, current_cover: Option<String>, has_custom_cover: bool, cover_source: &str) -> Option<String> {
     let mut fallback = image_url.map(|s| s.to_string()).or(current_cover);
 
     let mut local_cover_exists = false;
@@ -1797,7 +1797,22 @@ async fn resolve_cover(client: &Client, image_url: Option<&str>, folder_path: &s
                                     else if content_type.contains("image/webp") { ".webp" }
                                     else { ".jpg" };
                                 let cover_path = Path::new(folder_path).join(format!("cover{}", ext));
+                                // Identical bytes: the write is a no-op, so skip it and do NOT tell
+                                // Komga to rescan. Otherwise every provider sync would look like a
+                                // library change and defeat the whole debounce.
+                                let unchanged = std::fs::read(&cover_path)
+                                    .map(|old| old == bytes)
+                                    .unwrap_or(false);
+                                if unchanged {
+                                    log::debug!("[Metadata] Cover unchanged at {:?}; skipping write.", cover_path);
+                                    return Some(format!("/api/library/cover?path={}", urlencoding::encode(&cover_path.to_string_lossy())));
+                                }
                                 if std::fs::write(&cover_path, &bytes).is_ok() {
+                                    crate::library_events::emit(
+                                        "cover-download",
+                                        vec![cover_path.to_string_lossy().into_owned()],
+                                        vec![series_id.to_string()],
+                                    );
                                     return Some(format!("/api/library/cover?path={}", urlencoding::encode(&cover_path.to_string_lossy())));
                                 }
                             }

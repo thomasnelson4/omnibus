@@ -282,23 +282,30 @@ export async function persistKomgaLibraries(resolved: ResolvedKomgaLibrary[]): P
 /** The cached libraries (DB errors propagate). A corrupt settings column falls back to Komga's defaults. */
 export async function loadCachedKomgaLibraries(): Promise<ResolvedKomgaLibrary[]> {
     const rows = await prisma.komgaLibrary.findMany({ orderBy: { name: 'asc' } });
-    return rows.map(row => {
-        let parsed: unknown = null;
-        try {
-            parsed = JSON.parse(row.settings);
-        } catch {
-            // fall through to defaults
-        }
-        return {
-            komgaLibraryId: row.komgaLibraryId,
-            name: row.name,
-            root: row.root,
-            translatedRoot: row.translatedRoot,
-            omnibusLibraryId: row.omnibusLibraryId,
-            settings: coerceSettings(parsed),
-            unavailable: row.unavailable,
-        };
-    });
+    return rows.map(komgaLibraryRowToResolved);
+}
+
+/** One KomgaLibrary row → ResolvedKomgaLibrary. Shared so every reader coerces settings identically. */
+export function komgaLibraryRowToResolved(row: {
+    komgaLibraryId: string; name: string; root: string;
+    translatedRoot: string | null; omnibusLibraryId: string | null;
+    settings: string | null; unavailable?: boolean | null;
+}): ResolvedKomgaLibrary {
+    let parsed: unknown = null;
+    try {
+        parsed = row.settings ? JSON.parse(row.settings) : null;
+    } catch {
+        // fall through to defaults
+    }
+    return {
+        komgaLibraryId: row.komgaLibraryId,
+        name: row.name,
+        root: row.root,
+        translatedRoot: row.translatedRoot,
+        omnibusLibraryId: row.omnibusLibraryId,
+        settings: coerceSettings(parsed),
+        unavailable: Boolean(row.unavailable),
+    };
 }
 
 /**

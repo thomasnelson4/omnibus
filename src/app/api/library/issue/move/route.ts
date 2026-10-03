@@ -10,6 +10,7 @@ import path from 'path';
 import { prisma } from '@/lib/db';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
@@ -82,6 +83,8 @@ export async function POST(request: Request) {
 
         let moved = 0;
         const conflicts: string[] = [];
+        // Accumulated across the loop so a later throw still reports the files already moved.
+        const changedPaths: string[] = [];
         for (const issue of issues) {
             if (issue.seriesId === target.id) continue; // already in the target
 
@@ -89,6 +92,9 @@ export async function POST(request: Request) {
             if (issue.filePath && await fs.pathExists(issue.filePath)) {
                 try {
                     newFilePath = await moveFileNoClobber(issue.filePath, target.folderPath);
+                    if (issue.filePath && newFilePath !== issue.filePath) {
+                        changedPaths.push(issue.filePath, newFilePath);
+                    }
                 } catch (e) {
                     Logger.log(`[Issue Move] Failed to relocate file for issue ${issue.id}: ${getErrorMessage(e)}`, 'warn');
                     conflicts.push(issue.id);
@@ -97,6 +103,16 @@ export async function POST(request: Request) {
             }
             await prisma.issue.update({ where: { id: issue.id }, data: { seriesId: target.id, filePath: newFilePath } });
             moved++;
+        }
+
+        if (changedPaths.length) {
+            void recordLibraryChange({
+                paths: changedPaths,
+                seriesIds: [...new Set([target.id, ...issues.map(i => i.seriesId)])],
+                issueIds,
+                reason: 'issue-move',
+                source: 'api/library/issue/move',
+            });
         }
 
         await AuditLogger.log('MOVE_ISSUES', {

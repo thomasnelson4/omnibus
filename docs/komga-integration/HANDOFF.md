@@ -18,40 +18,52 @@ things actually stand so the next agent does not have to re-derive it.
 > These five files were recovered from the previous agent's `/private/tmp` scratchpad and copied in
 > here, because `/private/tmp` is not durable. Treat them as first-class project docs.
 
+```text
+docs/komga-integration/DEVIATIONS.md   running deviation log, Phases 0-2
+```
+
 ---
+
+## 0. Rebase onto `main` — DONE
+
+The branch was rebased onto `main` (now based on `cf2ae35`). Only two conflicts, both pure
+import-block unions in the admin routes, resolved by taking **both** sides:
+
+- `src/app/api/admin/config/route.ts` — kept `annas-mirrors` (main) **and** the Komga constants /
+  settings-hooks imports (Phase 1).
+- `src/app/api/admin/test/route.ts` — kept `hosters/mega-session` (main) **and** the Komga
+  connection-test imports (Phase 1).
+
+Everything else auto-merged, including `prisma/schema.prisma` (main's models and the Komga models
+coexist) and the reading-list routes. Gate numbers immediately after the rebase: **192 files,
+1650 passed / 2 skipped, 0 failed**, `tsc` 0 errors.
+
+The rebase carried a batch of pre-existing `main` code-quality problems into files Phase 2 also
+edits (empty `catch {}` blocks, unused locals, unguarded `new URL(request.url)`). These were **not**
+merge artifacts — verified identical on `git show main:…` and absent from `git diff main`. They are
+listed at the end of [`DEVIATIONS.md`](./DEVIATIONS.md). One was deliberately **not** "fixed": the
+`!!a !== !!b` MEGA validation in `config/route.ts` is already a correct XOR and rewriting it would
+introduce a bug.
+
 
 ## 1. Current state of the branch
 
-**⚠️ The branch is 3 commits behind `main` and must be rebased before it can land:**
-
-```
-240d920  docs: add Komga integration implementation plan   ← HEAD
-2ce1fb6  Add bulk Assign to Series flow
-...  base
-```
-
-Missing from this branch, present on `main`:
-
-| Commit | Subject |
-| --- | --- |
-| `ebc6fbe` | feat(annas-archive): add configurable mirror failover |
-| `907bc1c` | Add MEGA account downloads with session caching (#5) |
-| `cf2ae35` | Smart Match: one evidence-first decision service |
-
-All Phase 1 work is **uncommitted**. Do not discard it.
+Phase 1 and Phase 2 are **committed** on top of `main`. See the gate table in §2 and the phase
+table in §3 for what exists and what does not.
 
 ## 2. Verified gates (measured today, Node 22)
 
-| Gate | Phase 0 baseline (`BASELINE.md`) | Current | Verdict |
+| Gate | Phase 0 baseline (`BASELINE.md`) | Current (after rebase + Phase 2) | Verdict |
 | --- | --- | --- | --- |
-| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **183 files, 1488 passed / 2 skipped, 0 failed** | ✅ +393 tests, no regressions |
+| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **198 files, 1794 passed / 2 skipped, 0 failed** | ✅ no regressions; +699 vs baseline, +306 vs the 1488 pre-rebase figure |
 | `npx tsc --noEmit` | clean | **0 errors** | ✅ |
-| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2026 warnings** | ✅ the 2 baseline errors were fixed |
-| `cargo clippy --all-targets -- -D warnings` | clean | not re-run | — |
-| `cargo test` | 292 passed | not re-run | — |
-| `npx next build` | — | not re-run | — |
+| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2046 warnings** | ✅ the 2 baseline errors were fixed |
+| `npx prisma validate` | — | **valid** | ✅ |
+| `cargo clippy --all-targets -- -D warnings` | clean | **clean** | ✅ |
+| `cargo test` | 292 passed | **305 passed** | ✅ +13 |
+| `npx next build` | — | **succeeds** | ✅ |
 
-Everything currently on the branch is green. The build is unfinished by design, not broken.
+Everything currently on the branch is green.
 
 Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — there is no Redis here.
 
@@ -61,7 +73,7 @@ Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — ther
 | --- | --- | --- |
 | **0** | Workspace setup and baselines | ✅ **committed** as `240d920` |
 | **1** | Komga client, settings, connection test, library discovery | ✅ **complete, uncommitted** |
-| **2** | Change tracking + debounced scan trigger (req 1) | 🔶 **~15% — queue only** |
+| **2** | Change tracking + debounced scan trigger (req 1) | ✅ **complete, committed** |
 | **3** | Identity map + post-scan verification | ❌ not started |
 | **4** | Reading-list push (req 2) | ❌ not started |
 | **5** | Admin jobs, health, docs | ❌ not started |
@@ -91,27 +103,27 @@ Plus: `src/app/api/admin/komga/libraries/route.ts`, `src/app/admin/settings/tabs
 `admin-test-komga` 14, `queue` 12, `live-fixtures` 15. Shared fake: `__tests__/helpers/fake-komga.ts`
 — **extend it, do not fork it.**
 
-### Phase 2 — only the queue exists
+### Phase 2 — complete
 
-Present: `src/lib/komga/queue.ts` (job types `KOMGA_SYNC`, `KOMGA_RECONCILE`, `KOMGA_READLIST_PUSH`,
-`KOMGA_READLIST_DELETE`, dedup helpers, lazy Redis).
+All five modules exist, plus the engine emitter and every call site in `P2-INVENTORY.md`:
 
-**Missing — all of it:**
+| File | Role |
+| --- | --- |
+| `changes.ts` | `recordLibraryChange` (HOT PATH), `mergePendingPaths`, `resolveLibraryForPath` |
+| `flush.ts` | `isLibraryDue` (pure), `backoffMs`, `flushDueLibraries` |
+| `worker.ts` | `initKomgaWorker`, `processKomgaJob`, `scheduleKomgaReconcile` |
+| `sync.ts` | `runLibrarySync` stage machine (`start → preIdle → scan → settle`) |
+| `../api/internal/library-changed/route.ts` | the engine's inbound webhook (202, hand-validated) |
+| `omnibus-engine/src/library_events.rs` | engine emitter + drain + coalescer |
 
-```
-src/lib/komga/changes.ts                    recordLibraryChange (HOT PATH)
-src/lib/komga/flush.ts                      isLibraryDue (pure) + flushDueLibraries
-src/lib/komga/worker.ts                     initKomgaWorker
-src/lib/komga/sync.ts                       runLibrarySync stage machine
-src/app/api/internal/library-changed/route.ts
-```
+`src/instrumentation.ts` now starts the worker right after `initWorker()`. `queue.ts` gained
+`komgaLibraryIds` / `settleStartedAt` / `settleOutcome` on `KomgaSyncJobData`;
+`libraries.ts` exports `komgaLibraryRowToResolved`; `library-roots.ts` exports
+`getLibraryRootEntries()`; `settings-hooks.ts` resets `KomgaSyncState` backoff on a connection change.
 
-Also untouched: **the Rust engine emitter** in `omnibus-engine/src/library_events.rs` (modelled on
-`log_forward.rs`), which `git status omnibus-engine` shows as completely clean. Phase 2 needs
-emitters on both sides, and the plan lists ~14 Node call sites plus ~7 engine call sites.
-
-Note `src/instrumentation.ts` and `src/lib/cron.ts` contain **zero** Komga references — the worker is
-never started and the daily reconcile repeatable job is never registered.
+4 new test files: `changes` 44, `flush` 34, `sync` 28, `worker` 18, plus `internal-library-changed`
+20 (144 cases). `rename.test.ts:97` was updated — the inventory predicted this: the engine branch
+now takes one extra `series.findMany` snapshot query.
 
 ### Phases 3–5 — nothing exists
 
@@ -172,23 +184,27 @@ read-only Komga reference checkout at `/Users/thomas/repos/sbx/omnibus-reference
 
 ## 6. Suggested order of work
 
-1. **Rebase onto `main`** (`git rebase main`, resolving the Prisma/reading-list touchpoints) and
-   re-run the full gate set. Phase 1 touches settings tabs, admin config/test routes and
-   `page-sweep.ts` / `secret-keys.ts`, all of which `main` has since moved.
-2. **Phase 2**, per `CONTRACT-P2.md` + `P2-INVENTORY.md`, treating the LIVE addenda as authoritative:
-   `changes.ts` → `flush.ts` → `worker.ts` → `sync.ts` → internal route → Node call sites →
-   Rust emitter. Start the worker from `instrumentation.ts` after `initWorker()`.
-3. **Phase 3** — identity map and post-scan verification; the schema is ready.
+1. ~~**Rebase onto `main`**~~ — **done**, see §0.
+2. ~~**Phase 2**~~ — **done**, see §3. Two notes for whoever picks this up:
+   - `sync.ts` deliberately reads its cached library list through the **injected** `db`, not
+     `loadCachedKomgaLibraries()` (which uses the module-level `prisma`). Keep it that way, or the
+     stage machine stops being testable without a real database.
+   - `stepScan` snapshots `pendingPaths` **before** the update that clears it. Phase 3's
+     verification reads that snapshot; reading it after would silently verify nothing.
+3. **Phase 3** — identity map and post-scan verification; the schema is ready. Remember that folder
+   paths legitimately live in `pendingPaths` and must be treated as prefixes.
 4. **Phase 4** — reading-list push.
 5. **Phase 5** — admin jobs, health check, `docs/KOMGA.md`.
-6. **End-to-end run** against PID 55968, then tear it down.
+6. **End-to-end run** against PID 55968, then tear it down. This is now the highest-value remaining
+   step: Phase 2 has a complete pipeline (change → debounce → scan → settle) and has only ever run
+   against the fake.
 
 Per-phase gates are PLAN §11. No phase is committed until they pass, and every new module needs tests.
 
 ## 7. Open questions / risks carried forward
 
 - `PLAN.md` §15 "Deviations" is **empty** — the coordinator never backfilled it. `DEVIATIONS.md`
-  holds the Phase 0/1 content and should be merged into §15 when the branch is next committed.
+  holds the Phase 0/1/2 content and should be merged into §15 when the branch is next committed.
 - Phase 1's deviations from PLAN are substantial and all correct the plan (see `DEVIATIONS.md`),
   notably: `scanCbx` gates cbz/zip/cbr/rar together, not cbz alone; `scanDirectoryExclusions` is a
   case-insensitive substring match on the **full path**, not a folder-name match.
@@ -196,5 +212,14 @@ Per-phase gates are PLAN §11. No phase is committed until they pass, and every 
   `remote_path_mapping` while the resolver reads `remote_path_mappings`; the reading-list UI treating
   `WANTED` links as readable via `/reader?path=null`; CBL/CSV imports dropping provider IDs;
   `.cb7` invisible to Komga). Leave these alone.
-- The `settings-hooks.ts` reset of `KomgaSyncState` backoff on a `komga_*` change is listed as a P2
-  slice in `CONTRACT-P2.md` and is **not yet implemented**.
+- The `settings-hooks.ts` reset of `KomgaSyncState` backoff on a `komga_*` change **is now
+  implemented** (Phase 2).
+- **Three contradictions between the authoritative docs were found in Phase 2** and are written up
+  in `DEVIATIONS.md` §Phase 2: the `LibraryChange.source` type union vs the inventory's provenance
+  tags; PLAN's mark-all fallback wording vs the addenda's out-of-root decision; and
+  "settle when count reaches 0" being unimplementable given a global 10 s tick and sub-tick scans.
+  The first two were resolved by choosing the more specific document; the third by implementing the
+  LIVE-verified rule instead.
+- **Phase 2 has never been exercised against the live Komga instance.** Everything above is proven
+  by unit tests and the fake. The end-to-end run in §4 is still the thing that would catch a wrong
+  assumption about real Komga behaviour, and it now has a real pipeline to drive.

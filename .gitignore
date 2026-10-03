@@ -71,6 +71,9 @@ prisma/schema - BACKUP.prisma
 .claude/worktrees/
 .claude/plans/
 
+# Ignore .pi (Pi agent sessions, task logs, scratch)
+.pi/
+
 # Internal planning / status docs + local deploy compose (kept local, untracked)
 ANNAS_ARCHIVE_PLAN.md
 E2E_TESTING.md

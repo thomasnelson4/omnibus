@@ -174,6 +174,9 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     let mut success_count = 0;
     let mut unmatched_count = 0;
     let mut synced_series_ids = std::collections::HashSet::new();
+    // Library-side destinations this import wrote. The sources are under WATCHED_DIR, which is
+    // outside every library root, so only the destinations mean anything to Komga.
+    let mut imported_paths: Vec<String> = Vec::new();
 
     for file_data in preprocessed_files {
         let path = file_data.working_path;
@@ -363,6 +366,7 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
             let final_dest = dest_folder.join(format!("{}.{}", new_filename, dest_ext));
 
             if robust_move(&path, &final_dest).is_ok() {
+                imported_paths.push(final_dest.to_string_lossy().into_owned());
                 // Move sibling images (Cover scans) utilizing the original path
                 if let Some(parent_dir) = file_data.original_path.parent() {
                     if let Ok(siblings) = std::fs::read_dir(parent_dir) {
@@ -372,7 +376,11 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                                 let sib_ext = sib_path.extension().unwrap_or_default().to_string_lossy().to_lowercase();
                                 if matches!(sib_ext.as_str(), "jpg" | "jpeg" | "png" | "webp") {
                                     let sib_dest = dest_folder.join(sibling.file_name());
-                                    let _ = robust_move(&sib_path, &sib_dest);
+                                    // The result was discarded before, so a sibling that failed to
+                                    // move was invisible. Now only a real move is reported.
+                                    if robust_move(&sib_path, &sib_dest).is_ok() {
+                                        imported_paths.push(sib_dest.to_string_lossy().into_owned());
+                                    }
                                 }
                             }
                         }
@@ -518,6 +526,16 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     }
 
     let _ = clean_empty_folders(Path::new(&watched_dir), Path::new(&watched_dir));
+
+    // Emitted before the metadata sync consumes `synced_series_ids`. Paths are pushed even when
+    // the Issue upsert later fails: the file is already in the library either way.
+    if success_count > 0 {
+        crate::library_events::emit(
+            "watched-import",
+            imported_paths,
+            synced_series_ids.iter().cloned().collect(),
+        );
+    }
 
     if !synced_series_ids.is_empty() {
         let series_list: Vec<String> = synced_series_ids.into_iter().collect();

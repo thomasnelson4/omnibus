@@ -15,6 +15,7 @@ import { KOMGA_QUEUE_NAME, KOMGA_FLUSH_INTERVAL_MS, KOMGA_RECONCILE_INTERVAL_MS 
 import { getKomgaQueue, getKomgaRedisConnection, KOMGA_BASE_JOB_OPTIONS, KOMGA_JOB, type KomgaSyncJobData } from './queue';
 import { flushDueLibraries } from './flush';
 import { getKomgaSettings } from './settings';
+import { komgaLibrariesForOmnibusLibrary, komgaLibraryRowToResolved } from './libraries';
 
 const REPEATABLE_JOB_ID = 'repeat_komga_reconcile';
 
@@ -44,23 +45,31 @@ async function flushTick(): Promise<void> {
 }
 
 /**
- * Phase 2 reconcile: a full re-scan of every Omnibus library that has at least one mapped Komga
- * library. This is the safety net for anything the change trackers missed — a file written by a
- * tool outside Omnibus, a lost event, a Komga restart.
+ * The daily (and settings-change, and manual) reconcile: a FULL sync of every Omnibus library that
+ * a Komga library serves — pre-idle, scan, settle, reconcile, verify. That makes it a real backstop
+ * for lost engine callbacks: anything written to disk outside Omnibus still ends up scanned and
+ * mapped. Phase 4 appends the read-list pass and the orphan sweep to the same job.
+ *
+ * Library selection uses RUNTIME CONTAINMENT (komgaLibrariesForOmnibusLibrary), not the cached
+ * `omnibusLibraryId` column. One Komga library over a parent folder serves several Omnibus
+ * libraries but is stored against the single best match, so filtering on that column alone would
+ * silently skip the others on every nightly pass.
  *
  * The per-library sync is enqueued WITH dedupe (`komga-sync-<id>`): if a flush-originated sync is
- * already waiting for that library, the running scan covers the reconcile too, so adding a second
- * would just make Komga do the work twice.
+ * already waiting for that library it will run the same pipeline — including reconcile and verify —
+ * so a second job would only make Komga do the work twice.
  */
 async function runKomgaReconcile(data: { reason?: string }): Promise<void> {
     const reason = data?.reason || 'scheduled';
     try {
-        const mapped = await prisma.komgaLibrary.findMany({
-            where: { unavailable: false, omnibusLibraryId: { not: null } },
-            select: { omnibusLibraryId: true },
-            distinct: ['omnibusLibraryId'],
-        });
-        const libraryIds = Array.from(new Set(mapped.map(r => r.omnibusLibraryId).filter((v): v is string => Boolean(v))));
+        const [omnibusLibraries, rows] = await Promise.all([
+            prisma.library.findMany({ select: { id: true, name: true, path: true } }),
+            prisma.komgaLibrary.findMany({}),
+        ]);
+        const resolved = rows.map(komgaLibraryRowToResolved).filter(l => !l.unavailable);
+        const libraryIds = omnibusLibraries
+            .filter(lib => komgaLibrariesForOmnibusLibrary(lib, resolved).length > 0)
+            .map(lib => lib.id);
         if (libraryIds.length === 0) {
             log(`daily reconcile (${reason}): no Omnibus library is mapped to a Komga library; nothing to do`, 'debug');
             return;

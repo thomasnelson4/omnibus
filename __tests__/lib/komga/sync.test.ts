@@ -94,6 +94,12 @@ function makeDb(row = stateRow(), komgaLibraries: any[] = [KOMGA_LIB_ROW]) {
         komgaLibrary: { findMany: vi.fn(async () => komgaLibraries) },
         library: { findUnique: vi.fn(async () => ({ id: OMNIBUS_LIB, name: 'Manga', path: '/data/manga' })) },
         jobLog: { create: vi.fn(async () => ({})) },
+        // Phase 3 stages. An empty map means reconcile finds nothing to match, which is the right
+        // baseline for these tests: they are about the stage machine, not about the map.
+        issue: { findMany: vi.fn(async () => []) },
+        komgaBookLink: { findMany: vi.fn(async () => []), create: vi.fn(async () => ({})), update: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) },
+        komgaSeriesLink: { findMany: vi.fn(async () => []), create: vi.fn(async () => ({})), update: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) },
+        $transaction: vi.fn(async (ops: any[]) => { for (const op of ops) await op; return ops; }),
     };
     return { db, row, writes };
 }
@@ -115,8 +121,8 @@ afterEach(async () => {
 });
 
 describe('the stage list', () => {
-    it('is ordered start → preIdle → scan → settle', () => {
-        expect(SYNC_STEPS.map(s => s.stage)).toEqual(['start', 'preIdle', 'scan', 'settle']);
+    it('is ordered start → preIdle → scan → settle → reconcile → verify', () => {
+        expect(SYNC_STEPS.map(s => s.stage)).toEqual(['start', 'preIdle', 'scan', 'settle', 'reconcile', 'verify']);
     });
 
     it('ends every stage in a declared StepResult', () => {
@@ -426,9 +432,8 @@ describe('runLibrarySync: settle stage', () => {
             { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
             { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
         );
-        const w = writes.at(-1);
-        expect(w.syncLeaseUntil).toBeNull();
-        expect(w.lastSyncCompletedAt).toBeInstanceOf(Date);
+        const stamped = writes.find(w => w.lastSyncCompletedAt instanceof Date);
+        expect(stamped?.syncLeaseUntil).toBeNull();
     });
 
     it('records COMPLETED_WITH_ERRORS and reports timeout past the settle cap', async () => {
@@ -460,6 +465,75 @@ describe('runLibrarySync: settle stage', () => {
             { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
         );
         expect(db.jobLog.create.mock.calls[0][0].data.relatedItem).toBe('Manga');
+    });
+});
+
+describe('runLibrarySync: the Phase 3 stages', () => {
+    const settledFake = async () => startFakeKomga({
+        state: {
+            libraries: [makeKomgaLibrary({ id: K_L, root: '/komga/manga' })],
+            taskQueueFrames: [{ count: 0, countByType: {} }],
+        },
+    });
+
+    it('runs reconcile and verify after settle, and hands the lease back at the end', async () => {
+        fake = await settledFake();
+        const { db, writes } = makeDb();
+        const result = await runLibrarySync(
+            {
+                omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L],
+                scanRequestedAt: Date.now(), settleStartedAt: Date.now(),
+                snapshotPaths: ['/data/manga/S/1.cbz'],
+            },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        expect(result).toEqual({ done: true });
+        // reconcile reads the map...
+        expect(db.komgaBookLink.findMany).toHaveBeenCalled();
+        // ...verify lists the books and stamps a verdict...
+        expect(db.komgaSyncState.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({ data: expect.objectContaining({ lastSyncCompletedAt: expect.any(Date) }) }),
+        );
+        // ...and the pipeline ends with the lease released, so a verification retry can be flushed.
+        expect(writes.at(-1).syncLeaseUntil).toBeNull();
+    });
+
+    it('takes the lease back after settle released it, before the map is rewritten', async () => {
+        fake = await settledFake();
+        const { db, writes } = makeDb();
+        await runLibrarySync(
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        const firstRelease = writes.findIndex(w => w.syncLeaseUntil === null);
+        const retake = writes.findIndex((w, i) => i > firstRelease && w.syncLeaseUntil instanceof Date);
+        expect(retake).toBeGreaterThan(firstRelease);
+    });
+
+    it('writes a KOMGA_RECONCILE JobLog row', async () => {
+        fake = await settledFake();
+        const { db } = makeDb();
+        await runLibrarySync(
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        const types = db.jobLog.create.mock.calls.map((c: any[]) => c[0].data.jobType);
+        expect(types).toContain('KOMGA_SCAN');
+        expect(types).toContain('KOMGA_RECONCILE');
+    });
+
+    it('still reaches verify when reconcile throws', async () => {
+        fake = await settledFake();
+        const { db } = makeDb();
+        db.komgaBookLink.findMany = vi.fn(async () => { throw new Error('db exploded'); });
+        const result = await runLibrarySync(
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        expect(result).toEqual({ done: true });
+        expect(db.komgaSyncState.updateMany).toHaveBeenCalledWith(
+            expect.objectContaining({ data: expect.objectContaining({ lastSyncCompletedAt: expect.any(Date) }) }),
+        );
     });
 });
 
@@ -499,7 +573,7 @@ describe('runLibrarySync: continuations', () => {
         fake = await startFakeKomga();
         const { db } = makeDb();
         const result = await runLibrarySync(
-            { omnibusLibraryId: OMNIBUS_LIB, stage: 'reconcile' },
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'no-such-stage' },
             { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
         );
         expect(result).toEqual({ done: true });

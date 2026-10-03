@@ -48,22 +48,18 @@ introduce a bug.
 
 ## 1. Current state of the branch
 
-Phase 1 and Phase 2 are **committed** on top of `main`. See the gate table in §2 and the phase
+Phases 1, 2 and 3 are **committed** on top of `main`. See the gate table in §2 and the phase
 table in §3 for what exists and what does not.
 
 ## 2. Verified gates (measured today, Node 22)
 
-| Gate | Phase 0 baseline (`BASELINE.md`) | Current (after rebase + Phase 2) | Verdict |
+| Gate | Phase 0 baseline (`BASELINE.md`) | After Phase 3 | Verdict |
 | --- | --- | --- | --- |
-| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **198 files, 1794 passed / 2 skipped, 0 failed** | ✅ no regressions; +699 vs baseline, +306 vs the 1488 pre-rebase figure |
+| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **213 files, 2220 passed / 2 skipped, 0 failed** | ✅ no regressions; +1125 vs baseline, +86 from Phase 3 |
 | `npx tsc --noEmit` | clean | **0 errors** | ✅ |
-| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2046 warnings** | ✅ the 2 baseline errors were fixed |
+| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2139 warnings** | ✅ |
 | `npx prisma validate` | — | **valid** | ✅ |
-| `cargo clippy --all-targets -- -D warnings` | clean | **clean** | ✅ |
-| `cargo test` | 292 passed | **305 passed** | ✅ +13 |
 | `npx next build` | — | **succeeds** | ✅ |
-
-Everything currently on the branch is green.
 
 Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — there is no Redis here.
 
@@ -72,9 +68,9 @@ Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — ther
 | Phase | Scope | Status |
 | --- | --- | --- |
 | **0** | Workspace setup and baselines | ✅ **committed** as `240d920` |
-| **1** | Komga client, settings, connection test, library discovery | ✅ **complete, uncommitted** |
+| **1** | Komga client, settings, connection test, library discovery | ✅ **complete, committed** |
 | **2** | Change tracking + debounced scan trigger (req 1) | ✅ **complete, committed** |
-| **3** | Identity map + post-scan verification | ❌ not started |
+| **3** | Identity map + post-scan verification | ✅ **complete, committed** |
 | **4** | Reading-list push (req 2) | ❌ not started |
 | **5** | Admin jobs, health, docs | ❌ not started |
 
@@ -125,11 +121,24 @@ All five modules exist, plus the engine emitter and every call site in `P2-INVEN
 20 (144 cases). `rename.test.ts:97` was updated — the inventory predicted this: the engine branch
 now takes one extra `series.findMany` snapshot query.
 
-### Phases 3–5 — nothing exists
+### Phase 3 — complete
 
-Every module is absent: `reconcile.ts`, `verify.ts`, `id-map.ts`, `health.ts`, `readlist-resolver.ts`,
-`readlist-push.ts`, `readlist-trigger.ts`, plus the `GET /api/admin/komga/id-map` and
-`PATCH|GET /api/reading-lists/komga` routes and `docs/KOMGA.md`.
+| File | Role |
+| --- | --- |
+| `reconcile.ts` | `reconcileLibrary()`: pages every non-deleted book into memory with no transaction open, PATH-matches then LINK-matches, the four-condition safety valve, the two-consecutive-miss rule, chunked array-form `$transaction` writes of changed rows only, `KomgaSeriesLink` majority vote, one `KOMGA_RECONCILE` JobLog |
+| `verify.ts` | `verifyLibrary()`: checks the snapshot step c took, the `floor(mtime) − 2 s` rule, folder-path expansion, the overflow sweep, the 2-retry budget and the give-up JobLog |
+| `sync.ts` | `stepReconcile` + `stepVerify` appended after `settle`; `KomgaSyncDb` widened to the map models and `$transaction` |
+| `worker.ts` | `KOMGA_RECONCILE` now selects libraries by runtime containment instead of the cached best-match column |
+| `../api/admin/komga/id-map/route.ts` | ADMIN-only export of the map; no API key in the body |
+
+4 new test files: `reconcile` 46, `verify` 25, `admin-komga-id-map` 9, plus `sync` +4 (32 total).
+`fake-komga.ts`'s `makeKomgaBook` gained an optional metadata shorthand (shared helper, extended
+not forked).
+
+### Phases 4–5 — nothing exists
+
+Every module is absent: `health.ts`, `readlist-resolver.ts`, `readlist-push.ts`,
+`readlist-trigger.ts`, plus the `PATCH|GET /api/reading-lists/komga` route and `docs/KOMGA.md`.
 
 **The Prisma models for all of it already exist** (`KomgaLibrary`, `KomgaSyncState`, `KomgaBookLink`,
 `KomgaSeriesLink`, `KomgaReadListLink`) and are generated — but they are currently **dead weight**,
@@ -191,13 +200,18 @@ read-only Komga reference checkout at `/Users/thomas/repos/sbx/omnibus-reference
      stage machine stops being testable without a real database.
    - `stepScan` snapshots `pendingPaths` **before** the update that clears it. Phase 3's
      verification reads that snapshot; reading it after would silently verify nothing.
-3. **Phase 3** — identity map and post-scan verification; the schema is ready. Remember that folder
-   paths legitimately live in `pendingPaths` and must be treated as prefixes.
-4. **Phase 4** — reading-list push.
-5. **Phase 5** — admin jobs, health check, `docs/KOMGA.md`.
-6. **End-to-end run** against PID 55968, then tear it down. This is now the highest-value remaining
-   step: Phase 2 has a complete pipeline (change → debounce → scan → settle) and has only ever run
-   against the fake.
+   - `stepSettle` returns `{next: 'reconcile'}` now (it used to end the pipeline), and
+     `stepVerify` is what releases the lease. If you add a stage, keep the lease held for the whole
+     pipeline — see `DEVIATIONS.md`.
+3. **Phase 4** — reading-list push. `readlists` is still absent from `SYNC_STEPS`; append it after
+   `verify`. `isBookLinkValid` (exported from `reconcile.ts`) is already what classifies an issue
+   as `awaitingScan`. The push must treat `KomgaBookLink` as read-only.
+4. **Phase 5** — admin jobs, health check, `docs/KOMGA.md`. `health.ts` should read
+   `lastReconciledAt` staleness and the `reconcile safety valve` prefix in `lastError`, both of which
+   Phase 3 now writes and nothing else does.
+5. **End-to-end run** against PID 55968, then tear it down. Phase 3 has been validated against the
+   live instance (paging, url shape, whole-second mtimes, provider-key uniqueness over 5000 real
+   books — see `DEVIATIONS.md`), but the modules still run only against the fake.
 
 Per-phase gates are PLAN §11. No phase is committed until they pass, and every new module needs tests.
 
@@ -220,6 +234,7 @@ Per-phase gates are PLAN §11. No phase is committed until they pass, and every 
   "settle when count reaches 0" being unimplementable given a global 10 s tick and sub-tick scans.
   The first two were resolved by choosing the more specific document; the third by implementing the
   LIVE-verified rule instead.
-- **Phase 2 has never been exercised against the live Komga instance.** Everything above is proven
-  by unit tests and the fake. The end-to-end run in §4 is still the thing that would catch a wrong
-  assumption about real Komga behaviour, and it now has a real pipeline to drive.
+- **Phase 2's never-ran-against-Komga risk is now shared by Phase 3.** Phase 3 was validated against
+  the live instance for *data shape* only (urls, mtimes, paging, provider keys); the modules still
+  run end-to-end only against the fake. The end-to-end run in §4 remains the thing that would catch
+  a wrong assumption about real Komga behaviour.

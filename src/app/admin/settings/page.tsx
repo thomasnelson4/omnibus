@@ -28,6 +28,7 @@ import { SearchIndexersTab } from "./tabs/search-indexers-tab"
 import { DownloadsTab } from "./tabs/downloads-tab"
 import { DiscoveryTab } from "./tabs/discovery-tab"
 import { NotificationsTab } from "./tabs/notifications-tab"
+import { MediaServersTab } from "./tabs/media-servers-tab"
 import { AccessSecurityTab } from "./tabs/access-security-tab"
 import { SystemTab } from "./tabs/system-tab"
 import { MegaAccountFields } from "@/components/mega-account-fields"
@@ -48,7 +49,7 @@ export default function SettingsPage() {
   
   const [testResults, setTestResults] = useState<{ [key: string]: { success: boolean, text: string } | null }>({
     comicvine: null, metron: null, prowlarr: null, clients: null, paths: null, mapping: null, webhooks: null, smtp: null, smtp_digest: null, flaresolverr: null,
-    pushover: null, telegram: null, apprise: null
+    pushover: null, telegram: null, apprise: null, komga: null
   })
   
   const [refreshing, setRefreshing] = useState(false)
@@ -149,7 +150,9 @@ export default function SettingsPage() {
     getcomics_automated_pages: "5",
     annas_archive_interactive_enabled: "false", annas_archive_base_url: "", annas_archive_mirrors: "", annas_archive_formats: "cbz,cbr,pdf,epub",
     engine_max_scan_workers: "", engine_max_convert_workers: "", engine_cpu_cap: "",
-    engine_max_blocking_threads: "", engine_memory_ceiling_mb: "", engine_max_db_connections: ""
+    engine_max_blocking_threads: "", engine_memory_ceiling_mb: "", engine_max_db_connections: "",
+    komga_enabled: "false", komga_url: "", komga_api_key: "", komga_path_mappings: "[]",
+    komga_scan_on_change: "true", komga_readlists_enabled: "false"
   })
 
   const [customProwlarrCategories, setCustomProwlarrCategories] = useState("")
@@ -928,6 +931,7 @@ export default function SettingsPage() {
         <TabsContent value="downloads" className="space-y-6"><DownloadsTab s={s} /></TabsContent>
         <TabsContent value="discovery"><DiscoveryTab s={s} /></TabsContent>
         <TabsContent value="notifications"><NotificationsTab s={s} /></TabsContent>
+        <TabsContent value="media-servers" className="space-y-6"><MediaServersTab s={s} /></TabsContent>
         <TabsContent value="access" className="space-y-6"><AccessSecurityTab s={s} /></TabsContent>
         <TabsContent value="system" className="space-y-6"><SystemTab s={s} /></TabsContent>
 

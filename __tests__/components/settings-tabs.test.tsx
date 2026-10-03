@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 // __tests__/components/settings-tabs.test.tsx
 //
-// Settings reorganization Phase 1: the 3,400-line settings monolith becomes 8 tab components
-// (settings/tabs/*.tsx) fed by a shared state bag from page.tsx. These tests pin (a) that each
+// Settings reorganization Phase 1: the 3,400-line settings monolith becomes tab components
+// (settings/tabs/*.tsx, 9 with the Komga "Media Servers" tab) fed by a shared state bag from page.tsx. These tests pin (a) that each
 // tab renders its headline controls from a plain bag, (b) that the SECTIONS THAT MOVED landed
 // in their new tabs (acronyms → Search, Cloudflare/retries → Downloads, manga detection lists →
 // Discovery, custom headers → Access & Security, engine perf/env paths/Docker test → System),
@@ -20,6 +20,7 @@ import { DiscoveryTab } from '@/app/admin/settings/tabs/discovery-tab';
 import { NotificationsTab } from '@/app/admin/settings/tabs/notifications-tab';
 import { AccessSecurityTab } from '@/app/admin/settings/tabs/access-security-tab';
 import { SystemTab } from '@/app/admin/settings/tabs/system-tab';
+import { MediaServersTab } from '@/app/admin/settings/tabs/media-servers-tab';
 
 // Radix polyfills (same as the other component suites)
 global.ResizeObserver = vi.fn().mockImplementation(() => ({
@@ -29,9 +30,14 @@ window.HTMLElement.prototype.scrollIntoView = vi.fn();
 window.HTMLElement.prototype.hasPointerCapture = vi.fn();
 window.HTMLElement.prototype.releasePointerCapture = vi.fn();
 
-// A complete state bag: every key the tabs destructure, with inert defaults.
+// A complete state bag: every key the tabs destructure, with inert defaults. The Media Servers
+// tab reads only config/setConfig/handleTest/testing/testResults/setTestResults (its "Detect
+// libraries" preview is local state), so the Komga keys it needs are the config ones below.
 const mkBag = (overrides: Record<string, any> = {}) => ({
-    config: {},
+    config: {
+        komga_enabled: 'false', komga_url: '', komga_api_key: '', komga_path_mappings: '[]',
+        komga_scan_on_change: 'true', komga_readlists_enabled: 'false',
+    } as Record<string, any>,
     setConfig: vi.fn(),
     isSourceAvailable: vi.fn().mockReturnValue(true),
     handleTest: vi.fn(),
@@ -172,6 +178,18 @@ describe('Settings tabs (Phase 1 reorganization)', () => {
         // everything else waits for the global Save — that difference must be stated.
         render(<AccessSecurityTab s={mkBag()} />);
         expect(screen.getByText(/immediately/i)).toBeInTheDocument();
+    });
+
+    it('MediaServersTab renders the Komga card and writes through setConfig', () => {
+        const bag = mkBag();
+        render(<MediaServersTab s={bag} />);
+        expect(screen.getByText('Komga')).toBeInTheDocument();
+        expect(screen.getByLabelText(/Komga URL/i)).toBeInTheDocument();
+        expect(screen.getByText(/Path Mappings/i)).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Detect Libraries/i })).toBeInTheDocument();
+
+        fireEvent.click(screen.getByLabelText(/Enable Komga Integration/i));
+        expect(bag.setConfig).toHaveBeenCalledWith(expect.objectContaining({ komga_enabled: 'true' }));
     });
 
     it('SystemTab hosts engine performance, environment paths, and the Docker test area', () => {

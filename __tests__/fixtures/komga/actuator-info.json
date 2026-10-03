@@ -1,0 +1,36 @@
+{
+  "git": {
+    "branch": "master",
+    "commit": {
+      "id": "2ab7a5a",
+      "time": "2026-10-02T05:56:47Z"
+    }
+  },
+  "build": {
+    "artifact": "komga",
+    "name": "komga",
+    "version": "1.28.1",
+    "group": "komga"
+  },
+  "java": {
+    "version": "21.0.12.1",
+    "vendor": {
+      "name": "Homebrew",
+      "version": "Homebrew"
+    },
+    "runtime": {
+      "name": "OpenJDK Runtime Environment",
+      "version": "21.0.12.1"
+    },
+    "jvm": {
+      "name": "OpenJDK 64-Bit Server VM",
+      "vendor": "Homebrew",
+      "version": "21.0.12.1"
+    }
+  },
+  "os": {
+    "name": "Mac OS X",
+    "version": "26.6.2",
+    "arch": "aarch64"
+  }
+}

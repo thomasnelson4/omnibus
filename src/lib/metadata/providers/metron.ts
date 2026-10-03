@@ -30,6 +30,20 @@ const mapSeriesType = (seriesType: any): 'Print' | 'OneShot' | 'TPB' | 'GN' | nu
     return 'Print'; // Ongoing, Limited, Annual, Digital Chapters, etc. are all standard print series
 };
 
+/** The compact single-issue view the reading-list "Fix match" preview needs (getIssueSummary). */
+export interface MetronIssueSummary {
+    id: number;
+    number: string;
+    title: string | null;
+    seriesId: number | null;
+    seriesName: string | null;
+    seriesYearBegan: number | null;
+    publisher: string | null;
+    coverDate: string | null;
+    storeDate: string | null;
+    image: string | null;
+}
+
 export class MetronProvider implements IMetadataProvider {
     private readonly baseUrl = 'https://metron.cloud/api';
     private readonly requestHeaders = { 'User-Agent': 'Omnibus/1.0' };
@@ -76,7 +90,9 @@ export class MetronProvider implements IMetadataProvider {
                 const remaining = parseInt(response.headers.get('x-ratelimit-burst-remaining') || '20', 10);
                 Logger.log(`[Metron Debug] Rate Limit Status -> Burst Remaining: ${remaining}`, 'debug');
 
-                if (remaining <= 2) {
+                // config.failFast (opt-in, interactive single-issue lookups only): never sleep — a
+                // user is waiting on this response, so a burst/429 wait becomes an immediate error.
+                if (remaining <= 2 && !config.failFast) {
                     const reset = parseInt(response.headers.get('x-ratelimit-burst-reset') || '0', 10);
                     if (reset > 0) {
                         const sleepMs = Math.max(0, (reset * 1000) - Date.now()) + 500;
@@ -92,7 +108,8 @@ export class MetronProvider implements IMetadataProvider {
                         Logger.log(`[Metron] FATAL Rate Limit Hit. IP blocked for ${retryAfter}s.`, 'error');
                         throw new Error("FATAL_RATE_LIMIT");
                     }
-                    
+                    if (config.failFast) throw new Error('METRON_RATE_LIMITED');
+
                     Logger.log(`[Metron] Rate Limit Hit. Waiting ${retryAfter}s before retrying...`, 'warn');
                     await new Promise(resolve => setTimeout(resolve, (retryAfter + 1) * 1000));
                     continue; 
@@ -117,7 +134,7 @@ export class MetronProvider implements IMetadataProvider {
 
             } catch (error: any) {
                 Logger.log(`[Metron Debug] Fetch Attempt ${attempt + 1} Failed: ${error.message}`, 'debug');
-                if (attempt === maxRetries - 1) throw error;
+                if (error?.message === 'METRON_RATE_LIMITED' || attempt === maxRetries - 1) throw error;
                 await new Promise(resolve => setTimeout(resolve, 2000));
             }
         }
@@ -391,6 +408,49 @@ export class MetronProvider implements IMetadataProvider {
             // Issue.name convention is raw titles (parity with ComicVine), so the detail
             // pass needs it unwrapped. Placeholders ("Issue 154") stay out (#199 round 3).
             storyTitle: issueTitle && !isGeneric ? issueTitle : null
+        };
+    }
+
+    /**
+     * One issue by numeric id for an interactive lookup (reading-list Fix match): a single attempt
+     * with failFast — no burst/429 sleeps, no retry — so a busy Metron surfaces as an error the
+     * user can act on instead of a request that hangs. No series fallback search (unlike
+     * getIssueDetails): one upstream call at most. Resolves null when Metron has no such issue.
+     * Throws METRON_INVALID_ID / METRON_NOT_CONFIGURED before any I/O, and lets fetchWithBackoff's
+     * METRON_RATE_LIMITED / FATAL_RATE_LIMIT / "HTTP Error: <status>" errors through.
+     */
+    async getIssueSummary(id: string): Promise<MetronIssueSummary | null> {
+        if (!/^\d+$/.test(id)) throw new Error('METRON_INVALID_ID');
+        const auth = await this.getAuth();
+        // An undecryptable secret (enc:…, e.g. after a NEXTAUTH_SECRET change) can only be rejected.
+        if (!auth || auth.password.startsWith('enc:')) throw new Error('METRON_NOT_CONFIGURED');
+
+        const res = await this.fetchWithBackoff(`${this.baseUrl}/issue/${id}/`, { headers: this.requestHeaders, auth, timeout: 10000, failFast: true }, 1);
+        // Coarse key, like getSeriesIssues' '/issue' (a per-id key fragments the health panel's
+        // usage JSON). A 404 is still a real upstream call, so it counts too.
+        if (!res.cached) await logApiUsage('metron', '/issue');
+
+        const issue = res.data;
+        if (res.status === 404 || issue?.id == null || Number(issue.id) !== Number(id)) return null;
+
+        const rawName = Array.isArray(issue.name) ? issue.name[0] : issue.name;
+        const candidateTitle = (typeof issue.title === 'string' && issue.title.trim())
+            ? issue.title
+            : (typeof rawName === 'string' && rawName.trim() ? rawName : null);
+        const title = candidateTitle && !/^Issue\s*#?\s*-?\d+$/i.test(candidateTitle.trim()) ? candidateTitle : null;
+        const seriesObj = issue.series && typeof issue.series === 'object' ? issue.series : null;
+
+        return {
+            id: Number(issue.id),
+            number: String(issue.number ?? ''),
+            title,
+            seriesId: Number(seriesObj?.id ?? issue.series_id) || null,
+            seriesName: seriesObj?.name ?? (typeof issue.series === 'string' ? issue.series : null),
+            seriesYearBegan: Number(seriesObj?.year_began) || null,
+            publisher: issue.publisher?.name ?? null,
+            coverDate: issue.cover_date ?? null,
+            storeDate: issue.store_date ?? null,
+            image: issue.image ?? null,
         };
     }
 }

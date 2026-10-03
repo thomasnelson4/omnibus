@@ -16,7 +16,9 @@
 //              previous scan may still be running)
 //   scan     → POST the scan for every mapped Komga library, record when, clear pendingPaths
 //   settle   → wait for that scan to finish
-//   (Phase 3 inserts 'reconcile' + 'verify' here; Phase 4 inserts 'readlists')
+//   reconcile → Phase 3: rebuild the identity map for the library
+//   verify    → Phase 3: check the snapshot against what Komga indexed, then release the lease
+//   readlists → Phase 4: push the reading lists that cover this library
 //
 // A step that must wait returns {wait, stage}; runLibrarySync re-enqueues a continuation WITHOUT
 // the flush dedup id (the active job still owns it) and with a unique jobId, so the chain cannot
@@ -40,6 +42,7 @@ import { enqueueKomgaSync, type KomgaSyncJobData } from './queue';
 import { backoffMs } from './flush';
 import { reconcileLibrary } from './reconcile';
 import { verifyLibrary } from './verify';
+import { pushReadList } from './readlist-push';
 import {
     KOMGA_LEASE_MS,
     KOMGA_PRE_IDLE_RECHECK_MS,
@@ -455,9 +458,9 @@ async function stepReconcile(ctx: SyncContext): Promise<StepResult> {
 /**
  * Stage f: check the scan against the snapshot step c took, and re-dirty the library on a miss.
  *
- * This is the last stage Phase 3 adds, so it hands the lease back: Phase 4 appends 'readlists'
- * after it, and leaving the library locked for 30 minutes would stop the flush from acting on the
- * retry this stage may have just scheduled.
+ * This stage hands the lease back (see the updateMany below): Phase 4's 'readlists' runs AFTER it,
+ * and leaving the library locked for 30 minutes would stop the flush from acting on the retry this
+ * stage may have just scheduled.
  */
 async function stepVerify(ctx: SyncContext): Promise<StepResult> {
     const { db, data, now } = ctx;
@@ -482,7 +485,48 @@ async function stepVerify(ctx: SyncContext): Promise<StepResult> {
         where: { omnibusLibraryId: data.omnibusLibraryId },
         data: { syncLeaseUntil: null },
     }).catch((e: unknown) => log(`could not release the sync lease: ${getErrorMessage(e)}`, 'warn'));
+    return { next: 'readlists' };
+}
+
+/**
+ * Stage g: push the reading lists whose entries live in this library.
+ *
+ * Runs after 'verify' on purpose — the map is fresh, so a list can pick up the books this very sync
+ * produced instead of waiting for the next debounce. It never holds the lease and never fails the
+ * pipeline: a list that cannot be pushed is recorded on its own link row.
+ */
+async function stepReadlists(ctx: SyncContext): Promise<StepResult> {
+    const { db, data, now } = ctx;
+    try {
+        const pushed = await pushReadListsForLibrary(data.omnibusLibraryId, { db, client: ctx.client, settings: ctx.settings, now });
+        if (pushed > 0) log(`pushed ${pushed} reading list(s) after syncing ${data.omnibusLibraryId}`, 'debug');
+    } catch (e) {
+        log(`read-list pass threw for ${data.omnibusLibraryId}: ${getErrorMessage(e)}`, 'warn');
+    }
     return { done: true };
+}
+
+/**
+ * Every synced list with at least one entry under `omnibusLibraryId`. pushReadList itself checks the
+ * flags and the version, so an ineligible list costs a couple of cached reads and nothing else.
+ */
+async function pushReadListsForLibrary(
+    omnibusLibraryId: string,
+    deps: { db: KomgaSyncDb; client: KomgaClient; settings: KomgaSettings; now: () => Date },
+): Promise<number> {
+    const lists = await (deps.db as any).readingList.findMany({
+        where: {
+            komgaSync: true,
+            items: { some: { issue: { series: { libraryId: omnibusLibraryId } } } },
+        },
+        select: { id: true },
+    }) as { id: string }[];
+    let pushed = 0;
+    for (const list of lists) {
+        const result = await pushReadList(list.id, { ...deps, db: deps.db as any });
+        if (result.status === 'pushed' || result.status === 'waiting') pushed += 1;
+    }
+    return pushed;
 }
 
 /**
@@ -496,6 +540,7 @@ export const SYNC_STEPS: { stage: SyncStage; run: (ctx: SyncContext) => Promise<
     { stage: 'settle', run: stepSettle },
     { stage: 'reconcile', run: stepReconcile },
     { stage: 'verify', run: stepVerify },
+    { stage: 'readlists', run: stepReadlists },
 ];
 
 const STEP_BY_STAGE = new Map(SYNC_STEPS.map(s => [s.stage, s]));

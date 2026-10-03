@@ -70,8 +70,19 @@ async function runKomgaReconcile(data: { reason?: string }): Promise<void> {
         const libraryIds = omnibusLibraries
             .filter(lib => komgaLibrariesForOmnibusLibrary(lib, resolved).length > 0)
             .map(lib => lib.id);
+
+        // The orphan sweep is the one part of the reconcile that belongs to no library pipeline:
+        // remote read lists this instance pushed whose Omnibus list is gone. It runs FIRST and
+        // unconditionally, because a list can outlive every library it was built from — and the
+        // common case (Komga reachable, no library mapped any more) returns early below.
+        if ((await getKomgaSettings()).readListsEnabled) {
+            const { sweepOrphanedReadLists } = await import('./readlist-push');
+            const deleted = await sweepOrphanedReadLists();
+            if (deleted > 0) log(`orphan sweep (${reason}): deleted ${deleted} Komga read list(s) with no Omnibus list.`, 'info');
+        }
+
         if (libraryIds.length === 0) {
-            log(`daily reconcile (${reason}): no Omnibus library is mapped to a Komga library; nothing to do`, 'debug');
+            log(`daily reconcile (${reason}): no Omnibus library is mapped to a Komga library; nothing to scan`, 'debug');
             return;
         }
         const { enqueueKomgaSync } = await import('./queue');
@@ -110,10 +121,32 @@ export async function processKomgaJob(job: { name: string; data: unknown }): Pro
             case KOMGA_JOB.RECONCILE:
                 await runKomgaReconcile(data ?? {});
                 return;
-            case KOMGA_JOB.READLIST_PUSH:
-            case KOMGA_JOB.READLIST_DELETE:
-                log(`${job.name} is not implemented until Phase 4 (reading-list push)`, 'debug');
+            case KOMGA_JOB.READLIST_PUSH: {
+                const { pushReadList } = await import('./readlist-push');
+                const readingListId = (data as { readingListId?: string }).readingListId;
+                if (!readingListId) {
+                    log('KOMGA_READLIST_PUSH without a readingListId; ignoring', 'warn');
+                    return;
+                }
+                const result = await pushReadList(readingListId);
+                if (result.status === 'error') log(`push of ${readingListId} ended in an error: ${result.error}`, 'warn');
+                else log(`push of ${readingListId}: ${result.status}${result.reason ? ` (${result.reason})` : ''}`, 'debug');
                 return;
+            }
+            case KOMGA_JOB.READLIST_DELETE: {
+                const { deleteKomgaReadList } = await import('./readlist-push');
+                const payload = data as { komgaReadListId?: string; readingListId?: string };
+                if (!payload.komgaReadListId || !payload.readingListId) {
+                    log('KOMGA_READLIST_DELETE without both ids; ignoring', 'warn');
+                    return;
+                }
+                const result = await deleteKomgaReadList({
+                    komgaReadListId: payload.komgaReadListId,
+                    readingListId: payload.readingListId,
+                });
+                log(`delete of Komga read list ${payload.komgaReadListId}: ${result.status}${result.reason ? ` (${result.reason})` : ''}`, 'debug');
+                return;
+            }
             default:
                 log(`unknown job type '${job.name}'; ignoring`, 'warn');
         }

@@ -269,3 +269,117 @@ extension to `__tests__/helpers/fake-komga.ts`, not a fork.
   by Phase 3 and nothing else writes them.
 - The give-up JobLog uses `jobType: 'KOMGA_SCAN'`, so a Phase 5 health check that counts "verification
   give-ups in the last 24 h" must filter on that type plus the `Komga did not pick up` message.
+
+---
+
+## Phase 4 — reading-list push (requirement 2)
+
+Phase 4's LIVE-verified deltas (#10–#19, #23) were **re-probed independently** against the running
+instance (PID 55968, Komga 1.28.1) before and during implementation. All of them held. Two probes
+are worth recording because they shaped the code:
+
+- **#12 (FK rollback)** re-confirmed twice, including the part that matters: after
+  `PATCH {name, bookIds:[…, unknown]}` returned 500 with
+  `SQLITE_CONSTRAINT_FOREIGNKEY`, `GET` showed the **original** name — the rename rolled back with
+  the membership. This is why the retry path re-sends the name with the surviving ids rather than
+  assuming a partial success, and why a stale id is detected *before* the retry rather than after.
+- **#13 (names)** re-confirmed: case-only rename of a list's own name is 204; a PATCH into another
+  list's name is 400 `"Read list name already exists"`. `normalizeKomgaReadListName` (collapse all
+  whitespace incl. NBSP, trim) runs before **every** comparison and before every name sent, because
+  Komga compares untrimmed but case-insensitively.
+
+### D4.1 — the shared `cvIssueId` lookup rule lives in `reading-list-links.ts`, not in the resolver
+
+PLAN says to "extract the rule out of the `GET /api/reading-lists` auto-link into a shared lib
+helper that both use". It is implemented as `pickIssueForProviderId` (pure) +
+`findIssueForProviderId` (db) in `src/lib/reading-list-links.ts` — the module that already exists
+for "which local Issue may an entry link to". Putting it in `readlist-resolver.ts` would have meant
+the hottest reading-list route importing a Komga module for one function.
+
+The auto-link keeps everything that was tightened in 4a2fdd2 and is **not** moved: owner-scoped
+`linkAccessForList`, the `#194` title-number veto (applied via the helper's `expectedNumber`
+argument), and the conditional `updateMany` on `issueId: null`. The resolver calls the same helper
+with **no** `expectedNumber` (PLAN specifies no title veto for the push path) and never writes the
+link back. Both properties are asserted in `readlist-resolver.test.ts` and
+`reading-lists-route.test.ts`.
+
+### D4.2 — a route must never `await` the queue (bug found by the import-anilist test)
+
+The first cut of the cascade delete paths did `await enqueueKomgaReadListDelete(...)`. With Redis
+unreachable that blocks on the BullMQ connection, stalling a user-facing response — and it hung
+`__tests__/api/import-anilist.test.ts` outright. Fixed by splitting the helper in two:
+
+- `triggerReadListRemoteDelete(readingListId)` — reads the link, then fires and forgets;
+- `enqueueKomgaReadListDeleteNow(komgaReadListId, readingListId)` — takes an id the caller already
+  holds, returns immediately.
+
+The cascade paths (`import-mal`, `import-anilist`, admin user delete) use the second: they read
+`komgaReadListId` **before** the `deleteMany`/`user.delete` that cascades it away, then call the
+non-blocking version with the captured ids. The `reading-lists` DELETE calls the first, awaited,
+because it has no other way to learn the id.
+
+### D4.3 — `bookIds: []` is never sent, and a dead book id costs the whole request
+
+`PATCH {bookIds: []}` is a 400 (two violations), so the zero-book branch never creates and never
+empties: it marks the link `waiting` and leaves any remote list untouched. A remote list is deleted
+**only** on Omnibus delete, un-sync, or the orphan sweep.
+
+### D4.4 — the "enqueue a sync for the affected library" step needed the local link
+
+PLAN step 6 says a stale id should "enqueue a sync for the affected library". `getBook` cannot
+supply that: a **hard-deleted** book answers 404 with an *empty* body (delta #11), so there is no
+`libraryId` to read. Only soft-deleted books (which do return a DTO) contribute one. `pushReadList`
+therefore also looks the dropped ids up in `KomgaBookLink` (`komgaLibrariesForDroppedBooks`), which
+is where the id's library is still recorded. Without this the enqueue step would only ever fire for
+soft deletes.
+
+### D4.5 — `readlists` runs after `verify`, and `verify` keeps releasing the lease
+
+`SYNC_STEPS` gained `{ stage: 'readlists' }` after `verify` (the array stays data, not a switch).
+`stepVerify` now returns `{ next: 'readlists' }` instead of `{ done: true }`; the lease release stays
+inside `stepVerify`, so `stepReadlists` runs **without** holding it and the whole pipeline still ends
+unlocked. The stage also selects lists by `items.some.issue.series.libraryId`, so a list that only
+touches other libraries is not re-pushed on every sync.
+
+### D4.6 — the orphan sweep moved ahead of the "nothing mapped" early return
+
+Wiring the sweep into `runKomgaReconcile` first put it *after* the `libraryIds.length === 0` early
+return, which meant it never ran in exactly the case it exists for (a remote list outliving the
+library it was built from). It now runs first, and is skipped only when read lists are disabled.
+Caught by `worker.test.ts`.
+
+### D4.7 — the delete job stands down when the list was taken over
+
+PLAN has the re-import enqueue a remote delete *and* copy `komgaSync` onto the replacement "so the
+new list adopts the old remote through the marker rule". Those two race: if the push adopts the
+orphan first, the marker is rewritten to the **new** list id, and a delete job that only checks the
+*instance* would delete a list the new list now legitimately owns. `deleteKomgaReadList` therefore
+additionally requires `marker.readingListId === data.readingListId` and returns `refused` otherwise.
+This is strictly safer than PLAN and is covered by its own test.
+
+### D4.8 — a name-collision 400 the listing cannot see must not recurse
+
+If Komga answers the create with 400 `"Read list name already exists"` but the re-listing shows
+nothing under that name (lost race, or a normalisation we do not model), retrying the same name
+recurses forever. `createRetried` permits exactly one name change, and a same-name resolution with
+no takeover records the error instead of retrying.
+
+### D4.9 — out-of-scope lint tidies in files this phase already edits
+
+Reported, not fixed, per HANDOFF §0 — except where the fix is behaviour-free and the phase already
+touched the line:
+
+- `src/app/api/reading-lists/route.ts` — removed a dead `isAdmin` local (POST already computed
+  `canMakeGlobal`); renamed the unused `GET(request)` to `GET(_request)`, **keeping the arity**
+  (an earlier attempt to drop the parameter broke 22 existing test call sites).
+- `src/app/reading-lists/page.tsx` — three empty `catch` blocks (lines 131/152/247 on `main`) given
+  a `Logger.log(…, 'debug')` so the no-empty-catch lint stops flagging them. Behaviour unchanged.
+- `pushReadList` keeps a high branch count: it is PLAN's six numbered steps plus the retry path, and
+  splitting it would scatter the ordering guarantees that are the point of the function.
+
+### Test-count note
+
+The task brief stated a `main` baseline of "≥ 2384". Measured, this branch's pre-existing baseline is
+**2222** (`2358 + 2 skipped` measured now, minus the **138** cases this phase adds), which matches
+`HANDOFF.md`'s recorded post-Phase-3 figure exactly. The 2384 figure could not be reproduced from the
+tree and is treated as a miscount; `HANDOFF.md` is believed over it.

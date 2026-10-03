@@ -99,6 +99,8 @@ function makeDb(row = stateRow(), komgaLibraries: any[] = [KOMGA_LIB_ROW]) {
         issue: { findMany: vi.fn(async () => []) },
         komgaBookLink: { findMany: vi.fn(async () => []), create: vi.fn(async () => ({})), update: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) },
         komgaSeriesLink: { findMany: vi.fn(async () => []), create: vi.fn(async () => ({})), update: vi.fn(async () => ({})), delete: vi.fn(async () => ({})) },
+        // Phase 4 stage. No synced lists by default: the read-list pass has nothing to push.
+        readingList: { findMany: vi.fn(async () => []) },
         $transaction: vi.fn(async (ops: any[]) => { for (const op of ops) await op; return ops; }),
     };
     return { db, row, writes };
@@ -121,8 +123,8 @@ afterEach(async () => {
 });
 
 describe('the stage list', () => {
-    it('is ordered start → preIdle → scan → settle → reconcile → verify', () => {
-        expect(SYNC_STEPS.map(s => s.stage)).toEqual(['start', 'preIdle', 'scan', 'settle', 'reconcile', 'verify']);
+    it('is ordered start → preIdle → scan → settle → reconcile → verify → readlists', () => {
+        expect(SYNC_STEPS.map(s => s.stage)).toEqual(['start', 'preIdle', 'scan', 'settle', 'reconcile', 'verify', 'readlists']);
     });
 
     it('ends every stage in a declared StepResult', () => {
@@ -534,6 +536,51 @@ describe('runLibrarySync: the Phase 3 stages', () => {
         expect(db.komgaSyncState.updateMany).toHaveBeenCalledWith(
             expect.objectContaining({ data: expect.objectContaining({ lastSyncCompletedAt: expect.any(Date) }) }),
         );
+    });
+});
+
+describe('runLibrarySync: the Phase 4 read-list stage', () => {
+    const settledFake = async () => startFakeKomga({
+        state: {
+            libraries: [makeKomgaLibrary({ id: K_L, root: '/komga/manga' })],
+            taskQueueFrames: [{ count: 0, countByType: {} }],
+        },
+    });
+
+    it('runs after verify and still ends with the lease released', async () => {
+        fake = await settledFake();
+        const { db, writes } = makeDb();
+        const result = await runLibrarySync(
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        expect(result).toEqual({ done: true });
+        // The read-list pass must not re-take the lease verify released.
+        expect(writes.at(-1).syncLeaseUntil).toBeNull();
+    });
+
+    it('selects only synced lists that have an entry under this library', async () => {
+        fake = await settledFake();
+        const { db } = makeDb();
+        db.readingList.findMany = vi.fn(async () => [{ id: 'rl-1' }]);
+        await runLibrarySync(
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        expect(db.readingList.findMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ komgaSync: true }),
+        }));
+    });
+
+    it('never fails the pipeline when the read-list pass throws', async () => {
+        fake = await settledFake();
+        const { db } = makeDb();
+        db.readingList.findMany = vi.fn(async () => { throw new Error('db exploded'); });
+        const result = await runLibrarySync(
+            { omnibusLibraryId: OMNIBUS_LIB, stage: 'settle', komgaLibraryIds: [K_L], scanRequestedAt: Date.now(), settleStartedAt: Date.now() },
+            { db, client: await clientFor(fake), settings: SETTINGS, enqueue: vi.fn() },
+        );
+        expect(result).toEqual({ done: true });
     });
 });
 

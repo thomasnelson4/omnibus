@@ -27,6 +27,7 @@ import { getErrorMessage } from "@/lib/utils/error"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { ReadingListItemMatchDialog } from "@/components/reading-list-item-match-dialog"
+import ReadingListKomgaSync from "@/components/reading-list-komga-sync"
 import {
     isMatchProvider, providerIssueUrl, providerLabel, providerShortLabel, isDownloaded, readingListItemLabel, linkedIssueRequest
 } from "@/lib/utils/reading-list-match"
@@ -128,7 +129,10 @@ function ReadingListsContent() {
                       setCblListName(nameNode.textContent.trim());
                   }
               }
-          } catch (e) {} 
+          } catch (e) {
+              // Best-effort list-name guess from the CBL URL; a failure just leaves the field empty.
+              Logger.log(`[Reading Lists] could not prefill the CBL list name: ${getErrorMessage(e)}`, 'debug');
+          }
       };
       const timer = setTimeout(fetchCblName, 600); 
       return () => clearTimeout(timer);
@@ -149,7 +153,10 @@ function ReadingListsContent() {
                       setCblListName(nameNode.textContent.trim());
                   }
               }
-          } catch (err) {}
+          } catch (err) {
+              // A CBL with no readable <Name> leaves the field as-is; not worth a toast.
+              Logger.log(`[Reading Lists] could not read the CBL list name: ${getErrorMessage(err)}`, 'debug');
+          }
       };
       reader.readAsText(cblFile);
   }, [cblFile]);
@@ -244,7 +251,10 @@ function ReadingListsContent() {
 
     const savedRequests = localStorage.getItem('omnibus_requested_issues');
     if (savedRequests) {
-        try { setRequestedIds(new Set(JSON.parse(savedRequests))); } catch (e) {}
+        try { setRequestedIds(new Set(JSON.parse(savedRequests))); } catch (e) {
+            // Corrupt or hand-edited localStorage: start from an empty set rather than crash on mount.
+            Logger.log(`[Reading Lists] could not restore requested issues: ${getErrorMessage(e)}`, 'debug');
+        }
     }
   }, [paramId])
 
@@ -990,6 +1000,9 @@ function ReadingListsContent() {
                               <CardDescription className="text-primary/80 leading-relaxed text-sm sm:text-base break-words whitespace-normal w-full mt-2">
                                   {activeList.description}
                               </CardDescription>
+                          )}
+                          {isAdmin && (
+                              <ReadingListKomgaSync listId={activeList.id} totalItems={activeList.items.length} />
                           )}
                       </CardHeader>
                   </Card>

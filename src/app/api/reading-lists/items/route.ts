@@ -12,6 +12,7 @@ import { linkAccessForList, findLocalIssueForMatch } from '@/lib/reading-list-li
 import {
   isMatchProvider, parseProviderIssueId, buildReadingListItemTitle, libraryCannotContradict, type MatchProvider,
 } from '@/lib/utils/reading-list-match';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 
 export async function POST(request: Request) {
   try {
@@ -51,6 +52,7 @@ export async function POST(request: Request) {
           await prisma.readingListItem.create({
               data: { listId, issueId, order: nextOrder, title: "" }
           });
+          triggerReadListPushSoon(listId);
           return NextResponse.json({ success: true, message: `Added issue to reading list.` });
       } else {
           // Add all issues from one or more series (filtered to libraries the user can access)
@@ -75,6 +77,7 @@ export async function POST(request: Request) {
 
           if (itemsData.length > 0) {
               await prisma.readingListItem.createMany({ data: itemsData });
+              triggerReadListPushSoon(listId);
           }
 
           return NextResponse.json({ success: true, message: `Added ${itemsData.length} issues to reading list.` });
@@ -100,6 +103,7 @@ export async function POST(request: Request) {
             where: { listId, issueId: { in: issueIds } }
           });
       }
+      triggerReadListPushSoon(listId);
       return NextResponse.json({ success: true, message: 'Removed from reading list' });
     }
 
@@ -138,6 +142,10 @@ export async function PUT(request: Request) {
             )
         );
   
+        // Komga: a reorder changes the book order of the pushed list, which is exactly what
+        // `bookIds` encodes. Debounced, and only for lists with komgaSync.
+        triggerReadListPushSoon(listId);
+
         return NextResponse.json({ success: true, message: 'List reordered successfully' });
   
     } catch (error: unknown) {
@@ -225,6 +233,9 @@ export async function PATCH(request: Request) {
             await AuditLogger.log('REMATCH_READING_LIST_ITEM', {
                 listId, itemId, provider, providerIssueId, link, linkedIssueId: issueId, previous,
             }, userId);
+            // A rematch can move an entry to (or off) a downloaded, scannable issue, so it changes
+            // what Komga should hold for this list.
+            triggerReadListPushSoon(listId);
             return NextResponse.json({
                 success: true, item: updated, link, linked: !!updated?.issueId, hasFile: !!updated?.issue?.filePath?.trim(), match,
             });
@@ -240,6 +251,7 @@ export async function PATCH(request: Request) {
         const updated = await prisma.readingListItem.findFirst(itemQuery);
 
         await AuditLogger.log('CLEAR_READING_LIST_ITEM_MATCH', { listId, itemId, previous }, userId);
+        triggerReadListPushSoon(listId);
         return NextResponse.json({ success: true, item: updated });
 
     } catch (error: unknown) {

@@ -7,6 +7,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { XMLParser } from 'fast-xml-parser';
 import { assertSafeFetchUrl } from '@/lib/utils/ssrf';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 
 export const dynamic = 'force-dynamic';
 
@@ -155,6 +156,7 @@ export async function POST(request: Request) {
         }));
 
         await prisma.readingListItem.createMany({ data: itemsData });
+        triggerReadListPushSoon(newList.id);
 
         return NextResponse.json({ 
             success: true, 

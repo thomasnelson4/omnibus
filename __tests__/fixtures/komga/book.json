@@ -1,0 +1,54 @@
+{
+  "id": "0RT153YNBXQWF",
+  "seriesId": "0RT153YNBXQWD",
+  "seriesTitle": "Alpha Squad",
+  "libraryId": "0RT153YK7XXMX",
+  "name": "Alpha Squad 001 (2020)",
+  "url": "/private/tmp/claude-502/-Users-thomas-orca-workspaces-omnibus-komga-integration/0dac9aa8-c899-4db0-884e-fbfb7f0c78d3/scratchpad/komga-live/library/live-a/Alpha Squad (2020)/Alpha Squad 001 (2020).cbz",
+  "number": 1,
+  "created": "2026-10-02T23:38:03Z",
+  "lastModified": "2026-10-02T23:38:04Z",
+  "fileLastModified": "2026-10-02T23:37:45Z",
+  "sizeBytes": 665,
+  "size": "665 B",
+  "media": {
+    "status": "READY",
+    "mediaType": "application/zip",
+    "pagesCount": 2,
+    "comment": "",
+    "epubDivinaCompatible": false,
+    "epubIsKepub": false,
+    "mediaProfile": "DIVINA"
+  },
+  "metadata": {
+    "title": "Alpha Squad part 1",
+    "titleLock": false,
+    "summary": "",
+    "summaryLock": false,
+    "number": "1",
+    "numberLock": false,
+    "numberSort": 1,
+    "numberSortLock": false,
+    "releaseDate": "2020-01-01",
+    "releaseDateLock": false,
+    "authors": [],
+    "authorsLock": false,
+    "tags": [],
+    "tagsLock": false,
+    "isbn": "",
+    "isbnLock": false,
+    "links": [
+      {
+        "label": "comicvine.gamespot.com",
+        "url": "https://comicvine.gamespot.com/x/4000-100101/"
+      }
+    ],
+    "linksLock": false,
+    "created": "2026-10-02T23:38:03Z",
+    "lastModified": "2026-10-02T23:38:04Z"
+  },
+  "readProgress": null,
+  "deleted": false,
+  "fileHash": "676b9032ce902e93b16dde676788e515",
+  "oneshot": false
+}

@@ -1,0 +1,16 @@
+{
+  "id": "0RT14KXEZXM3B",
+  "email": "admin@omnibus.local",
+  "roles": [
+    "ADMIN",
+    "FILE_DOWNLOAD",
+    "KOBO_SYNC",
+    "KOREADER_SYNC",
+    "PAGE_STREAMING",
+    "USER"
+  ],
+  "sharedAllLibraries": true,
+  "sharedLibrariesIds": [],
+  "labelsAllow": [],
+  "labelsExclude": []
+}

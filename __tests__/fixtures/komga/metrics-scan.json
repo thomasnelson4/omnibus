@@ -1,0 +1,19 @@
+{
+  "name": "komga.tasks.execution",
+  "baseUnit": "seconds",
+  "measurements": [
+    {
+      "statistic": "COUNT",
+      "value": 11
+    },
+    {
+      "statistic": "TOTAL_TIME",
+      "value": 5.89426679
+    },
+    {
+      "statistic": "MAX",
+      "value": 2.827510541
+    }
+  ],
+  "availableTags": []
+}

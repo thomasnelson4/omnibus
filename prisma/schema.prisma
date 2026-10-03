@@ -122,6 +122,7 @@ model Library {
 
   series    Series[]
   userAccess UserLibraryAccess[]
+  komgaSyncState KomgaSyncState?
 }
 
 // Per-user library grants. A non-admin user sees only libraries they have a row for (absence = no access).
@@ -215,6 +216,7 @@ model Series {
   issueReports    IssueReport[]
   reviews         Review[]
   readerPreferences ReaderPreference[]
+  komgaSeriesLink KomgaSeriesLink?
 
   libraryId       String?
   library         Library? @relation(fields: [libraryId], references: [id], onDelete: SetNull)
@@ -303,6 +305,7 @@ model Issue {
   readingListItems ReadingListItem[]
   bookmarks       Bookmark[]
   dailyIssueReads DailyIssueRead[]
+  komgaBookLink   KomgaBookLink?
 
   @@index([seriesId])
   @@index([metadataId])
@@ -605,6 +608,8 @@ model ReadingList {
   updatedAt   DateTime          @updatedAt
   shareId     String?           @unique
   isGlobal    Boolean           @default(false)
+  komgaSync   Boolean           @default(false) // admin opt-in: push this list to Komga (src/lib/komga)
+  komgaReadListLink KomgaReadListLink?
 
   @@index([userId])
 }
@@ -754,4 +759,90 @@ model DigestHistory {
   sentAt    DateTime @default(now())
 
   @@unique([seriesId, issueNum])
+}
+
+// ---------------------------------------------------------------------------------------------
+// Komga integration (src/lib/komga, docs/KOMGA.md). Every Komga* table is a rebuildable cache or
+// ledger owned by Node — the engine never writes them, and backups deliberately skip them. JSON
+// payloads are plain strings (no Json/enum types: the schema must stay SQLite + Postgres safe).
+// ---------------------------------------------------------------------------------------------
+
+// Cache of Komga's libraries, refreshed whenever listLibraries succeeds (test, sync, reconcile).
+model KomgaLibrary {
+  komgaLibraryId   String   @id
+  name             String
+  root             String // Komga-side path
+  translatedRoot   String? // root mapped to Omnibus paths (null = no mapping covers it)
+  omnibusLibraryId String? // best-matching Omnibus Library.id (null = unmapped)
+  settings         String // JSON string of the LibraryDto flags used for warnings and scannability
+  unavailable      Boolean  @default(false)
+  lastSeenAt       DateTime
+}
+
+// Dirty/lease state per *Omnibus* library for the debounced scan trigger.
+model KomgaSyncState {
+  omnibusLibraryId    String    @id
+  library             Library   @relation(fields: [omnibusLibraryId], references: [id], onDelete: Cascade)
+  dirtySince          DateTime?
+  lastChangeAt        DateTime?
+  pendingPaths        String? // JSON string array, de-duplicated, <= 200
+  pendingOverflow     Boolean   @default(false)
+  lastScanRequestedAt DateTime?
+  lastSyncCompletedAt DateTime?
+  lastReconciledAt    DateTime?
+  syncLeaseUntil      DateTime?
+  nextEligibleAt      DateTime?
+  retryCount          Int       @default(0)
+  consecutiveFailures Int       @default(0)
+  lastError           String?
+  updatedAt           DateTime  @updatedAt
+}
+
+// Identity map: Omnibus Issue <-> Komga book. Valid while omnibusPath === Issue.filePath.
+model KomgaBookLink {
+  id             String   @id @default(cuid())
+  issueId        String   @unique
+  issue          Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  komgaBookId    String   @unique
+  komgaSeriesId  String
+  komgaLibraryId String
+  omnibusPath    String // Issue.filePath when matched (validity check)
+  komgaPath      String
+  matchedBy      String // PATH | LINK
+  missCount      Int      @default(0)
+  verifiedAt     DateTime
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([komgaLibraryId])
+}
+
+// Identity map: Omnibus Series <-> Komga series (majority komgaSeriesId of the linked books).
+model KomgaSeriesLink {
+  id             String   @id @default(cuid())
+  seriesId       String   @unique
+  series         Series   @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  komgaSeriesId  String
+  komgaLibraryId String
+  verifiedAt     DateTime
+
+  @@index([komgaLibraryId])
+}
+
+// Push ledger for a reading list mirrored to Komga (ReadingList.komgaSync).
+model KomgaReadListLink {
+  id                String      @id @default(cuid())
+  readingListId     String      @unique
+  readingList       ReadingList @relation(fields: [readingListId], references: [id], onDelete: Cascade)
+  komgaReadListId   String?
+  lastPushedName    String?
+  lastPushedSummary String?
+  lastPushedBookIds String? // JSON string array
+  lastPushedAt      DateTime?
+  status            String      @default("pending") // pending | synced | waiting | error
+  pushedCount       Int         @default(0)
+  skippedCount      Int         @default(0)
+  skippedSummary    String? // JSON string
+  lastError         String?
+  updatedAt         DateTime    @updatedAt
 }

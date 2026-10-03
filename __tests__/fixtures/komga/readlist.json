@@ -1,0 +1,14 @@
+{
+  "id": "0RT15EJXKXV79",
+  "name": "RL Valid",
+  "summary": "omnibus test",
+  "ordered": true,
+  "bookIds": [
+    "0RT153YNBXQWE",
+    "0RT153YNBXQWF",
+    "0RT153YNBXQWG"
+  ],
+  "createdDate": "2026-10-02T23:39:30Z",
+  "lastModifiedDate": "2026-10-02T23:39:30Z",
+  "filtered": false
+}

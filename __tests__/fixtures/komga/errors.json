@@ -1,0 +1,212 @@
+{
+  "createWithUnknownBookId": {
+    "request": "POST /api/v1/readlists {name:\"RL Unknown\", bookIds:[valid, UNKNOWN, valid]}",
+    "status": 500,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.916+00:00",
+      "status": 500,
+      "error": "Internal Server Error",
+      "message": "SQL [insert into READLIST_BOOK (READLIST_ID, BOOK_ID, NUMBER) values (?, ?, ?)]; [SQLITE_CONSTRAINT_FOREIGNKEY] A foreign key constraint failed (FOREIGN KEY constraint failed)",
+      "path": "/api/v1/readlists"
+    }
+  },
+  "patchWithUnknownBookId": {
+    "request": "PATCH /api/v1/readlists/{id} {bookIds:[b4, UNKNOWN]}",
+    "status": 500,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.941+00:00",
+      "status": 500,
+      "error": "Internal Server Error",
+      "message": "SQL [insert into READLIST_BOOK (READLIST_ID, BOOK_ID, NUMBER) values (?, ?, ?)]; [SQLITE_CONSTRAINT_FOREIGNKEY] A foreign key constraint failed (FOREIGN KEY constraint failed)",
+      "path": "/api/v1/readlists/0RT15EJXKXV79"
+    }
+  },
+  "patchNameAndUnknownBookId": {
+    "request": "PATCH /api/v1/readlists/{id} {name:\"RL Renamed\", bookIds:[UNKNOWN]}",
+    "status": 500,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.950+00:00",
+      "status": 500,
+      "error": "Internal Server Error",
+      "message": "SQL [insert into READLIST_BOOK (READLIST_ID, BOOK_ID, NUMBER) values (?, ?, ?)]; [SQLITE_CONSTRAINT_FOREIGNKEY] A foreign key constraint failed (FOREIGN KEY constraint failed)",
+      "path": "/api/v1/readlists/0RT15EJXKXV79"
+    }
+  },
+  "patchUnknownReadList": {
+    "request": "PATCH /api/v1/readlists/UNKNOWN {bookIds:[b1]}",
+    "status": 404,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.956+00:00",
+      "status": 404,
+      "error": "Not Found",
+      "message": "404 NOT_FOUND",
+      "path": "/api/v1/readlists/0ZZZZZZZZZZZZ"
+    }
+  },
+  "getUnknownReadList": {
+    "request": "GET /api/v1/readlists/UNKNOWN",
+    "status": 404,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.959+00:00",
+      "status": 404,
+      "error": "Not Found",
+      "message": "404 NOT_FOUND",
+      "path": "/api/v1/readlists/0ZZZZZZZZZZZZ"
+    }
+  },
+  "createEmptyBookIds": {
+    "request": "POST /api/v1/readlists {name:\"RL Empty\", bookIds:[]}",
+    "status": 400,
+    "body": {
+      "violations": [
+        {
+          "fieldName": "bookIds",
+          "message": "must not be empty"
+        }
+      ]
+    }
+  },
+  "createDuplicateNameSameCase": {
+    "request": "POST /api/v1/readlists {name:\"RL Valid\" (exists), bookIds:[b1]}",
+    "status": 400,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.980+00:00",
+      "status": 400,
+      "error": "Bad Request",
+      "message": "Read list name already exists",
+      "path": "/api/v1/readlists"
+    }
+  },
+  "createDuplicateNameDifferentCase": {
+    "request": "POST /api/v1/readlists {name:\"rl valid\", bookIds:[b1]}",
+    "status": 400,
+    "body": {
+      "timestamp": "2026-10-02T23:39:30.984+00:00",
+      "status": 400,
+      "error": "Bad Request",
+      "message": "Read list name already exists",
+      "path": "/api/v1/readlists"
+    }
+  },
+  "createDuplicateNameTrailingSpace": {
+    "request": "POST /api/v1/readlists {name:\"RL Valid \" (trailing space), bookIds:[b1]}",
+    "status": 200,
+    "body": {
+      "id": "0RT15EK5FXW1Y",
+      "name": "RL Valid ",
+      "summary": "",
+      "ordered": true,
+      "bookIds": [
+        "0RT153YNBXQWF"
+      ],
+      "createdDate": "2026-10-02T23:39:30Z",
+      "lastModifiedDate": "2026-10-02T23:39:30Z",
+      "filtered": false
+    }
+  },
+  "createDuplicateBookIds": {
+    "request": "POST /api/v1/readlists {name:\"RL Dup Ids\", bookIds:[b1,b2,b1]}",
+    "status": 400,
+    "body": {
+      "violations": [
+        {
+          "fieldName": "bookIds",
+          "message": "must only contain unique elements"
+        }
+      ]
+    }
+  },
+  "createBlankName": {
+    "request": "POST /api/v1/readlists {name:\"\", bookIds:[b1]}",
+    "status": 400,
+    "body": {
+      "violations": [
+        {
+          "fieldName": "name",
+          "message": "must not be blank"
+        }
+      ]
+    }
+  },
+  "createMissingSummaryOrdered": {
+    "request": "POST /api/v1/readlists {name, bookIds} (no summary/ordered)",
+    "status": 200,
+    "body": {
+      "id": "0RT15EK6QXTF7",
+      "name": "RL Missing Fields",
+      "summary": "",
+      "ordered": true,
+      "bookIds": [
+        "0RT153YNBXQWF"
+      ],
+      "createdDate": "2026-10-02T23:39:30Z",
+      "lastModifiedDate": "2026-10-02T23:39:30Z",
+      "filtered": false
+    }
+  },
+  "patchRenameToExistingNameDifferentCase": {
+    "request": "PATCH /api/v1/readlists/{other} {name:\"RL VALID\"} (collides with \"RL Valid\")",
+    "status": 400,
+    "body": {
+      "timestamp": "2026-10-02T23:39:31.003+00:00",
+      "status": 400,
+      "error": "Bad Request",
+      "message": "Read list name already exists",
+      "path": "/api/v1/readlists/0RT15EK73XRY2"
+    }
+  },
+  "patchRenameSelfCaseOnly": {
+    "request": "PATCH /api/v1/readlists/{self} {name:\"rl valid\"} (case change of own name)",
+    "status": 204,
+    "body": null
+  },
+  "patchEmptyBookIds": {
+    "request": "PATCH /api/v1/readlists/{id} {bookIds:[]}",
+    "status": 400,
+    "body": {
+      "violations": [
+        {
+          "fieldName": "bookIds",
+          "message": "must be null"
+        },
+        {
+          "fieldName": "bookIds",
+          "message": "must not be empty"
+        }
+      ]
+    }
+  },
+  "patchDuplicateBookIds": {
+    "request": "PATCH /api/v1/readlists/{id} {bookIds:[b2,b2]}",
+    "status": 400,
+    "body": {
+      "violations": [
+        {
+          "fieldName": "bookIds",
+          "message": "must only contain unique elements"
+        }
+      ]
+    }
+  },
+  "patchOk": {
+    "request": "PATCH /api/v1/readlists/{id} {bookIds:[b5,b4,b1]}",
+    "status": 204,
+    "body": null
+  },
+  "deleteOk": {
+    "request": "DELETE /api/v1/readlists/{other}",
+    "status": 204,
+    "body": null
+  },
+  "deleteAgain": {
+    "request": "DELETE /api/v1/readlists/{other} (already deleted)",
+    "status": 404,
+    "body": {
+      "timestamp": "2026-10-02T23:39:31.048+00:00",
+      "status": 404,
+      "error": "Not Found",
+      "message": "404 NOT_FOUND",
+      "path": "/api/v1/readlists/0RT15EK73XRY2"
+    }
+  }
+}

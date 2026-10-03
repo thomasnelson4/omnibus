@@ -1,0 +1,299 @@
+{
+  "content": [
+    {
+      "id": "0RT153YNBXQWF",
+      "seriesId": "0RT153YNBXQWD",
+      "seriesTitle": "Alpha Squad",
+      "libraryId": "0RT153YK7XXMX",
+      "name": "Alpha Squad 001 (2020)",
+      "url": "/private/tmp/claude-502/-Users-thomas-orca-workspaces-omnibus-komga-integration/0dac9aa8-c899-4db0-884e-fbfb7f0c78d3/scratchpad/komga-live/library/live-a/Alpha Squad (2020)/Alpha Squad 001 (2020).cbz",
+      "number": 1,
+      "created": "2026-10-02T23:38:03Z",
+      "lastModified": "2026-10-02T23:38:04Z",
+      "fileLastModified": "2026-10-02T23:37:45Z",
+      "sizeBytes": 665,
+      "size": "665 B",
+      "media": {
+        "status": "READY",
+        "mediaType": "application/zip",
+        "pagesCount": 2,
+        "comment": "",
+        "epubDivinaCompatible": false,
+        "epubIsKepub": false,
+        "mediaProfile": "DIVINA"
+      },
+      "metadata": {
+        "title": "Alpha Squad part 1",
+        "titleLock": false,
+        "summary": "",
+        "summaryLock": false,
+        "number": "1",
+        "numberLock": false,
+        "numberSort": 1,
+        "numberSortLock": false,
+        "releaseDate": "2020-01-01",
+        "releaseDateLock": false,
+        "authors": [],
+        "authorsLock": false,
+        "tags": [],
+        "tagsLock": false,
+        "isbn": "",
+        "isbnLock": false,
+        "links": [
+          {
+            "label": "comicvine.gamespot.com",
+            "url": "https://comicvine.gamespot.com/x/4000-100101/"
+          }
+        ],
+        "linksLock": false,
+        "created": "2026-10-02T23:38:03Z",
+        "lastModified": "2026-10-02T23:38:04Z"
+      },
+      "readProgress": null,
+      "deleted": false,
+      "fileHash": "676b9032ce902e93b16dde676788e515",
+      "oneshot": false
+    },
+    {
+      "id": "0RT153YNBXQWG",
+      "seriesId": "0RT153YNBXQWD",
+      "seriesTitle": "Alpha Squad",
+      "libraryId": "0RT153YK7XXMX",
+      "name": "Alpha Squad 002 (2020)",
+      "url": "/private/tmp/claude-502/-Users-thomas-orca-workspaces-omnibus-komga-integration/0dac9aa8-c899-4db0-884e-fbfb7f0c78d3/scratchpad/komga-live/library/live-a/Alpha Squad (2020)/Alpha Squad 002 (2020).cbz",
+      "number": 2,
+      "created": "2026-10-02T23:38:03Z",
+      "lastModified": "2026-10-02T23:38:04Z",
+      "fileLastModified": "2026-10-02T23:37:45Z",
+      "sizeBytes": 662,
+      "size": "662 B",
+      "media": {
+        "status": "READY",
+        "mediaType": "application/zip",
+        "pagesCount": 2,
+        "comment": "",
+        "epubDivinaCompatible": false,
+        "epubIsKepub": false,
+        "mediaProfile": "DIVINA"
+      },
+      "metadata": {
+        "title": "Alpha Squad part 2",
+        "titleLock": false,
+        "summary": "",
+        "summaryLock": false,
+        "number": "2",
+        "numberLock": false,
+        "numberSort": 2,
+        "numberSortLock": false,
+        "releaseDate": "2020-01-01",
+        "releaseDateLock": false,
+        "authors": [],
+        "authorsLock": false,
+        "tags": [],
+        "tagsLock": false,
+        "isbn": "",
+        "isbnLock": false,
+        "links": [
+          {
+            "label": "comicvine.gamespot.com",
+            "url": "https://comicvine.gamespot.com/x/4000-100102/"
+          }
+        ],
+        "linksLock": false,
+        "created": "2026-10-02T23:38:03Z",
+        "lastModified": "2026-10-02T23:38:04Z"
+      },
+      "readProgress": null,
+      "deleted": false,
+      "fileHash": "90547df34676ddb43488b16f0a5c5c14",
+      "oneshot": false
+    },
+    {
+      "id": "0RT153YNBXQWE",
+      "seriesId": "0RT153YNBXQWD",
+      "seriesTitle": "Alpha Squad",
+      "libraryId": "0RT153YK7XXMX",
+      "name": "Alpha Squad 003 (2020)",
+      "url": "/private/tmp/claude-502/-Users-thomas-orca-workspaces-omnibus-komga-integration/0dac9aa8-c899-4db0-884e-fbfb7f0c78d3/scratchpad/komga-live/library/live-a/Alpha Squad (2020)/Alpha Squad 003 (2020).cbz",
+      "number": 3,
+      "created": "2026-10-02T23:38:03Z",
+      "lastModified": "2026-10-02T23:38:04Z",
+      "fileLastModified": "2026-10-02T23:37:45Z",
+      "sizeBytes": 663,
+      "size": "663 B",
+      "media": {
+        "status": "READY",
+        "mediaType": "application/zip",
+        "pagesCount": 2,
+        "comment": "",
+        "epubDivinaCompatible": false,
+        "epubIsKepub": false,
+        "mediaProfile": "DIVINA"
+      },
+      "metadata": {
+        "title": "Alpha Squad part 3",
+        "titleLock": false,
+        "summary": "",
+        "summaryLock": false,
+        "number": "3",
+        "numberLock": false,
+        "numberSort": 3,
+        "numberSortLock": false,
+        "releaseDate": "2020-01-01",
+        "releaseDateLock": false,
+        "authors": [],
+        "authorsLock": false,
+        "tags": [],
+        "tagsLock": false,
+        "isbn": "",
+        "isbnLock": false,
+        "links": [
+          {
+            "label": "comicvine.gamespot.com",
+            "url": "https://comicvine.gamespot.com/x/4000-100103/"
+          }
+        ],
+        "linksLock": false,
+        "created": "2026-10-02T23:38:03Z",
+        "lastModified": "2026-10-02T23:38:04Z"
+      },
+      "readProgress": null,
+      "deleted": false,
+      "fileHash": "7dd9301ba2e42e63a67d3c45cbd131db",
+      "oneshot": false
+    },
+    {
+      "id": "0RT153YNBXQWB",
+      "seriesId": "0RT153YN7XPBJ",
+      "seriesTitle": "Beta Force",
+      "libraryId": "0RT153YK7XXMX",
+      "name": "Beta Force 001 (2021)",
+      "url": "/private/tmp/claude-502/-Users-thomas-orca-workspaces-omnibus-komga-integration/0dac9aa8-c899-4db0-884e-fbfb7f0c78d3/scratchpad/komga-live/library/live-a/Beta Force (2021)/Beta Force 001 (2021).cbz",
+      "number": 1,
+      "created": "2026-10-02T23:38:03Z",
+      "lastModified": "2026-10-02T23:38:04Z",
+      "fileLastModified": "2026-10-02T23:37:45Z",
+      "sizeBytes": 663,
+      "size": "663 B",
+      "media": {
+        "status": "READY",
+        "mediaType": "application/zip",
+        "pagesCount": 2,
+        "comment": "",
+        "epubDivinaCompatible": false,
+        "epubIsKepub": false,
+        "mediaProfile": "DIVINA"
+      },
+      "metadata": {
+        "title": "Beta Force part 1",
+        "titleLock": false,
+        "summary": "",
+        "summaryLock": false,
+        "number": "1",
+        "numberLock": false,
+        "numberSort": 1,
+        "numberSortLock": false,
+        "releaseDate": "2021-01-01",
+        "releaseDateLock": false,
+        "authors": [],
+        "authorsLock": false,
+        "tags": [],
+        "tagsLock": false,
+        "isbn": "",
+        "isbnLock": false,
+        "links": [
+          {
+            "label": "comicvine.gamespot.com",
+            "url": "https://comicvine.gamespot.com/x/4000-100201/"
+          }
+        ],
+        "linksLock": false,
+        "created": "2026-10-02T23:38:03Z",
+        "lastModified": "2026-10-02T23:38:04Z"
+      },
+      "readProgress": null,
+      "deleted": false,
+      "fileHash": "2dc56ec817c0b14a26c75d1a711e9815",
+      "oneshot": false
+    },
+    {
+      "id": "0RT153YN7XPBK",
+      "seriesId": "0RT153YN7XPBJ",
+      "seriesTitle": "Beta Force",
+      "libraryId": "0RT153YK7XXMX",
+      "name": "Beta Force 002 (2021)",
+      "url": "/private/tmp/claude-502/-Users-thomas-orca-workspaces-omnibus-komga-integration/0dac9aa8-c899-4db0-884e-fbfb7f0c78d3/scratchpad/komga-live/library/live-a/Beta Force (2021)/Beta Force 002 (2021).cbz",
+      "number": 2,
+      "created": "2026-10-02T23:38:03Z",
+      "lastModified": "2026-10-02T23:38:04Z",
+      "fileLastModified": "2026-10-02T23:37:45Z",
+      "sizeBytes": 661,
+      "size": "661 B",
+      "media": {
+        "status": "READY",
+        "mediaType": "application/zip",
+        "pagesCount": 2,
+        "comment": "",
+        "epubDivinaCompatible": false,
+        "epubIsKepub": false,
+        "mediaProfile": "DIVINA"
+      },
+      "metadata": {
+        "title": "Beta Force part 2",
+        "titleLock": false,
+        "summary": "",
+        "summaryLock": false,
+        "number": "2",
+        "numberLock": false,
+        "numberSort": 2,
+        "numberSortLock": false,
+        "releaseDate": "2021-01-01",
+        "releaseDateLock": false,
+        "authors": [],
+        "authorsLock": false,
+        "tags": [],
+        "tagsLock": false,
+        "isbn": "",
+        "isbnLock": false,
+        "links": [
+          {
+            "label": "comicvine.gamespot.com",
+            "url": "https://comicvine.gamespot.com/x/4000-100202/"
+          }
+        ],
+        "linksLock": false,
+        "created": "2026-10-02T23:38:03Z",
+        "lastModified": "2026-10-02T23:38:04Z"
+      },
+      "readProgress": null,
+      "deleted": false,
+      "fileHash": "32fcefd22a8b49c272e41ef0fe91ed36",
+      "oneshot": false
+    }
+  ],
+  "pageable": {
+    "pageNumber": 0,
+    "pageSize": 5,
+    "sort": {
+      "empty": false,
+      "unsorted": false,
+      "sorted": true
+    },
+    "offset": 0,
+    "paged": true,
+    "unpaged": false
+  },
+  "totalPages": 2,
+  "totalElements": 9,
+  "last": false,
+  "size": 5,
+  "number": 0,
+  "sort": {
+    "empty": false,
+    "unsorted": false,
+    "sorted": true
+  },
+  "first": true,
+  "numberOfElements": 5,
+  "empty": false
+}

@@ -33,6 +33,7 @@ import { mergePendingPaths } from './changes';
 import { isBookLinkValid } from './reconcile';
 import {
     KOMGA_OVERFLOW_STAT_LIMIT,
+    KOMGA_VERIFY_GIVEUP_PREFIX,
     KOMGA_VERIFY_MAX_RETRIES,
     KOMGA_VERIFY_MTIME_SLACK_MS,
 } from './constants';
@@ -247,7 +248,7 @@ export async function verifyLibrary(omnibusLibraryId: string, deps: VerifyDeps):
                 status: 'COMPLETED_WITH_ERRORS',
                 relatedItem: omnibusLibraryId,
                 durationMs: null,
-                message: `Komga did not pick up ${missed.length} path(s) after ${KOMGA_VERIFY_MAX_RETRIES} verification retries; giving up on: ${missed.slice(0, 20).join(', ')}${missed.length > 20 ? ` (+${missed.length - 20} more)` : ''}`.slice(0, 1000),
+                message: `${KOMGA_VERIFY_GIVEUP_PREFIX} ${missed.length} path(s) after ${KOMGA_VERIFY_MAX_RETRIES} verification retries; giving up on: ${missed.slice(0, 20).join(', ')}${missed.length > 20 ? ` (+${missed.length - 20} more)` : ''}`.slice(0, 1000),
             },
         }).catch((e: unknown) => log(`could not write the verification give-up JobLog: ${getErrorMessage(e)}`, 'warn'));
         await db.komgaSyncState.updateMany({

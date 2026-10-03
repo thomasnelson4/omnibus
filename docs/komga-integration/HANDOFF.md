@@ -53,13 +53,22 @@ table in §3 for what exists and what does not.
 
 ## 2. Verified gates (measured today, Node 22)
 
-| Gate | Phase 0 baseline (`BASELINE.md`) | After Phase 3 | Verdict |
-| --- | --- | --- | --- |
-| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | **220 files, 2358 passed / 2 skipped, 0 failed** | ✅ no regressions; +1263 vs baseline, +138 from Phase 4 |
-| `npx tsc --noEmit` | clean | **0 errors** | ✅ |
-| `npm run lint` | 2 errors, 2004 warnings | **0 errors, 2178 warnings** | ✅ |
-| `npx prisma validate` | — | **valid** | ✅ |
-| `npx next build` | — | **succeeds** | ✅ |
+| Gate | Phase 0 baseline (`BASELINE.md`) | After Phase 3 | After Phase 5 | Verdict |
+| --- | --- | --- | --- | --- |
+| `npx vitest run --pool=forks` | 171 files, 1095 passed / 2 skipped | 220 files, 2358 passed / 2 skipped, 0 failed | **221 files, 2392 passed / 2 skipped, 0 failed** | ✅ no regressions; +1297 vs baseline, +23 from Phase 5 |
+| `npx tsc --noEmit` | clean | 0 errors | **0 errors** | ✅ |
+| `npm run lint` | 2 errors, 2004 warnings | 0 errors, 2178 warnings | **0 errors, 2179 warnings** | ✅ |
+| `npx prisma validate` | — | valid | **not re-run** (schema untouched this phase) | n/a |
+| `npx next build` | — | succeeds | **succeeds** | ✅ |
+| `cargo clippy --all-targets -- -D warnings` | — | — | **clean** | ✅ |
+| `cargo test` | — | — | **319 passed, 0 failed** | ✅ |
+
+The `main` baseline this branch started from measures **2369 passed / 2 skipped**, exactly the
+"≥ 2369" figure the Phase 5 brief quotes; Phase 5 adds 23 (routing 12, health 9, worker 2).
+
+`next build` needs a `NEXTAUTH_SECRET` in the environment: without one the page-data worker aborts
+with `CRITICAL SECURITY ERROR: NEXTAUTH_SECRET is insecure or missing` **after** compilation
+succeeds, which looks like a build failure but is not one. Any throwaway value works.
 
 Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — there is no Redis here.
 
@@ -72,7 +81,7 @@ Harmless `ECONNREFUSED 127.0.0.1:6379` noise in test output is expected — ther
 | **2** | Change tracking + debounced scan trigger (req 1) | ✅ **complete, committed** |
 | **3** | Identity map + post-scan verification | ✅ **complete, committed** |
 | **4** | Reading-list push (req 2) | ✅ **complete, committed** |
-| **5** | Admin jobs, health, docs | ❌ not started |
+| **5** | Admin jobs, health, docs | ✅ **complete, committed** |
 
 ### Phase 1 — done
 
@@ -159,12 +168,29 @@ Two findings worth carrying forward:
 - **The delete job now also checks `marker.readingListId`**, not just the instance, so a re-import's
   push and its delete job cannot destroy the list the replacement adopted (D4.7).
 
-### Phases 5 — nothing exists
+### Phase 5 — complete
 
-Every remaining module is absent: `health.ts`, plus the admin jobs buttons and `docs/KOMGA.md`.
-The `health.ts` inputs it needs are already written by Phases 3 and 4 and nothing else writes them:
-`KomgaSyncState.lastError LIKE 'reconcile safety valve%'`, `lastReconciledAt` older than 48 h, and
-the verification give-up `JobLog` (`jobType: 'KOMGA_SCAN'` with a `Komga did not pick up` message).
+| File | Change |
+| --- | --- |
+| `../api/admin/jobs/trigger/route.ts` | a SECOND `komgaJobMap` (`komga_sync` → `KOMGA_SYNC`, `komga_rebuild_id_map` → `KOMGA_RECONCILE`, `komga_readlist_push` → `KOMGA_READLIST_PUSH`) and `runKomgaTrigger`, which reaches queue/libraries/readlist-trigger only through `await import` and never touches `omnibusQueue` |
+| `../../admin/jobs/page.tsx` | three Run-Now buttons in the house style, plus a read-only "integration is off" note linking to Settings → Media Servers (no new schedule, nothing new written on save) |
+| `health-checker.ts` | section 12, five `komga_*` entries, **DB-only** — three aggregate queries, no HTTP |
+| `constants.ts` | `KOMGA_VERIFY_GIVEUP_PREFIX` and `KOMGA_VALVE_ERROR_PREFIX`, so the writers and the health queries share one literal |
+| `verify.ts` / `reconcile.ts` | emit those two prefixes instead of inline string literals (no behaviour change) |
+| `worker.ts` | `KOMGA_READLIST_SYNC` JobLog — the only one of PLAN's three types that was missing |
+| `backup.rs`, `backup/route.ts`, `restore/route.ts` | one comment each. **No allowlist entry, no code change** |
+| `docs/KOMGA.md` | the user guide (new file) |
+
+3 new/extended test files: `admin-jobs-trigger-komga` 12, `health-checker` +9, `worker` +2.
+
+Two things the next phase should know:
+
+- **The Komga health section lives in `src/lib/health-checker.ts`, not a new `health.ts`.** PLAN's
+  wording suggested a module; putting it in the existing checker is what keeps the results in the
+  Admin → Health panel, which reads one `system_health_cache` setting written by one function.
+- **The health section is gated on `komga_enabled` AND wrapped in a try/catch.** A disabled
+  integration emits nothing and a missing table costs the panel zero entries — an optional media
+  server must never be able to degrade or break the whole check.
 
 **Do not "clean them up"** the Komga tables: all of them are now live.
 
@@ -230,9 +256,11 @@ read-only Komga reference checkout at `/Users/thomas/repos/sbx/omnibus-reference
    - The orphan sweep lives at the TOP of `runKomgaReconcile`, before the "nothing mapped" early
      return — moving it below silently disables it (D4.6).
    - `enqueueKomgaReadListDeleteNow` is intentionally non-blocking; do not make it `await` (D4.2).
-4. **Phase 5** — admin jobs, health check, `docs/KOMGA.md`. `health.ts` should read
-   `lastReconciledAt` staleness and the `reconcile safety valve` prefix in `lastError`, both of which
-   Phase 3 now writes and nothing else does.
+4. ~~**Phase 5**~~ — **done**, see §3. The health section went into `src/lib/health-checker.ts`
+   rather than a new `health.ts`, and it reads `lastReconciledAt` staleness, the
+   `reconcile safety valve` prefix in `lastError` and the verification give-up `JobLog` — all three
+   are now shared constants (`constants.ts`), so a future wording change cannot silently make the
+   queries match nothing.
 5. **End-to-end run** against PID 55968, then tear it down. Phase 3 has been validated against the
    live instance (paging, url shape, whole-second mtimes, provider-key uniqueness over 5000 real
    books — see `DEVIATIONS.md`), but the modules still run only against the fake.

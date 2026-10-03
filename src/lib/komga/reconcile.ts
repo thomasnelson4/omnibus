@@ -29,7 +29,7 @@ import type { KomgaBookDto, KomgaWebLinkDto } from './types';
 import type { KomgaSettings } from './settings';
 import { komgaLibraryRowToResolved, type ResolvedKomgaLibrary } from './libraries';
 import { isPathUnder, normalizeKomgaPath, toKomgaPath, toOmnibusPath } from './path-map';
-import { KOMGA_DB_CHUNK } from './constants';
+import { KOMGA_DB_CHUNK, KOMGA_VALVE_ERROR_PREFIX } from './constants';
 
 /**
  * The models reconcile touches, plus the root $transaction it writes through. sync.ts injects a
@@ -233,7 +233,7 @@ export async function reconcileLibrary(omnibusLibraryId: string, deps: Reconcile
     // lastReconciledAt only moves when the pass produced a trustworthy picture: a hard error (no
     // listing at all) must leave the timestamp alone so the health check can see the staleness.
     const lastError = valves.length > 0
-        ? `reconcile safety valve: ${valves[0]}`.slice(0, 500)
+        ? `${KOMGA_VALVE_ERROR_PREFIX}: ${valves[0]}`.slice(0, 500)
         : null;
     // A tripped valve means the map was NOT reconciled, so lastReconciledAt must not move: the
     // Phase 5 health check reads its staleness as "the map is out of date", which is exactly true.

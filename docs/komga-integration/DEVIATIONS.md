@@ -383,3 +383,79 @@ The task brief stated a `main` baseline of "≥ 2384". Measured, this branch's p
 **2222** (`2358 + 2 skipped` measured now, minus the **138** cases this phase adds), which matches
 `HANDOFF.md`'s recorded post-Phase-3 figure exactly. The 2384 figure could not be reproduced from the
 tree and is treated as a miscount; `HANDOFF.md` is believed over it.
+
+---
+
+## Phase 5 — admin jobs, health check, docs
+
+### D5.1 — the health section lives in `health-checker.ts`, not a new `health.ts`
+
+The plan called the deliverable a Komga health module. It is section 12 of the existing
+`runSystemHealthCheck` instead, because the Admin → Health panel renders exactly one
+`system_health_cache` setting that one function writes. A separate module would have had to be
+called from inside that function anyway, and would have duplicated the `HealthCheckResult` shape.
+The section is gated on `komga_enabled` (a disabled integration emits nothing at all) and wrapped in
+its own try/catch (a missing table costs zero entries) — an optional media server must never be able
+to degrade or break the whole check.
+
+**No live HTTP call was introduced.** It is three aggregate queries: `komgaSyncState.findMany`,
+`komgaLibrary.count`, `jobLog.count`. A test asserts that no `fetch` in the run targets the Komga URL
+or its port, and that the configured API key never reaches the rendered panel.
+
+### D5.2 — the two "read it from somewhere else" literals became shared constants
+
+The plan describes the health check reading `KomgaSyncState.lastError LIKE 'reconcile safety valve%'`
+and the verification give-up `JobLog`. Both are **string literals the pipeline writes**, and a health
+check that greps for a copy of them silently matches nothing the day either side is reworded — the
+worst possible failure for a check whose whole job is to notice a stall. `KOMGA_VALVE_ERROR_PREFIX`
+and `KOMGA_VERIFY_GIVEUP_PREFIX` now live in `constants.ts`, and `reconcile.ts` / `verify.ts`
+interpolate them. Behaviour is byte-identical; a test pins the query to the constant.
+
+### D5.3 — only `KOMGA_READLIST_SYNC` was genuinely missing
+
+The plan lists three `JobLog` types. Checked before adding anything: `sync.ts` already wrote
+`KOMGA_SCAN` and `reconcile.ts` already wrote `KOMGA_RECONCILE`, so only the read-list push had no
+history at all — a failed push left nothing in Admin → Logs, since that page filters on `jobType`.
+`processKomgaJob` now writes it after every push. `skipped` and `unchanged` are recorded as
+`COMPLETED`, not as errors: a list whose books are not on disk yet is a normal, self-resolving state.
+The `AuditLogger` entries were also already partly present — `settings-hooks.ts` has written
+`KOMGA_SETTINGS_CHANGED` (including the toggles) since Phase 1, so only the manual triggers were
+missing, as `KOMGA_ADMIN_TRIGGERED`.
+
+### D5.4 — the Jobs page gained a Komga card but no Komga schedule
+
+`handleRunJob`'s union gained three literal names and the page gained three Run-Now buttons. It also
+reads `komga_enabled` to explain a run that would be skipped, exactly as it already does for
+`export_series_json` and `cbr_conversion_enabled`: **read-only, never written back**, and nothing is
+added to the save payload. The Komga pipeline's cadence is the daily reconcile, which the worker
+schedules for itself — putting a schedule on this page would have been a second owner for it.
+
+The one "reading list" string on that page is the button caption PLAN itself specifies
+("Komga: push reading lists"). No reading-list module is imported, and the page still reads no
+reading-list data: it posts one trigger name and shows the route's message.
+
+### D5.5 — the trigger route refuses a disabled integration instead of answering "queued"
+
+The worker drops every Komga job while `komga_enabled` is false, logging only at `debug`. A manual
+trigger that answered `success` there would look like it had run. The route does one settings read
+first and answers `400` with the reason. Same for "nothing is mapped": it answers `200` with a
+message that says nothing was queued, rather than a success that reads like a completed sync.
+
+### D5.6 — backups: comment only, and one pre-existing finding left alone
+
+Confirmed rather than assumed: all three backup lists are **allowlists**, and both Node tables and
+the Rust `backup_tables()` copy columns dynamically (`findMany`/`SELECT *`), so the new `Komga*`
+tables were already excluded and `ReadingList.komgaSync` already round-trips through the existing
+`readingLists` entry. Per PLAN, **no code changed** and `backup_table_set_matches_restore` was not
+touched; each of the three sites got the one-line "Komga* tables are rebuildable caches" note.
+
+Reported, not fixed (out of scope, pre-existing on `main`): `src/app/admin/jobs/page.tsx:106` runs
+`new URL(anchor.href)` inside a click handler with no `try/catch`. A malformed `href` throws an
+uncaught error in the browser. Unrelated to Komga, so left for a focused change.
+
+### D5.7 — the Jobs page has no reading-list reference (with one deliberate exception)
+
+Noted for the record because it looks like a contradiction of the brief: the brief asks to keep the
+Jobs page free of reading-list references *and* names the third trigger "Komga: push reading lists".
+Both are honoured by reading "reference" as a code/data dependency rather than a UI caption — see
+D5.4.

@@ -9,6 +9,9 @@ const mocks = vi.hoisted(() => ({
     findManyLibraries: vi.fn(),
     findManyRequests: vi.fn().mockResolvedValue([]),
     countDownloadClients: vi.fn().mockResolvedValue(1),
+    komgaSyncStateFindMany: vi.fn().mockResolvedValue([]),
+    komgaLibraryCount: vi.fn().mockResolvedValue(0),
+    jobLogCount: vi.fn().mockResolvedValue(0),
     log: vi.fn(),
     sendAlert: vi.fn().mockResolvedValue(true),
     fetch: vi.fn()
@@ -23,7 +26,11 @@ vi.mock('@/lib/db', () => ({
         },
         library: { findMany: mocks.findManyLibraries },
         downloadClient: { count: mocks.countDownloadClients },
-        request: { findMany: mocks.findManyRequests }
+        request: { findMany: mocks.findManyRequests },
+        // Komga: the health check reads these three DB-only (never calls Komga).
+        komgaSyncState: { findMany: mocks.komgaSyncStateFindMany },
+        komgaLibrary: { count: mocks.komgaLibraryCount },
+        jobLog: { count: mocks.jobLogCount }
     }
 }));
 
@@ -304,6 +311,194 @@ describe('System Health & Diagnostics', () => {
             expect(stalled?.status).toBe('ok');
             expect(stalled?.message).toContain('disabled');
             expect(result.status).toBe('HEALTHY');
+        });
+    });
+
+    describe('Komga (DB-only — no live HTTP call)', () => {
+        beforeEach(() => {
+            // The "Stalled vs. Awaiting-availability" describe above leaves a STALLED request in
+            // its shared mock (clearMocks keeps implementations), which would make these
+            // otherwise-green runs DEGRADED for a reason that has nothing to do with Komga.
+            mocks.findManyRequests.mockResolvedValue([]);
+        });
+
+        const HOUR = 60 * 60 * 1000;
+        const healthy = () => {
+            vi.mocked(fs.promises.statfs).mockResolvedValue({ bsize: 1024, bavail: 15 * 1024 * 1024 * 1024 / 1024 } as any);
+            vi.mocked(fs.promises.access).mockResolvedValue(undefined);
+        };
+        /** The base settings plus the Komga master switch. */
+        const withKomga = (rows: { key: string, value: string }[] = []) => {
+            mocks.findManySettings.mockResolvedValue([
+                { key: 'cv_api_key', value: 'valid_key' },
+                { key: 'download_path', value: '/downloads' },
+                { key: 'last_backup_sync', value: Date.now().toString() },
+                { key: 'cloudflare_block_time', value: '0' },
+                { key: 'komga_enabled', value: 'true' },
+                { key: 'komga_url', value: 'http://komga.internal:25600' },
+                { key: 'komga_api_key', value: 'SUPER-SECRET-KEY' },
+                ...rows,
+            ]);
+        };
+        const syncState = (over: Record<string, any> = {}) => ({
+            omnibusLibraryId: 'lib_1', consecutiveFailures: 0, lastError: null,
+            lastReconciledAt: new Date(Date.now() - HOUR), ...over,
+        });
+
+        it('is entirely absent when the integration is disabled — and never touches its tables', async () => {
+            healthy();
+            mocks.findManySettings.mockResolvedValue([
+                { key: 'cv_api_key', value: 'valid_key' },
+                { key: 'download_path', value: '/downloads' },
+                { key: 'last_backup_sync', value: Date.now().toString() },
+            ]);
+
+            const result = await runSystemHealthCheck();
+
+            expect(result.checks.filter(c => c.id.startsWith('komga_'))).toHaveLength(0);
+            expect(mocks.komgaSyncStateFindMany).not.toHaveBeenCalled();
+            expect(mocks.komgaLibraryCount).not.toHaveBeenCalled();
+            expect(mocks.jobLogCount).not.toHaveBeenCalled();
+            expect(result.status).toBe('HEALTHY');
+        });
+
+        it('reports all-green entries when enabled and healthy', async () => {
+            healthy();
+            withKomga();
+            mocks.komgaSyncStateFindMany.mockResolvedValue([syncState()]);
+            mocks.komgaLibraryCount.mockResolvedValue(0);
+            mocks.jobLogCount.mockResolvedValue(0);
+
+            const result = await runSystemHealthCheck();
+
+            const ids = ['komga_failures', 'komga_unmapped', 'komga_safety_valve', 'komga_reconcile_stale', 'komga_verify_giveups'];
+            for (const id of ids) {
+                expect(result.checks.find(c => c.id === id)?.status).toBe('ok');
+            }
+            expect(result.status).toBe('HEALTHY');
+        });
+
+        it('surfaces consecutiveFailures and lastError with the library name and a settings link', async () => {
+            healthy();
+            withKomga();
+            mocks.komgaSyncStateFindMany.mockResolvedValue([
+                syncState(),
+                syncState({ omnibusLibraryId: 'lib_2', consecutiveFailures: 4, lastError: 'scan failed: Komga answered 500' }),
+            ]);
+
+            const result = await runSystemHealthCheck();
+
+            const check = result.checks.find(c => c.id === 'komga_failures');
+            expect(check?.status).toBe('warning');
+            expect(check?.message).toContain('Manga');           // the library NAME, not the id
+            expect(check?.message).toContain('4 consecutive failures');
+            expect(check?.message).toContain('scan failed: Komga answered 500');
+            expect(check?.actionLink).toBe('/admin/settings');
+            expect(check?.details).toContain('Manga — 4 consecutive failure(s): scan failed: Komga answered 500');
+            // A failing optional integration degrades nothing else.
+            expect(result.checks.find(c => c.id === 'cf_block')?.status).toBe('ok');
+        });
+
+        it('warns on unmapped Komga libraries and on a tripped safety valve', async () => {
+            healthy();
+            withKomga();
+            mocks.komgaLibraryCount.mockResolvedValue(2);
+            mocks.komgaSyncStateFindMany.mockResolvedValue([
+                syncState({ consecutiveFailures: 1, lastError: 'reconcile safety valve: Comics: Komga listed 0 books while 120 link(s) exist' }),
+            ]);
+
+            const result = await runSystemHealthCheck();
+
+            const unmapped = result.checks.find(c => c.id === 'komga_unmapped');
+            expect(unmapped?.status).toBe('warning');
+            expect(unmapped?.message).toContain('2 Komga libraries');
+
+            const valve = result.checks.find(c => c.id === 'komga_safety_valve');
+            expect(valve?.status).toBe('warning');
+            // The prefix the valve writes is stripped from the detail, not shown twice.
+            expect(valve?.details?.[0]).toBe('Main: Comics: Komga listed 0 books while 120 link(s) exist');
+            expect(valve?.details?.[0]).not.toContain('reconcile safety valve:');
+            expect(valve?.actionLink).toBe('/admin/settings');
+        });
+
+        it('flags a map that has not been reconciled in 48 hours, and clears once it has', async () => {
+            healthy();
+            withKomga();
+
+            mocks.komgaSyncStateFindMany.mockResolvedValue([syncState({ lastReconciledAt: new Date(Date.now() - 72 * HOUR) })]);
+            let result = await runSystemHealthCheck();
+            const stale = result.checks.find(c => c.id === 'komga_reconcile_stale');
+            expect(stale?.status).toBe('warning');
+            expect(stale?.message).toContain('over 48 hours');
+            expect(stale?.message).toContain('72');
+
+            mocks.komgaSyncStateFindMany.mockResolvedValue([syncState({ lastReconciledAt: new Date(Date.now() - 47 * HOUR) })]);
+            result = await runSystemHealthCheck();
+            expect(result.checks.find(c => c.id === 'komga_reconcile_stale')?.status).toBe('ok');
+        });
+
+        it('treats a map that has never reconciled as stale rather than silently fresh', async () => {
+            healthy();
+            withKomga();
+            mocks.komgaSyncStateFindMany.mockResolvedValue([syncState({ lastReconciledAt: null })]);
+
+            const result = await runSystemHealthCheck();
+            const stale = result.checks.find(c => c.id === 'komga_reconcile_stale');
+            expect(stale?.status).toBe('warning');
+            expect(stale?.message).toContain('never completed');
+        });
+
+        it('counts verification give-ups in the last 24 hours via the shared message prefix', async () => {
+            healthy();
+            withKomga();
+
+            mocks.jobLogCount.mockResolvedValue(3);
+            const result = await runSystemHealthCheck();
+            const giveUps = result.checks.find(c => c.id === 'komga_verify_giveups');
+            expect(giveUps?.status).toBe('warning');
+            expect(giveUps?.message).toContain('3 scan verifications');
+            expect(giveUps?.message).toContain('.cb7');
+
+            // The query must match the prefix verify.ts actually writes, and be windowed to 24 h.
+            const arg = mocks.jobLogCount.mock.calls[0][0];
+            expect(arg.where.jobType).toBe('KOMGA_SCAN');
+            expect(arg.where.message.startsWith).toBe('Komga did not pick up');
+            expect(arg.where.createdAt.gte).toBeInstanceOf(Date);
+            const ageH = (Date.now() - arg.where.createdAt.gte.getTime()) / HOUR;
+            expect(ageH).toBeGreaterThan(23.9);
+            expect(ageH).toBeLessThan(24.1);
+        });
+
+        it('NEVER calls Komga over HTTP — the section is database-only', async () => {
+            healthy();
+            withKomga();
+            mocks.komgaSyncStateFindMany.mockResolvedValue([syncState({ consecutiveFailures: 2, lastError: 'boom' })]);
+            mocks.komgaLibraryCount.mockResolvedValue(1);
+            mocks.jobLogCount.mockResolvedValue(1);
+
+            const result = await runSystemHealthCheck();
+
+            // The health check runs often, so a live probe here would be a latency and side-effect
+            // bug. Only the app's own loopback update check and the engine may be contacted.
+            const urls = mocks.fetch.mock.calls.map(([url]) => String(url));
+            expect(urls.some(u => /komga/i.test(u))).toBe(false);
+            expect(urls.some(u => u.includes('25600'))).toBe(false);
+            // The configured key must not have leaked into the rendered panel either.
+            const serialised = JSON.stringify(result);
+            expect(serialised).not.toContain('SUPER-SECRET-KEY');
+            expect(result.checks.filter(c => c.id.startsWith('komga_'))).toHaveLength(5);
+        });
+
+        it('survives a failure of the Komga read rather than failing the whole check', async () => {
+            healthy();
+            withKomga();
+            mocks.komgaSyncStateFindMany.mockRejectedValue(new Error('no such table: KomgaSyncState'));
+
+            const result = await runSystemHealthCheck();
+
+            expect(result.checks.filter(c => c.id.startsWith('komga_'))).toHaveLength(0);
+            expect(result.status).toBe('HEALTHY');
+            expect(mocks.upsertSetting).toHaveBeenCalled();
         });
     });
 });

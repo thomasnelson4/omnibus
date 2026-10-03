@@ -16,6 +16,7 @@ import { getKomgaQueue, getKomgaRedisConnection, KOMGA_BASE_JOB_OPTIONS, KOMGA_J
 import { flushDueLibraries } from './flush';
 import { getKomgaSettings } from './settings';
 import { komgaLibrariesForOmnibusLibrary, komgaLibraryRowToResolved } from './libraries';
+import type { PushResult } from './readlist-push';
 
 const REPEATABLE_JOB_ID = 'repeat_komga_reconcile';
 
@@ -96,6 +97,41 @@ async function runKomgaReconcile(data: { reason?: string }): Promise<void> {
     }
 }
 
+/**
+ * History for one read-list push. `KOMGA_SCAN` and `KOMGA_RECONCILE` were written by the pipeline
+ * itself; the push had no JobLog at all, so a failed push (or a push that quietly skipped half the
+ * list) left nothing behind in the Admin → Logs history — the only record was a `[Komga]` line in
+ * the rotating log file, which is not what that page reads.
+ *
+ * `skipped` and `unchanged` are COMPLETED, not errors: a list whose books are not on disk yet is a
+ * normal state that resolves itself on the next sync.
+ */
+async function recordReadListPushJobLog(readingListId: string, result: PushResult): Promise<void> {
+    try {
+        await prisma.jobLog.create({
+            data: {
+                jobType: 'KOMGA_READLIST_SYNC',
+                status: result.status === 'error' ? 'FAILED' : 'COMPLETED',
+                relatedItem: result.name ?? readingListId,
+                durationMs: null,
+                message: JSON.stringify({
+                    readingListId,
+                    status: result.status,
+                    name: result.name ?? null,
+                    komgaReadListId: result.komgaReadListId ?? null,
+                    bookCount: result.bookCount ?? null,
+                    pushedCount: result.pushedCount ?? null,
+                    skipped: result.skipped ?? null,
+                    ...(result.reason ? { reason: result.reason } : {}),
+                    ...(result.error ? { error: result.error.slice(0, 500) } : {}),
+                }).slice(0, 2000),
+            },
+        });
+    } catch (e) {
+        log(`could not write the read-list push JobLog for ${readingListId}: ${getErrorMessage(e)}`, 'warn');
+    }
+}
+
 /** Dispatch one Komga job. Unknown names are logged, never thrown. */
 export async function processKomgaJob(job: { name: string; data: unknown }): Promise<void> {
     const data = (job?.data ?? {}) as Record<string, unknown>;
@@ -131,6 +167,7 @@ export async function processKomgaJob(job: { name: string; data: unknown }): Pro
                 const result = await pushReadList(readingListId);
                 if (result.status === 'error') log(`push of ${readingListId} ended in an error: ${result.error}`, 'warn');
                 else log(`push of ${readingListId}: ${result.status}${result.reason ? ` (${result.reason})` : ''}`, 'debug');
+                await recordReadListPushJobLog(readingListId, result);
                 return;
             }
             case KOMGA_JOB.READLIST_DELETE: {

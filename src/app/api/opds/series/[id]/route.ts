@@ -3,9 +3,11 @@ import { prisma } from '@/lib/db';
 import { validateApiKey } from '@/lib/api-auth';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger';
-import { escapeXml } from '@/lib/utils/xml';
 import { getAccessibleLibraryIds, canAccessLibraryId } from '@/lib/library-access';
 import { countArchivePages, isPageCountable, countArchivePagesViaEngine, isEngineCountable } from '@/lib/utils/archive-pages';
+import { getPublicBaseUrl } from '@/lib/opds-base-url';
+import { atomFeed, feedContentType, feedUpdated, issueEntry } from '@/lib/opds-feed';
+import { progressByIssueId } from '@/lib/opds-progress';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,14 +18,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             return new Response('Unauthorized', { status: 401, headers: { 'WWW-Authenticate': 'Basic realm="Omnibus OPDS"' } });
         }
 
-    const url = new URL(req.url);
-    const baseUrl = url.origin;
-    
+    const baseUrl = getPublicBaseUrl(req);
+
     const resolvedParams = await params;
     const seriesId = resolvedParams.id;
-
-    // Check user permissions
-    const canDownload = auth.user.role === 'ADMIN' || auth.user.canDownload === true;
 
     const series = await prisma.series.findUnique({
         where: { id: seriesId },
@@ -52,11 +50,12 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         return numA - numB;
     });
 
+    // #221: pse:lastRead / pse:lastReadDate, so a page-streaming client resumes where this user
+    // stopped — one query for the whole feed rather than one per issue.
+    const progress = await progressByIssueId(auth.user.id, sortedIssues.map((i) => i.id));
+
     const entries = [];
     for (const issue of sortedIssues) {
-        const rawCover = issue.coverUrl || (series.folderPath ? `/api/library/cover?path=${encodeURIComponent(series.folderPath)}` : '');
-        const finalCoverUrl = rawCover.startsWith('http') ? rawCover : (rawCover ? `${baseUrl}${rawCover}` : '');
-
         // --- MEMORY LEAK FIXED: Pulling directly from DB instead of loading files into RAM ---
         let pageCount = (issue as any).pageCount || 0;
         // Self-heal issues indexed before page counts were persisted: without a real pse:count,
@@ -73,40 +72,28 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
             await prisma.issue.update({ where: { id: issue.id }, data: { pageCount } }).catch(() => {});
         }
 
-        // The Official OPDS-PSE Streaming Link with the URI Template
-        const pseLink = `<link rel="http://vaemendis.net/opds-pse/stream" type="image/jpeg" href="${baseUrl}/api/opds/page/${issue.id}/{pageNumber}" pse:count="${pageCount}"/>`;
-        
-        // Full File Download Link (Only injected if they have permission)
-        const downloadLink = canDownload && issue.filePath 
-            ? `<link rel="http://opds-spec.org/acquisition" href="${baseUrl}/api/opds/download?issueId=${issue.id}" type="application/vnd.comicbook+zip"/>`
-            : '';
-
-        entries.push(`
-  <entry>
-    <title>${escapeXml(issue.name || `${series.name}${(issue as any).isAnnual ? ' Annual' : ''} #${issue.number}`)}</title>
-    <id>urn:omnibus:issue:${issue.id}</id>
-    <updated>${new Date().toISOString()}</updated>
-    <author><name>${escapeXml(series.publisher || 'Unknown')}</name></author>
-    <content type="text">${escapeXml(issue.description || 'No synopsis available.')}</content>
-    ${finalCoverUrl ? `<link rel="http://opds-spec.org/image" href="${escapeXml(finalCoverUrl)}" type="image/jpeg"/>` : ''}
-    ${finalCoverUrl ? `<link rel="http://opds-spec.org/image/thumbnail" href="${escapeXml(finalCoverUrl)}" type="image/jpeg"/>` : ''}
-    ${pseLink}
-    ${downloadLink}
-  </entry>`);
+        entries.push(issueEntry(baseUrl, series, issue, {
+            pageCount,
+            progress: progress.get(issue.id) ?? null,
+        }));
     }
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opds="http://opds-spec.org/2010/catalog" xmlns:pse="http://vaemendis.net/opds-pse/ns">
-  <id>urn:omnibus:series:${series.id}</id>
-  <title>${escapeXml(series.name)}</title>
-  <updated>${new Date().toISOString()}</updated>
-  <link rel="self" href="${baseUrl}/api/opds/series/${series.id}" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  <link rel="start" href="${baseUrl}/api/opds" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  <link rel="up" href="${baseUrl}/api/opds/series" type="application/atom+xml;profile=opds-catalog;kind=navigation"/>
-  ${entries.join('')}
-</feed>`;
+    const kind = 'application/atom+xml;profile=opds-catalog;kind=navigation';
+    const xml = atomFeed({
+        id: `urn:omnibus:series:${series.id}`,
+        title: series.name,
+        updated: feedUpdated(sortedIssues.map(i => i.updatedAt)),
+        // A series' own feed is an acquisition feed: its entries are publications.
+        links: [
+            `<link rel="self" href="${baseUrl}/api/opds/series/${series.id}" type="application/atom+xml;profile=opds-catalog;kind=acquisition"/>`,
+            `<link rel="start" href="${baseUrl}/api/opds" type="${kind}"/>`,
+            `<link rel="up" href="${baseUrl}/api/opds/series" type="${kind}"/>`,
+        ].join('\n  '),
+        entries: entries.join(''),
+        namespaces: ' xmlns:pse="http://vaemendis.net/opds-pse/ns" xmlns:dc="http://purl.org/dc/elements/1.1/"',
+    });
 
-    return new Response(xml, { headers: { 'Content-Type': 'application/atom+xml;profile=opds-catalog; charset=utf-8' } });
+    return new Response(xml, { headers: { 'Content-Type': feedContentType('acquisition') } });
     } catch (error: unknown) {
         Logger.log(`[OPDS Series Detail API] Error: ${getErrorMessage(error)}`, 'error');
         return new Response('Internal Server Error', { status: 500 });

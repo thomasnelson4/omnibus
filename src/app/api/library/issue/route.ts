@@ -36,8 +36,12 @@ export async function GET(request: Request) {
   try {
     const issue = await prisma.issue.findUnique({
         where: { id },
-        // metadataId/metadataSource feed the #194 identity guard on the deep-fetch below.
-        include: { series: { select: { libraryId: true, metadataId: true, metadataSource: true } } }
+        // metadataId/metadataSource feed the #194 identity guard on the deep-fetch below; an attached
+        // annual/collected edition is checked against its own volume instead of the series' (#238).
+        include: {
+            series: { select: { libraryId: true, metadataId: true, metadataSource: true } },
+            attachedVolume: { select: { volumeId: true, metadataSource: true } },
+        }
     });
 
     if (!issue) return NextResponse.json({ error: "Issue not found" }, { status: 404 });
@@ -115,6 +119,7 @@ export async function GET(request: Request) {
                     rowNumber: issue.number,
                     seriesMetadataId: issue.series?.metadataId,
                     seriesMetadataSource: issue.series?.metadataSource,
+                    attachedVolume: issue.attachedVolume,
                     expectedSource: 'METRON',
                     fetchedParentId: deepData.seriesId != null ? deepData.seriesId.toString() : null,
                     fetchedIssueNumber: deepData.issueNumber
@@ -198,6 +203,7 @@ export async function GET(request: Request) {
                         rowNumber: issue.number,
                         seriesMetadataId: issue.series?.metadataId,
                         seriesMetadataSource: issue.series?.metadataSource,
+                        attachedVolume: issue.attachedVolume,
                         expectedSource: 'COMICVINE',
                         fetchedParentId: deepData.volume?.id != null ? deepData.volume.id.toString() : null,
                         fetchedIssueNumber: deepData.issue_number

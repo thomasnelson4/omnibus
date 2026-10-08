@@ -26,7 +26,11 @@ async function requireAdminIssue(issueId: unknown) {
     const session = await getServerSession(authOptions);
     if (session?.user?.role !== 'ADMIN') return { ok: false as const, error: 'Unauthorized', status: 403 };
     if (!issueId || typeof issueId !== 'string') return { ok: false as const, error: 'Missing issue ID', status: 400 };
-    const issue = await prisma.issue.findUnique({ where: { id: issueId }, include: { series: true } });
+    // attachedVolume: an attached annual/collected edition's cover is checked against its own volume (#238).
+    const issue = await prisma.issue.findUnique({
+        where: { id: issueId },
+        include: { series: true, attachedVolume: { select: { volumeId: true, metadataSource: true } } },
+    });
     if (!issue) return { ok: false as const, error: 'Issue not found', status: 404 };
     return { ok: true as const, session, issue };
 }
@@ -115,6 +119,7 @@ export async function DELETE(request: Request) {
                         rowNumber: issue.number,
                         seriesMetadataId: issue.series?.metadataId,
                         seriesMetadataSource: issue.series?.metadataSource,
+                        attachedVolume: issue.attachedVolume,
                         expectedSource: 'METRON',
                         fetchedParentId: details.seriesId != null ? details.seriesId.toString() : null,
                         fetchedIssueNumber: details.issueNumber
@@ -139,6 +144,7 @@ export async function DELETE(request: Request) {
                             rowNumber: issue.number,
                             seriesMetadataId: issue.series?.metadataId,
                             seriesMetadataSource: issue.series?.metadataSource,
+                            attachedVolume: issue.attachedVolume,
                             expectedSource: 'COMICVINE',
                             fetchedParentId: results.volume?.id != null ? results.volume.id.toString() : null,
                             fetchedIssueNumber: results.issue_number

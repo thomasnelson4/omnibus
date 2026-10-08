@@ -17,9 +17,8 @@ const mocks = vi.hoisted(() => ({
     fsPromisesUtimes: vi.fn().mockResolvedValue(true),
     // global fetch (engine page offload)
     fetch: vi.fn(),
-    zipGetEntry: vi.fn(),
-    zipGetEntries: vi.fn().mockReturnValue([]),
-    zipGetData: vi.fn(),
+    // Engine-down fallback: one page read from the zip's index (lib/utils/archive-pages).
+    readArchivePage: vi.fn(),
     sharpResize: vi.fn().mockReturnThis(),
     sharpWebp: vi.fn().mockReturnThis(),
     sharpTrim: vi.fn().mockReturnThis(),
@@ -66,15 +65,7 @@ vi.mock('next-auth', () => ({ getServerSession: vi.fn().mockResolvedValue(mocks.
 vi.mock('next-auth/jwt', () => ({ getToken: vi.fn().mockResolvedValue(mocks.mockSession.user) }));
 vi.mock('@/lib/auth', () => ({ getAuthSession: vi.fn().mockResolvedValue(mocks.mockSession) }));
 
-// CRITICAL FIX: Treat AdmZip as a class so 'new AdmZip()' executes correctly
-vi.mock('adm-zip', () => {
-    return {
-        default: class AdmZipMock {
-            getEntry(name: string) { return mocks.zipGetEntry(name); }
-            getEntries() { return mocks.zipGetEntries(); }
-        }
-    };
-});
+vi.mock('@/lib/utils/archive-pages', () => ({ readArchivePage: mocks.readArchivePage }));
 
 vi.mock('sharp', () => {
     return {
@@ -90,6 +81,7 @@ vi.mock('sharp', () => {
 
 describe('API Route: Reader Image Serving', () => {
     beforeEach(() => {
+        vi.clearAllMocks();
         mocks.libraryFindMany.mockResolvedValue([{ path: '/data/comics' }]);
         mocks.fsExistsSync.mockReturnValue(true);
         mocks.fsStatSync.mockReturnValue({ mtimeMs: 12345, size: 50000 });
@@ -119,22 +111,29 @@ describe('API Route: Reader Image Serving', () => {
         expect(res.status).toBe(200);
         expect(res.headers.get('content-type')).toBe('image/webp');
         expect(mocks.fsPromisesReadFile).toHaveBeenCalled();
-        expect(mocks.zipGetEntry).not.toHaveBeenCalled();
+        expect(mocks.readArchivePage).not.toHaveBeenCalled();
     });
 
-    it('should extract from zip and convert to webp if no cache exists', async () => {
+    it('with the engine down, reads just the one page from the zip and converts it to webp', async () => {
         // Async cache read rejects with ENOENT → cache miss → fall through to extraction.
         mocks.fsPromisesReadFile.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
-
-        // Mock out the zip parsing to feed the sharp pipeline
-        mocks.zipGetEntry.mockReturnValue({ getData: mocks.zipGetData });
-        mocks.zipGetData.mockReturnValue(Buffer.from('raw_zip_data'));
+        mocks.readArchivePage.mockResolvedValue(Buffer.from('raw_zip_data'));
 
         const req = new NextRequest('http://localhost/api/reader/image?path=/data/comics/batman.cbz&page=page1.jpg');
         const res = await GET(req);
 
         expect(res.status).toBe(200);
+        expect(mocks.readArchivePage).toHaveBeenCalledWith('/data/comics/batman.cbz', 'page1.jpg');
         expect(mocks.sharpToBuffer).toHaveBeenCalled();
+    });
+
+    it('with the engine down, answers 404 for a page the zip does not have', async () => {
+        mocks.fsPromisesReadFile.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+        mocks.readArchivePage.mockResolvedValue(null);
+
+        const res = await GET(new NextRequest('http://localhost/api/reader/image?path=/data/comics/batman.cbz&page=nope.jpg'));
+        expect(res.status).toBe(404);
+        expect(await res.text()).toBe('Page Not Found');
     });
 
     it('should serve engine-produced webp bytes (non-crop) without touching the local zip/sharp path', async () => {
@@ -148,9 +147,43 @@ describe('API Route: Reader Image Serving', () => {
 
         expect(res.status).toBe(200);
         expect(res.headers.get('content-type')).toBe('image/webp');
-        expect(mocks.fetch).toHaveBeenCalled();
+        expect(JSON.parse(mocks.fetch.mock.calls[0][1].body)).toEqual(expect.objectContaining({ entry: 'page1.jpg', width: 1600 }));
         // Offloaded → the local extraction/sharp path is never reached.
-        expect(mocks.zipGetEntry).not.toHaveBeenCalled();
+        expect(mocks.readArchivePage).not.toHaveBeenCalled();
         expect(mocks.sharpToBuffer).not.toHaveBeenCalled();
+    });
+
+    // Crop mode (auto-trim margins) used to skip the engine for zips and load the whole archive
+    // locally - up to six kept in memory, a file over 1 GB re-read for every page, over 2 GB
+    // unreadable. Every archive type now gets its page from the engine at a larger width, trimmed
+    // here and fitted to the reader's 1600px (the engine never enlarges a page).
+    it.each([
+        ['a zip', '/data/comics/compendium.cbz'],
+        ['a CBR', '/data/comics/batman.cbr'],
+    ])('crop mode on %s asks the engine for a 2400px page, then trims it and fits it to 1600px', async (_label, file) => {
+        mocks.fsPromisesReadFile.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+        mocks.fetch.mockResolvedValue({ ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer });
+
+        const res = await GET(new NextRequest(`http://localhost/api/reader/image?path=${encodeURIComponent(file)}&page=page1.jpg&crop=true`));
+
+        expect(res.status).toBe(200);
+        expect(JSON.parse(mocks.fetch.mock.calls[0][1].body)).toEqual(expect.objectContaining({ entry: 'page1.jpg', width: 2400 }));
+        expect(mocks.sharpTrim).toHaveBeenCalled();
+        expect(mocks.sharpResize).toHaveBeenCalledWith({ width: 1600, withoutEnlargement: true });
+        expect(mocks.readArchivePage).not.toHaveBeenCalled();
+    });
+
+    it('crop mode serves a page it cannot trim (one solid colour) untrimmed instead of failing', async () => {
+        mocks.fsPromisesReadFile.mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }));
+        mocks.fetch.mockResolvedValue({ ok: true, arrayBuffer: async () => new Uint8Array([9, 9, 9]).buffer });
+        mocks.sharpToBuffer
+            .mockRejectedValueOnce(new Error('Unexpected error while trimming'))
+            .mockResolvedValueOnce(Buffer.from('untrimmed page'));
+
+        const res = await GET(new NextRequest('http://localhost/api/reader/image?path=/data/comics/compendium.cbz&page=blank.jpg&crop=true'));
+
+        expect(res.status).toBe(200);
+        expect(Buffer.from(await res.arrayBuffer()).toString()).toBe('untrimmed page');
+        expect(mocks.readArchivePage).not.toHaveBeenCalled();
     });
 });

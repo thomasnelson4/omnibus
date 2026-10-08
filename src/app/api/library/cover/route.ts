@@ -21,10 +21,16 @@ const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
 const ALLOWED_WIDTHS = [160, 320, 480, 640, 1024];
 
 // A cover's bytes only change when its source changes, and every response carries an ETag derived
-// from that source (file mtime+size / render cache key / remote URL) — so a long fresh window is
-// safe: after it lapses the browser revalidates and gets a 304 instead of re-downloading the wall.
-// Admin-driven cover changes (upload/match) additionally cache-bust via &v= in the stored URL.
+// from that source (file mtime+size / render cache key / remote URL) — so after the fresh window
+// lapses the browser revalidates and gets a 304 instead of re-downloading the wall. The long window
+// is only safe when a changed cover also changes the URL: provider art (content-stable URLs) and
+// admin-driven changes (upload/match), which cache-bust via &v= in the stored URL.
 const CACHE_OK = 'public, max-age=604800, stale-while-revalidate=86400';
+// #237: an UNVERSIONED local cover can be rewritten in place — a provider sync overwrites
+// <folder>/cover.jpg behind the same URL — and a 7-day fresh window kept the old art (an annual's
+// page the scan had extracted) in the library grid. These are revalidated on every use instead;
+// the 304 is answered from a stat alone, so the grid still never re-downloads an unchanged cover.
+const CACHE_REVALIDATE = 'public, no-cache';
 
 // First-page issue covers (discussion #182, local-first ingest): rendered once via the engine,
 // then served from disk. Weekly-unaccessed eviction — unlike reader pages these are grid-hot, and
@@ -56,13 +62,13 @@ function etagMatches(header: string | null, etag: string): boolean {
     return header.split(',').some(t => t.trim().replace(/^W\//, '') === etag);
 }
 
-function notModified(etag: string): NextResponse {
+function notModified(etag: string, cacheControl: string = CACHE_OK): NextResponse {
     // 304 re-carries the validator + freshness so the browser's entry is renewed for another window.
-    return new NextResponse(null, { status: 304, headers: { 'ETag': etag, 'Cache-Control': CACHE_OK } });
+    return new NextResponse(null, { status: 304, headers: { 'ETag': etag, 'Cache-Control': cacheControl } });
 }
 
-function serveImage(buffer: Buffer, contentType: string, etag?: string): NextResponse {
-    const headers: Record<string, string> = { 'Content-Type': contentType, 'Cache-Control': CACHE_OK };
+function serveImage(buffer: Buffer, contentType: string, etag?: string, cacheControl: string = CACHE_OK): NextResponse {
+    const headers: Record<string, string> = { 'Content-Type': contentType, 'Cache-Control': cacheControl };
     if (etag) headers['ETag'] = etag;
     return new NextResponse(buffer as unknown as BodyInit, { headers });
 }
@@ -170,27 +176,29 @@ function getFallbackImage(cacheControl: string = 'public, max-age=86400') {
 // Serve a library-root-checked image file, optionally as a cached ?w= WebP thumbnail. The ETag
 // derives from the SOURCE file (mtime+size+variant), so a provider sync overwriting cover.jpg
 // rolls the validator naturally and a 304 can be answered from the stat alone — no read, no resize.
-async function serveLocalImage(request: NextRequest, absPath: string, stat: fs.Stats, w: number | null): Promise<NextResponse> {
+// `versioned` = the URL carries &v=, i.e. it changes whenever this cover does (#237).
+async function serveLocalImage(request: NextRequest, absPath: string, stat: fs.Stats, w: number | null, versioned: boolean): Promise<NextResponse> {
+    const cacheControl = versioned ? CACHE_OK : CACHE_REVALIDATE;
     const etag = `"c-${stat.mtimeMs}-${stat.size}${w ? `-w${w}` : ''}"`;
-    if (etagMatches(request.headers.get('if-none-match'), etag)) return notModified(etag);
+    if (etagMatches(request.headers.get('if-none-match'), etag)) return notModified(etag, cacheControl);
 
     if (w) {
         const thumbKey = crypto.createHash('md5').update(`${absPath}|${stat.mtimeMs}|${stat.size}|w${w}`).digest('hex') + '.webp';
         const thumbFile = path.join(THUMB_CACHE_DIR, thumbKey);
         const cached = await readCacheFile(thumbFile);
-        if (cached) return serveImage(cached, 'image/webp', etag);
+        if (cached) return serveImage(cached, 'image/webp', etag, cacheControl);
 
         const source = await fs.promises.readFile(absPath);
         const resized = await resizeToWebp(source, w);
         if (resized) {
             writeCacheFile(THUMB_CACHE_DIR, thumbFile, resized);
-            return serveImage(resized, 'image/webp', etag);
+            return serveImage(resized, 'image/webp', etag, cacheControl);
         }
-        return serveImage(source, contentTypeFor(path.extname(absPath).toLowerCase()), etag);
+        return serveImage(source, contentTypeFor(path.extname(absPath).toLowerCase()), etag, cacheControl);
     }
 
     const buffer = await fs.promises.readFile(absPath);
-    return serveImage(buffer, contentTypeFor(path.extname(absPath).toLowerCase()), etag);
+    return serveImage(buffer, contentTypeFor(path.extname(absPath).toLowerCase()), etag, cacheControl);
 }
 
 export async function GET(request: NextRequest) {
@@ -199,6 +207,7 @@ export async function GET(request: NextRequest) {
   const issueId = searchParams.get('issueId');
   const wRaw = parseInt(searchParams.get('w') || '', 10);
   const w = ALLOWED_WIDTHS.includes(wRaw) ? wRaw : null;
+  const versioned = searchParams.has('v');
 
   // --- ISSUE FIRST-PAGE COVERS (discussion #182, local-first ingest) ---
   // ?issueId=<id>: an issue scanned without provider metadata has no coverUrl row of its own; its
@@ -335,13 +344,13 @@ export async function GET(request: NextRequest) {
                 // the candidate's mtime+size; a missing candidate throws to the next.
                 const coverStat = await fs.promises.stat(coverPath);
                 if (!coverStat.isFile()) continue;
-                return await serveLocalImage(request, coverPath, coverStat, w);
+                return await serveLocalImage(request, coverPath, coverStat, w, versioned);
             } catch { /* try the next candidate */ }
         }
         return getFallbackImage();
     }
 
-    return await serveLocalImage(request, realTarget, stat, w);
+    return await serveLocalImage(request, realTarget, stat, w, versioned);
 
   } catch (error) {
     Logger.log(`Cover Error: ${getErrorMessage(error)}`, 'error');

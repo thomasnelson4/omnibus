@@ -212,6 +212,20 @@ fn extraction_temp_base() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/config/cache"))
 }
 
+/// Never clobber an existing .cbz when converting to one (the rule page removal and cover insertion
+/// already follow): the original stays as it is — CBR/CB7 read natively — and the caller reports
+/// why. A .cbz source is a repack of itself, not a conversion, so it is never refused.
+fn refuse_existing_cbz(source: &Path, cbz: &Path) -> Result<()> {
+    let is_repack = source.extension().map(|e| e.eq_ignore_ascii_case("cbz")).unwrap_or(false);
+    if !is_repack && cbz.exists() {
+        anyhow::bail!(
+            "A .cbz with this name already exists next to the original ({:?}) — keeping the original; resolve the duplicate first.",
+            cbz.file_name().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 /// Fast, native function to extract a CBR/RAR/CB7 and repack it directly to CBZ (ZIP) without re-encoding images.
 pub fn convert_cbr_to_cbz(cbr_path: &Path) -> Result<PathBuf> {
     if !cbr_path.exists() {
@@ -219,6 +233,7 @@ pub fn convert_cbr_to_cbz(cbr_path: &Path) -> Result<PathBuf> {
     }
 
     let cbz_path = cbr_path.with_extension("cbz");
+    refuse_existing_cbz(cbr_path, &cbz_path)?;
     // Extraction temp lives under the configured cache dir (see extraction_temp_base).
     let temp_dir_base = extraction_temp_base();
 
@@ -238,26 +253,37 @@ pub fn convert_cbr_to_cbz(cbr_path: &Path) -> Result<PathBuf> {
         return Err(e);
     }
 
-    // 2. Create the new ZIP file
-    let cbz_file = File::create(&cbz_path)?;
-    let mut zip = ZipWriter::new(cbz_file);
-    // Use Deflated compression (standard ZIP)
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    // 2. Build the new ZIP beside the original under a temp name, then rename it into place: an
+    // interrupted run never leaves a half-written .cbz, and no existing file is ever written into.
+    let temp_cbz = cbr_path.with_extension("cbz.tmp");
+    let built = (|| -> Result<()> {
+        let mut zip = ZipWriter::new(File::create(&temp_cbz)?);
+        // Use Deflated compression (standard ZIP)
+        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-    // 3. Walk the temporary directory and stream files into the new ZIP
-    for entry in jwalk::WalkDir::new(&temp_dir) {
-        let entry = entry?;
-        let path = entry.path();
-        
-        if path.is_file() {
-            let name = path.strip_prefix(&temp_dir)?.to_string_lossy().replace("\\", "/");
-            zip.start_file(name, options)?;
-            
-            let mut f = File::open(&path)?;
-            std::io::copy(&mut f, &mut zip)?;
+        // 3. Walk the temporary directory and stream files into the new ZIP
+        for entry in jwalk::WalkDir::new(&temp_dir) {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_file() {
+                let name = path.strip_prefix(&temp_dir)?.to_string_lossy().replace("\\", "/");
+                zip.start_file(name, options)?;
+
+                let mut f = File::open(&path)?;
+                std::io::copy(&mut f, &mut zip)?;
+            }
         }
+        zip.finish()?;
+        // A .cbz may have arrived while this one was being built.
+        refuse_existing_cbz(cbr_path, &cbz_path)
+    })();
+    if let Err(e) = built {
+        let _ = fs::remove_file(&temp_cbz);
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(e);
     }
-    zip.finish()?;
+    fs::rename(&temp_cbz, &cbz_path)?;
 
     // 4. Cleanup the temporary folder and the original CBR file
     fs::remove_dir_all(&temp_dir)?;
@@ -407,6 +433,11 @@ pub fn process_archive(
 ) -> Result<PathBuf> {
     log::info!("Starting processing for: {:?}", source_path.file_name().unwrap_or_default());
 
+    // Always outputs a .cbz; converting to one never replaces an existing .cbz (checked again
+    // before the final rename, in case one arrives while this one is being built).
+    let output_path = source_path.with_extension("cbz");
+    refuse_existing_cbz(source_path, &output_path)?;
+
     // 1. Extraction temp lives under the configured cache dir (see extraction_temp_base).
     let temp_dir_base = extraction_temp_base();
         
@@ -446,10 +477,7 @@ pub fn process_archive(
     images.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
     log::debug!("[Converter Debug] Found {} images in {:?}", images.len(), source_path.file_name().unwrap_or_default());
 
-    // 4. Determine output path (always outputs a .cbz)
-    let output_path = source_path.with_extension("cbz");
-    
-    // Create a temporary output file to prevent corrupting data if the process crashes
+    // 4. Create a temporary output file to prevent corrupting data if the process crashes
     let temp_output_path = source_path.with_extension("cbz.tmp");
     let file = File::create(&temp_output_path)?;
     let mut zip = ZipWriter::new(file);
@@ -504,6 +532,11 @@ pub fn process_archive(
     zip.finish()?;
 
     // 8. Move the temp zip to the final destination and clean up
+    if let Err(e) = refuse_existing_cbz(source_path, &output_path) {
+        let _ = fs::remove_file(&temp_output_path);
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Err(e);
+    }
     fs::rename(&temp_output_path, &output_path)?;
     if source_path != output_path && source_path.exists() {
         fs::remove_file(source_path)?; // Delete original CBR if we made a CBZ
@@ -1651,9 +1684,10 @@ pub fn ensure_folder_cover(folder: &Path, archive_path: &Path) -> Option<PathBuf
     }
 }
 
-/// The lowest natural-sorted comic archive directly inside `folder` (epub is skipped — its cover lives
-/// in OPF metadata, not as a page). Used to pick which file a series cover is pulled from.
-pub fn first_comic_file(folder: &Path) -> Option<PathBuf> {
+/// The comic archives directly inside `folder`, natural-sorted (epub is skipped — its cover lives in
+/// OPF metadata, not as a page). The scanner picks which of them speaks for the folder — its cover
+/// and its identity evidence — skipping annuals (scanner::folder_run_witness, #237).
+pub fn comic_files_sorted(folder: &Path) -> Vec<PathBuf> {
     let mut comics: Vec<PathBuf> = Vec::new();
     if let Ok(rd) = fs::read_dir(folder) {
         for entry in rd.flatten() {
@@ -1668,7 +1702,7 @@ pub fn first_comic_file(folder: &Path) -> Option<PathBuf> {
         }
     }
     comics.sort_by(|a, b| natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
-    comics.into_iter().next()
+    comics
 }
 
 // ============================================================================
@@ -2062,6 +2096,105 @@ mod tests {
         }
         zw.finish().unwrap();
         path
+    }
+
+    // ==== beta.021: converting to CBZ never clobbers an existing .cbz (the rule page removal and
+    // cover insertion already follow) and never writes the .cbz in place - a temp file is renamed
+    // into place, so an interrupted run leaves no half-written archive and, with hardlinked
+    // imports, no write can reach a seeding file.
+
+    fn tmp_leftovers(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir).unwrap().filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn convert_cbr_to_cbz_refuses_to_clobber_an_existing_cbz() {
+        std::env::set_var("OMNIBUS_CACHE_DIR", std::env::temp_dir());
+        let dir = scratch_dir();
+        let cbr = make_zip(&dir, "taken.cbr", &[("01.jpg", b"new page")]);
+        fs::write(dir.join("taken.cbz"), b"already here").unwrap();
+
+        let err = convert_cbr_to_cbz(&cbr).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{}", err);
+        assert!(cbr.exists(), "the .cbr is kept (it reads natively)");
+        assert_eq!(fs::read(dir.join("taken.cbz")).unwrap(), b"already here", "existing .cbz untouched");
+        assert!(tmp_leftovers(&dir).is_empty(), "no temp file left: {:?}", tmp_leftovers(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn convert_cbr_to_cbz_builds_the_cbz_and_retires_the_cbr() {
+        std::env::set_var("OMNIBUS_CACHE_DIR", std::env::temp_dir());
+        let dir = scratch_dir();
+        let cbr = make_zip(&dir, "fresh.cbr", &[("01.jpg", b"page one"), ("02.jpg", b"page two")]);
+
+        let out = convert_cbr_to_cbz(&cbr).unwrap();
+        assert_eq!(out, dir.join("fresh.cbz"));
+        assert!(!cbr.exists(), "original .cbr retired");
+        assert_eq!(list_image_entries(&out).unwrap().len(), 2);
+        assert!(tmp_leftovers(&dir).is_empty(), "no temp file left: {:?}", tmp_leftovers(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_archive_refuses_to_clobber_an_existing_cbz() {
+        std::env::set_var("OMNIBUS_CACHE_DIR", std::env::temp_dir());
+        let dir = scratch_dir();
+        let cbr = make_zip(&dir, "sweep.cbr", &[("01.jpg", b"new page")]);
+        fs::write(dir.join("sweep.cbz"), b"already here").unwrap();
+
+        let err = process_archive(&cbr, false, 80.0).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{}", err);
+        assert!(cbr.exists(), "the .cbr is kept");
+        assert_eq!(fs::read(dir.join("sweep.cbz")).unwrap(), b"already here", "existing .cbz untouched");
+
+        // A .zip source is a conversion too.
+        let zip_src = make_zip(&dir, "pack.zip", &[("01.jpg", b"x")]);
+        fs::write(dir.join("pack.cbz"), b"mine").unwrap();
+        assert!(process_archive(&zip_src, false, 80.0).is_err());
+        assert!(zip_src.exists());
+        assert_eq!(fs::read(dir.join("pack.cbz")).unwrap(), b"mine");
+        assert!(tmp_leftovers(&dir).is_empty(), "no temp file left: {:?}", tmp_leftovers(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_archive_still_repacks_a_cbz_over_itself() {
+        std::env::set_var("OMNIBUS_CACHE_DIR", std::env::temp_dir());
+        let dir = scratch_dir();
+        let cbz = make_zip(&dir, "repack.cbz", &[("b.jpg", b"two"), ("a.jpg", b"one")]);
+
+        let out = process_archive(&cbz, false, 80.0).unwrap();
+        assert_eq!(out, cbz, "a repack keeps its own name");
+        assert_eq!(list_image_entries(&out).unwrap(), vec!["page_0001.jpg", "page_0002.jpg"]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn converting_hardlinked_files_never_writes_into_the_seed() {
+        std::env::set_var("OMNIBUS_CACHE_DIR", std::env::temp_dir());
+        let dir = scratch_dir();
+        // A CBZ repack of a library file that shares its inode with a seeding file.
+        let seed = make_zip(&dir, "seed.cbz", &[("a.jpg", b"one")]);
+        let seed_bytes = fs::read(&seed).unwrap();
+        let library = dir.join("library.cbz");
+        fs::hard_link(&seed, &library).unwrap();
+        process_archive(&library, false, 80.0).unwrap();
+        assert_eq!(fs::read(&seed).unwrap(), seed_bytes, "the seed's bytes are untouched");
+        assert_ne!(fs::read(&library).unwrap(), seed_bytes, "the library copy was rebuilt");
+
+        // A CBR conversion of a hardlinked library file: the seed keeps its file.
+        let seed_cbr = make_zip(&dir, "seed.cbr", &[("a.jpg", b"one")]);
+        let seed_cbr_bytes = fs::read(&seed_cbr).unwrap();
+        let library_cbr = dir.join("issue.cbr");
+        fs::hard_link(&seed_cbr, &library_cbr).unwrap();
+        convert_cbr_to_cbz(&library_cbr).unwrap();
+        assert_eq!(fs::read(&seed_cbr).unwrap(), seed_cbr_bytes, "the seeding .cbr is untouched");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ==== Issue #189 follow-up (2026-07-26): uploaded issue covers embed as the archive's first
@@ -2633,15 +2766,16 @@ mod tests {
     }
 
     #[test]
-    fn first_comic_file_picks_lowest_and_ignores_noncomics() {
+    fn comic_files_sorted_orders_naturally_and_ignores_noncomics() {
         let dir = std::env::temp_dir().join(format!("omnibus_first_comic_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("Series 010.cbz"), b"").unwrap();
         fs::write(dir.join("Series 002.cbz"), b"").unwrap();
         fs::write(dir.join("cover.jpg"), b"").unwrap(); // not a comic
         fs::write(dir.join("notes.txt"), b"").unwrap();
-        let got = first_comic_file(&dir).unwrap();
-        assert_eq!(got.file_name().unwrap().to_string_lossy(), "Series 002.cbz");
+        let got: Vec<String> = comic_files_sorted(&dir).iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(got, vec!["Series 002.cbz", "Series 010.cbz"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

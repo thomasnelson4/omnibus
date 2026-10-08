@@ -10,6 +10,8 @@ import { AuditLogger } from '@/lib/audit-logger';
 import { moveFileSafe } from '@/lib/utils/safe-fs';
 import { countArchivePages } from '@/lib/utils/archive-pages';
 import { recordLibraryChange } from '@/lib/komga/changes';
+import { carriedStamp } from '@/lib/file-added';
+import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
 
 export async function POST(request: NextRequest) {
     try {
@@ -63,6 +65,7 @@ export async function POST(request: NextRequest) {
         const safePublisher = series.publisher ? series.publisher.replace(/[<>:"/\\|?*]/g, '').trim() : "Other";
         const safeName = series.name ? series.name.replace(/[<>:"/\\|?*]/g, '').trim() : "Unknown Series";
         const safeYear = series.year ? series.year.toString() : "";
+        const safeImprint = series.imprint ? sanitizeNamingPart(series.imprint) : "";
         
         const issueNumStr = targetIssue.number;
         let formattedNum = issueNumStr;
@@ -90,7 +93,7 @@ export async function POST(request: NextRequest) {
         }
 
         // 4. Generate the new file name (Added {VolumeYear} and {IssueYear} tags)
-        const newFileName = filePatternToUse
+        let newFileName = filePatternToUse
             .replace(/{Publisher}/gi, safePublisher)
             .replace(/{Series}/gi, safeName)
             .replace(/{Year}/gi, safeYear)
@@ -98,11 +101,13 @@ export async function POST(request: NextRequest) {
             .replace(/{IssueYear}/gi, issueYear)
             .replace(/{Issue}/gi, formattedNum || "")
             .replace(/{IssueTitle}/gi, cleanIssueName.replace(/[<>:"/\\|?*]/g, '').trim()) // <-- ADD THIS
-            .replace(/{UniverseName}/gi, "") // <-- ADD THIS
+            .replace(/{UniverseName}/gi, ""); // <-- ADD THIS
+
+        newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
             .replace(/\(\s*\)/g, '')
             .replace(/\[\s*\]/g, '')
-            .replace(/\s*-\s*-/g, ' - ') // <-- ADD THIS
-            .replace(/(^\s*-\s*|\s*-\s*$)/g, '') // <-- ADD THIS
+            .replace(/\s*-\s*-/g, ' - ')
+            .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
             .replace(/\s+/g, ' ')
             .trim() + ext;
 
@@ -151,7 +156,10 @@ export async function POST(request: NextRequest) {
                     filePath: finalFilePath,
                     status: 'DOWNLOADED',
                     // Persist the page total so OPDS (pse:count) can stream this issue.
-                    pageCount: await countArchivePages(finalFilePath)
+                    pageCount: await countArchivePages(finalFilePath),
+                    // #206 follow-up: a re-home, not an arrival — the file keeps the time the
+                    // unmatched row it came from was announced with.
+                    fileAddedAt: carriedStamp(unmatchedIssue),
                 }
             }),
             prisma.issue.delete({

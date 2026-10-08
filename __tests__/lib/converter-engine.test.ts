@@ -24,7 +24,8 @@ vi.mock('fs-extra', () => ({
         read: vi.fn(),
         close: vi.fn(),
         readdir: vi.fn().mockResolvedValue([]),
-        existsSync: vi.fn().mockReturnValue(true),
+        // Every path exists except the target .cbz (an existing one would refuse the conversion — beta.021).
+        existsSync: vi.fn((p: string) => !String(p).endsWith('.cbz')),
         remove: vi.fn().mockResolvedValue(true)
     }
 }));

@@ -39,6 +39,30 @@ function queueSeriesJsonExport(seriesId: string, tag: string) {
     ).catch(e => Logger.log(`[Attachments API] Couldn't queue the series.json export: ${getErrorMessage(e)}`, 'warn'));
 }
 
+/**
+ * Rewrite the ComicInfo of every file in an attachment's lane once its pass has run (#238). A
+ * claimed file otherwise keeps the XML it had before the attach — the parent volume's id, the series'
+ * year, no issue id — until the series' next refresh, and the attached volume's id in the file is
+ * half of the zero-API restore. Same FIRE-AND-FORGET rule as the series.json export, and a failure
+ * here never fails the attach: the next refresh rewrites these files anyway.
+ */
+async function queueLaneEmbed(attachmentId: string) {
+    try {
+        const rows = await prisma.issue.findMany({
+            where: { attachedVolumeId: attachmentId, filePath: { not: null } },
+            select: { id: true, filePath: true },
+        });
+        const issueIds = rows.filter(r => r.filePath).map(r => r.id);
+        if (issueIds.length === 0) return;
+        void omnibusQueue.add('EMBED_METADATA',
+            { type: 'EMBED_METADATA', issueIds },
+            { jobId: `EMBED_META_ATTACH_${attachmentId}_${Date.now()}` }
+        ).catch(e => Logger.log(`[Attachments API] Couldn't queue the ComicInfo rewrite: ${getErrorMessage(e)}`, 'warn'));
+    } catch (e) {
+        Logger.log(`[Attachments API] Couldn't queue the ComicInfo rewrite: ${getErrorMessage(e)}`, 'warn');
+    }
+}
+
 async function requireAdmin() {
     const session = await getServerSession(await getAuthOptions());
     if (session?.user?.role !== 'ADMIN') return null;
@@ -71,7 +95,7 @@ async function attachLocal(session: any, series: any, kind: string, body: any) {
             owner: {
                 id: series.id, name: series.name, year: series.year ?? null, publisher: series.publisher ?? null,
                 metadataSource: series.metadataSource || 'COMICVINE', metadataId: series.metadataId ?? null,
-                folderPath: series.folderPath, isManga: !!series.isManga,
+                folderPath: series.folderPath, isManga: !!series.isManga, imprint: series.imprint ?? null,
             },
             source: sourcePath, sourceSeriesId: sourceSeries?.id ?? null,
             metadataSource: 'LOCAL', volumeId, volumeName: name, volumeYear: startYear || 0,
@@ -116,6 +140,7 @@ async function attachLocal(session: any, series: any, kind: string, body: any) {
     }
 
     queueSeriesJsonExport(series.id, `ATTACH_LOCAL_${attachment.id}`);
+    await queueLaneEmbed(attachment.id);
     await AuditLogger.log('ATTACH_VOLUME', { seriesId: series.id, seriesName: series.name, metadataSource: 'LOCAL', volumeId, kind, name, local: true, summary }, session.user.id);
     return NextResponse.json({
         success: true, local: true, attachmentId: attachment.id, name,
@@ -239,6 +264,8 @@ export async function POST(request: Request) {
         // against a dead/wedged Redis never settles, and awaiting it would hang the whole response
         // long after the import itself succeeded (the beta.027 settings-save incident, exactly).
         queueSeriesJsonExport(seriesId, `ATTACH_${attachment.id}`);
+        // The files the pass claimed get the attached volume's ComicInfo now, not at the next refresh (#238).
+        await queueLaneEmbed(attachment.id);
 
         await AuditLogger.log('ATTACH_VOLUME', {
             seriesId, seriesName: series.name, metadataSource, volumeId, kind, summary,

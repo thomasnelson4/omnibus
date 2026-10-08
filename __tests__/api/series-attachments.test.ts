@@ -5,6 +5,7 @@ import { GET, POST, PUT, DELETE } from '@/app/api/library/series/attachments/rou
 import { prisma } from '@/lib/db';
 import { getServerSession } from 'next-auth/next';
 import { engineFetchLong } from '@/lib/engine';
+import { omnibusQueue } from '@/lib/queue';
 import { makePostJson, getReq } from '../helpers/request';
 
 vi.mock('next-auth/next', () => ({ getServerSession: vi.fn() }));
@@ -39,6 +40,9 @@ const deleteReq = (body: any) => new Request('http://localhost/api/library/serie
 
 const engineOk = (summary: any) => ({ ok: true, status: 200, json: async () => ({ ok: true, results: [summary] }) });
 
+/** The EMBED_METADATA jobs the route queued (the series.json export is queued alongside). */
+const embedJobs = () => (omnibusQueue.add as any).mock.calls.filter((c: any[]) => c[0] === 'EMBED_METADATA');
+
 describe('API: /api/library/series/attachments', () => {
     beforeEach(() => {
         vi.clearAllMocks();
@@ -48,9 +52,60 @@ describe('API: /api/library/series/attachments', () => {
         });
         (prisma.attachedVolume.upsert as any).mockResolvedValue({ id: 'att1', name: null });
         (prisma.series.findFirst as any).mockResolvedValue(null); // no standalone twin by default
+        (prisma.issue.findMany as any).mockResolvedValue([]); // the lane owns no files by default
+        (omnibusQueue.add as any).mockResolvedValue({});
         (engineFetchLong as any).mockResolvedValue(engineOk({
             attachment_id: 'att1', name: 'Batman Annual', total: 4, claimed: 2, created: 2, updated: 0, unclaimed: 1,
         }));
+    });
+
+    // #238: the files an attach claims kept the ComicInfo written before it — the parent volume's id,
+    // the series' year, no issue id — until the series' next refresh. They are rewritten right away now,
+    // which also puts the attached volume's id into them (half of the zero-API restore).
+    it("rewrites the ComicInfo of the lane's files once the attach pass succeeds", async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([
+            { id: 'a1', filePath: '/comics/Batman/Batman Annual #001 (2012).cbz' },
+            { id: 'a2', filePath: '/comics/Batman/Batman Annual #002 (2013).cbz' },
+        ]);
+
+        const res = await POST(createReq({ seriesId: 's1', volumeId: '49197', metadataSource: 'COMICVINE' }));
+
+        expect(res.status).toBe(200);
+        expect(prisma.issue.findMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ attachedVolumeId: 'att1' }),
+        }));
+        expect(embedJobs()).toEqual([[
+            'EMBED_METADATA',
+            { type: 'EMBED_METADATA', issueIds: ['a1', 'a2'] },
+            expect.objectContaining({ jobId: expect.stringContaining('att1') }),
+        ]]);
+    });
+
+    it('queues no rewrite when the lane owns no files (skeletons only)', async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([{ id: 'sk1', filePath: '' }]);
+
+        await POST(createReq({ seriesId: 's1', volumeId: '49197' }));
+
+        expect(embedJobs()).toEqual([]);
+    });
+
+    it('answers without waiting on the queue (a dead Redis never settles an add)', async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([{ id: 'a1', filePath: '/comics/Batman/a1.cbz' }]);
+        (omnibusQueue.add as any).mockReturnValue(new Promise(() => {}));
+
+        const res = await POST(createReq({ seriesId: 's1', volumeId: '49197' }));
+
+        expect(res.status).toBe(200);
+        expect(embedJobs()).toHaveLength(1);
+    });
+
+    it('still reports the attach when the rewrite cannot be queued', async () => {
+        (prisma.issue.findMany as any).mockRejectedValue(new Error('database is locked'));
+
+        const res = await POST(createReq({ seriesId: 's1', volumeId: '49197' }));
+
+        expect(res.status).toBe(200);
+        expect((await res.json()).success).toBe(true);
     });
 
     it('attaches a volume and reports what the pass actually did', async () => {
@@ -91,6 +146,8 @@ describe('API: /api/library/series/attachments', () => {
         // The link is the user's decision — a provider outage must not undo it.
         expect(data.attachmentId).toBe('att1');
         expect(prisma.attachedVolume.delete).not.toHaveBeenCalled();
+        // Nothing was claimed, so nothing is rewritten.
+        expect(embedJobs()).toEqual([]);
     });
 
     it('rejects non-admins and unknown sources/kinds', async () => {
@@ -232,7 +289,24 @@ describe('API: attachments — LOCAL (no provider volume)', () => {
             id: where.seriesId_metadataSource_volumeId.volumeId === 'local_old' ? 'attExisting' : 'attL', ...create,
         }));
         (prisma.series.findFirst as any).mockResolvedValue(null);
+        (prisma.issue.findMany as any).mockResolvedValue([]);
+        (omnibusQueue.add as any).mockResolvedValue({});
         (engineFetchLong as any).mockResolvedValue(engineOk({ attachment_id: 'attL', name: 'Saga Compendium', total: 1, claimed: 1, created: 0, updated: 0, unclaimed: 0 }));
+    });
+
+    it("rewrites the ComicInfo of the files the engine's local claim pass took (#238)", async () => {
+        (prisma.issue.findMany as any).mockResolvedValue([{ id: 'l1', filePath: '/comics/Image/Saga (2012)/Saga Compendium.cbz' }]);
+
+        await POST(createReq({ seriesId: 's1', metadataSource: 'LOCAL', kind: 'COLLECTED', name: 'Saga Compendium' }));
+
+        expect(prisma.issue.findMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ attachedVolumeId: 'attL' }),
+        }));
+        expect(embedJobs()).toEqual([[
+            'EMBED_METADATA',
+            { type: 'EMBED_METADATA', issueIds: ['l1'] },
+            expect.objectContaining({ jobId: expect.stringContaining('attL') }),
+        ]]);
     });
 
     it('creates the attachment under a local id and has the engine claim its files by name', async () => {

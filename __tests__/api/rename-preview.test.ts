@@ -36,8 +36,21 @@ describe('API Route: Rename Preview', () => {
         mocks.libraryFindMany.mockResolvedValue([{ id: 'lib_1', path: '/data/comics', isDefault: true, isManga: false }]);
         mocks.seriesFindUnique.mockResolvedValue({
             id: 'series_1', libraryId: 'lib_1', folderPath: '/data/comics/DC Comics/Batman (2016)',
-            publisher: 'DC Comics', name: 'Batman', year: 2016, isManga: false,
+            publisher: 'DC Comics', name: 'Batman', year: 2016, imprint: 'Black $& Label', isManga: false,
         });
+    });
+
+    it('preserves the previous cleanup result for templates without Imprint', async () => {
+        mocks.issueFindMany.mockResolvedValue([{
+            id: 'issue_1', number: '1', name: 'Batman #1', releaseDate: '2016-01-01',
+            filePath: '/data/comics/old/Batman 1.cbz', attachedVolume: null,
+        }]);
+        const res = await post({
+            seriesIds: ['series_1'], folderPattern: '{Series}', filePattern: '{Series} --- #{Issue}',
+        });
+        const { previews } = await res.json();
+        // Original Node cleanup and the Rust renamer each collapse the hyphen run once.
+        expect(previews[0].newPath).toBe('/data/comics/Batman/Batman - - #001.cbz');
     });
 
     it('promises a LOCAL collected edition\'s books under the edition\'s name, and everything else under the series', async () => {
@@ -77,5 +90,20 @@ describe('API Route: Rename Preview', () => {
         vi.mocked(getToken).mockResolvedValueOnce({ id: 'u1', role: 'USER' } as never);
         const res = await post({ seriesIds: ['series_1'], folderPattern: '{Series}', filePattern: '{Series} #{Issue}' });
         expect(res.status).toBe(403);
+    });
+
+    it('resolves repeated case variants of {Imprint} literally in folder and file names', async () => {
+        mocks.issueFindMany.mockResolvedValue([{
+            id: 'issue_1', number: '1', name: 'Batman #1', releaseDate: '2016-01-01',
+            filePath: '/data/comics/old/Batman 1.cbz', attachedVolume: null,
+        }]);
+
+        const res = await post({
+            seriesIds: ['series_1'],
+            folderPattern: '{imprint}/{IMPRINT}/{Series}',
+            filePattern: '{Imprint} {imprint} #{Issue}',
+        });
+        const { previews } = await res.json();
+        expect(previews[0].newPath).toBe('/data/comics/Black $& Label/Black $& Label/Batman/Black $& Label Black $& Label #001.cbz');
     });
 });

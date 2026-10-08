@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import AdmZip from 'adm-zip';
 import sharp from 'sharp';
 import crypto from 'crypto';
 import os from 'os';
@@ -13,6 +12,7 @@ import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getAccessibleLibraryPaths, canAccessPath } from '@/lib/library-access';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
+import { readArchivePage } from '@/lib/utils/archive-pages';
 
 // Atomic disk-cache write: temp file → rename, so concurrent requests for the same page can't serve a
 // half-written image. Best-effort + non-blocking (fire-and-forget).
@@ -48,53 +48,20 @@ setInterval(() => {
     }
 }, 60 * 60 * 1000); 
 
-const zipCache = new Map<string, { zip: AdmZip, lastAccessed: number }>();
-const MAX_CACHE_SIZE = 6; // Optimized for high-RAM (64GB+) environments
+// The reader's page width. Crop mode asks the engine for a wider page, trims the margins here, then
+// fits the result to READER_WIDTH - the same output as trimming the original (the engine never
+// enlarges a page, so a small page stays its own size).
+const READER_WIDTH = 1600;
+const CROP_SOURCE_WIDTH = 2400;
 
-// Aggressive cache cleanup (runs every 30 seconds)
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, data] of zipCache.entries()) {
-        // Reduced TTL: Drop cache if untouched for 60 seconds
-        if (now - data.lastAccessed > 60 * 1000) {
-            zipCache.delete(key);
-        }
+// Crop mode: trim the uniform margins, then fit the reader's width. A page sharp can't trim (one
+// solid colour) is served untrimmed rather than failing the request.
+async function trimToReaderWidth(buffer: Buffer): Promise<Buffer> {
+    try {
+        return await sharp(buffer).trim().resize({ width: READER_WIDTH, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
+    } catch {
+        return await sharp(buffer).resize({ width: READER_WIDTH, withoutEnlargement: true }).webp({ quality: 80 }).toBuffer();
     }
-}, 30000); 
-
-function getZipInstance(filePath: string) {
-    const now = Date.now();
-    
-    // Size-based bypass: Since the host has ample RAM, we can safely increase this bypass limit to 1GB.
-    // Files over 1GB will bypass the cache to prevent extreme spikes.
-    const stats = fs.statSync(filePath);
-    const isMassiveFile = stats.size > 1024 * 1024 * 1024; // 1GB
-
-    if (isMassiveFile) {
-        Logger.log(`[Reader] Bypassing cache for massive file (>1GB): ${filePath}`, 'debug');
-        return new AdmZip(filePath);
-    }
-
-    let cached = zipCache.get(filePath);
-    
-    if (!cached) {
-        if (zipCache.size >= MAX_CACHE_SIZE) {
-            let oldestKey = null;
-            let oldestTime = Infinity;
-            for (const [key, data] of zipCache.entries()) {
-                if (data.lastAccessed < oldestTime) {
-                    oldestTime = data.lastAccessed;
-                    oldestKey = key;
-                }
-            }
-            if (oldestKey) zipCache.delete(oldestKey);
-        }
-        cached = { zip: new AdmZip(filePath), lastAccessed: now };
-        zipCache.set(filePath, cached);
-    } else {
-        cached.lastAccessed = now;
-    }
-    return cached.zip;
 }
 
 export async function GET(request: Request) {
@@ -164,55 +131,42 @@ export async function GET(request: Request) {
     }
 
     // --- ENGINE OFFLOAD ---
-    // Hand the extract + resize + WebP encode to the Rust engine so the whole-archive AdmZip buffer and
-    // sharp don't run on the Node event loop (which serves every request). The auto-crop path has no
-    // clean engine equivalent, so for zips it stays local; a zip failure (engine down, older engine
-    // without the route, unreadable page) falls through to the local sharp path below.
-    // Engine-native archives (RAR, 7z/.cb7): the engine is the ONLY extractor — Node has no reader
-    // for them — so crop requests trim the engine's WebP output locally instead of skipping the offload.
-    if (!shouldCrop || isEngineFormat) {
-        try {
-            const engineRes = await fetch(ENGINE_URL + '/api/reader/page', {
-                method: 'POST',
-                headers: engineHeaders({ 'Content-Type': 'application/json' }),
-                body: JSON.stringify({ path: filePath, entry: pageName, width: 1600, quality: 80 }),
-            });
-            if (engineRes.ok) {
-                let engineBuffer: Buffer = Buffer.from(await engineRes.arrayBuffer());
-                if (engineBuffer.length > 0) {
-                    if (isEngineFormat && shouldCrop) {
-                        engineBuffer = await sharp(engineBuffer).trim().webp({ quality: 80 }).toBuffer();
-                    }
-                    writePageCacheAtomic(cacheFilePath, engineBuffer);
-                    return new NextResponse(engineBuffer as unknown as BodyInit, {
-                        headers: { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' },
-                    });
-                }
+    // Hand the extract + resize + WebP encode to the Rust engine for every archive type, so no archive
+    // is ever loaded into Node's memory and sharp stays off the event loop (which serves every
+    // request). Crop mode included: the engine returns a wider page and it's trimmed here. Any
+    // failure (engine down, older engine without the route, unreadable page) falls through to the
+    // local path below.
+    try {
+        const engineRes = await fetch(ENGINE_URL + '/api/reader/page', {
+            method: 'POST',
+            headers: engineHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ path: filePath, entry: pageName, width: shouldCrop ? CROP_SOURCE_WIDTH : READER_WIDTH, quality: 80 }),
+        });
+        if (engineRes.ok) {
+            let engineBuffer: Buffer = Buffer.from(await engineRes.arrayBuffer());
+            if (engineBuffer.length > 0) {
+                if (shouldCrop) engineBuffer = await trimToReaderWidth(engineBuffer);
+                writePageCacheAtomic(cacheFilePath, engineBuffer);
+                return new NextResponse(engineBuffer as unknown as BodyInit, {
+                    headers: { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' },
+                });
             }
-            // Non-OK (e.g. 404 page-not-found, or an older engine) → fall through to the local path.
-        } catch (e) {
-            Logger.log(`[Reader] Engine page offload unavailable, using local extraction: ${getErrorMessage(e)}`, 'debug');
         }
+        // Non-OK (e.g. 404 page-not-found, or an older engine) → fall through to the local path.
+    } catch (e) {
+        Logger.log(`[Reader] Engine page offload unavailable, using local extraction: ${getErrorMessage(e)}`, 'debug');
     }
 
-    // No local fallback exists for RAR/7z — AdmZip below can't open them.
+    // No local fallback exists for RAR/7z — Node has no reader for them.
     if (isEngineFormat) {
         return new NextResponse("Native page extraction requires the engine. Check that the engine container is running, or wait for the CBZ auto-conversion.", { status: 502 });
     }
 
-    const zipInstance = getZipInstance(filePath);
-    
-    let zipEntry = zipInstance.getEntry(pageName) || zipInstance.getEntry(pageName.replace(/\//g, '\\'));
-    
-    if (!zipEntry) {
-        const getBaseName = (p: string) => p.split(/[/\\]/).pop() || p;
-        const targetFile = getBaseName(pageName);
-        zipEntry = zipInstance.getEntries().find(e => getBaseName(e.entryName) === targetFile) || null;
-    }
+    // Engine unavailable: read just this page through the zip's index (lib/utils/archive-pages) - the
+    // whole archive is never loaded, whatever its size.
+    const buffer = await readArchivePage(filePath, pageName);
+    if (!buffer) return new NextResponse("Page Not Found", { status: 404 });
 
-    if (!zipEntry) return new NextResponse("Page Not Found", { status: 404 });
-    
-    const buffer = zipEntry.getData();
     let finalBuffer = buffer;
     let contentType = 'image/jpeg';
 

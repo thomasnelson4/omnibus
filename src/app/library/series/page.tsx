@@ -33,9 +33,12 @@ import PageManagerModal from "@/components/page-manager-modal"
 import { AttachedVolumesManager } from "@/components/attached-volumes-manager"
 import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
 import { CoverageField } from "@/components/coverage-field"
+import { CollectedReadButton, CollectedProgressBadge } from "@/components/collected-read-button"
 import { CoveredIssuesSection } from "@/components/covered-issues-section"
 import { requestNameFor } from "@/lib/utils/request-name"
 import { InteractiveSearchModal } from "@/components/interactive-search-modal"
+import { hasMetronCredentials } from "@/lib/metron/credentials"
+import { RefreshMetadataButton } from "@/components/refresh-metadata-button"
 
 // Loop-safe fallback for cover <img>s: on a broken cover, swap to the series cover; if that also fails,
 // hide the element rather than show the browser's broken-image glyph. (The issue grid had no onError, so
@@ -108,7 +111,6 @@ function SeriesContent() {
   const [metronConfigured, setMetronConfigured] = useState(false);
   
   const [copied, setCopied] = useState(false);
-  const [isRefreshingMetadata, setIsRefreshingMetadata] = useState(false);
   const [isScanningDirectory, setIsScanningDirectory] = useState(false);
 
   const [matchModalOpen, setMatchModalOpen] = useState(false);
@@ -270,11 +272,7 @@ function SeriesContent() {
         fetch('/api/admin/config')
             .then(res => res.ok ? res.json() : null)
             .then(data => {
-                if (data?.settings) {
-                    const mUser = data.settings.find((s: any) => s.key === 'metron_user')?.value;
-                    const mPass = data.settings.find((s: any) => s.key === 'metron_pass')?.value;
-                    if (mUser && mPass) setMetronConfigured(true);
-                }
+                if (data?.settings && hasMetronCredentials(data.settings)) setMetronConfigured(true);
             })
             .catch(() => {});
     }
@@ -557,32 +555,6 @@ function SeriesContent() {
       setIsMoving(false);
     }
   };
-
-  const handleRefreshMetadata = async () => {
-    if (!seriesInfo.metadataId && !seriesInfo.cvId) return;
-    setIsRefreshingMetadata(true);
-    toast({ title: "Sync Queued", description: "Metadata is being refreshed in the background." });
-    
-    try {
-        const targetId = seriesInfo.metadataId || seriesInfo.cvId?.toString();
-        const res = await fetch('/api/library/refresh-metadata', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ metadataId: targetId, metadataSource: seriesInfo.metadataSource || 'COMICVINE', folderPath: folderPath })
-        });
-        
-        if (res.ok) {
-            toast({ title: "Task Queued", description: "You will receive a notification when the sync is complete." });
-        } else {
-            const err = await res.json();
-            toast({ title: "Refresh Failed", description: err.error, variant: "destructive" });
-        }
-    } catch (e: any) {
-        toast({ title: "Error", description: e.message, variant: "destructive" });
-    } finally {
-        setIsRefreshingMetadata(false);
-    }
-  }
 
   const handleRequestMissing = async (issue: any) => {
         if (!canRequest) {
@@ -1439,16 +1411,13 @@ function SeriesContent() {
         </Link>
       </Button>
                         
-                        {isAdmin && (
-                            <Button 
-                                variant="secondary" 
-                                className="w-full transition-all shadow-sm active:scale-95 border-border hover:bg-muted text-foreground font-bold" 
-                                disabled={isRefreshingMetadata} 
-                                onClick={handleRefreshMetadata}
-                            >
-                                {isRefreshingMetadata ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <RefreshCw className="w-4 h-4 mr-2" />}
-                                Refresh Metadata
-                            </Button>
+                        {/* Asks before fetching per-issue Metron credits while that setting is off (Metron beta 4). */}
+                        {isAdmin && (seriesInfo.metadataId || seriesInfo.cvId) && (
+                            <RefreshMetadataButton
+                                metadataId={seriesInfo.metadataId || seriesInfo.cvId?.toString() || ''}
+                                metadataSource={seriesInfo.metadataSource || 'COMICVINE'}
+                                folderPath={folderPath}
+                            />
                         )}
 
                         {isAdmin && (
@@ -1806,10 +1775,11 @@ function SeriesContent() {
                                           activeIssue?.id === book.id ? "border-primary ring-2 ring-primary/30" : "border-border"
                                       )}
                                   >
-                                      <div className="w-12 h-[68px] shrink-0 rounded overflow-hidden bg-muted border border-border">
+                                      <div className="w-12 h-[68px] shrink-0 rounded overflow-hidden bg-muted border border-border relative">
                                           {book.coverUrl
                                               ? <img src={book.coverUrl} alt="" className="w-full h-full object-cover" onError={coverImgError(seriesInfo.cover)} />
                                               : null}
+                                          {owned && <CollectedProgressBadge book={book} />}
                                       </div>
                                       <div className="min-w-0 flex-1">
                                           <p className="text-sm font-bold text-foreground truncate" title={book.name}>{book.name}</p>
@@ -1824,6 +1794,8 @@ function SeriesContent() {
                                               className="mt-1"
                                           />
                                       </div>
+                                      {/* #215: an owned collection reads like any issue — straight into the reader. */}
+                                      {owned && <CollectedReadButton book={book} seriesFolder={folderPath || ''} />}
                                       {/* Collections sit outside the run's missing-issue math, so they
                                           need their own way to be asked for — searched by the book's
                                           own title, never as "{Series} #N". */}
@@ -2300,7 +2272,7 @@ function SeriesContent() {
                   <DialogDescription>
                       This will physically move and rename the files on your hard drive to match your selected naming conventions.
                       <br/><br/>
-                      <span className="text-[11px] font-mono opacity-80">Available tags: {"{Publisher}"}, {"{Series}"}, {"{VolumeYear}"}, {"{IssueYear}"}, {"{Issue}"}</span>
+                      <span className="text-[11px] font-mono opacity-80">Available tags: {"{Publisher}"}, {"{Imprint}"}, {"{Series}"}, {"{VolumeYear}"}, {"{IssueYear}"}, {"{Issue}"}</span>
                   </DialogDescription>
               </DialogHeader>
               

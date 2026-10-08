@@ -1,11 +1,10 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
-import AdmZip from 'adm-zip';
-import { prisma } from '@/lib/db'; 
+import { prisma } from '@/lib/db';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
-import { IMAGE_EXT_REGEX } from '@/lib/utils/formats';
+import { listArchivePages } from '@/lib/utils/archive-pages';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getAccessibleLibraryPaths, canAccessPath } from '@/lib/library-access';
@@ -74,17 +73,10 @@ export async function GET(request: Request) {
         return NextResponse.json({ error: "Unsupported file format." }, { status: 400 });
     }
 
-    Logger.log(`[Reader Debug] Initiating AdmZip extraction...`, 'debug');
-    const zip = new AdmZip(filePath);
-    const zipEntries = zip.getEntries();
-    Logger.log(`[Reader Debug] Archive contains ${zipEntries.length} total raw entries. Filtering for valid images...`, 'debug');
-
-    const pages = zipEntries
-      .filter(entry => {
-        const name = entry.entryName.toLowerCase();
-        return !entry.isDirectory && !name.includes('__macosx') && IMAGE_EXT_REGEX.test(name);
-      })
-      .map(entry => entry.entryName);
+    // Pages come from the zip's index alone (#215): AdmZip read the whole archive into memory just to
+    // list names - a spike on a 1-2 GB compendium and a hard failure over 2 GB. Same page filter and
+    // the same entry names as before, so reader/image resolves them 1:1.
+    const pages = await listArchivePages(filePath);
 
     pages.sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
 

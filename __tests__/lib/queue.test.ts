@@ -152,6 +152,18 @@ describe('Cron: BullMQ Worker Router', () => {
         expect(mocks.jobLogCreate).not.toHaveBeenCalled();
     });
 
+    // Metron beta 4: a person's yes to the Refresh button's per-issue credits ask reaches the engine.
+    it('should forward a refresh\'s fetchCredits to the engine as fetch_credits', async () => {
+        initWorker();
+
+        await mocks.workerCb.current({ id: 'job_meta_credits', data: { type: 'METADATA_SYNC', seriesIds: ['series_1'], fetchCredits: true }, updateProgress: vi.fn() });
+
+        expect(mocks.engineFetch).toHaveBeenCalledWith(
+            `${ENGINE_URL}/api/metadata/sync`,
+            expect.objectContaining({ body: JSON.stringify({ series_ids: ['series_1'], fetch_credits: true }) })
+        );
+    });
+
     it('should forward a scheduled METADATA_SYNC with series_ids null and bump the schedule timer', async () => {
         initWorker();
 
@@ -353,6 +365,12 @@ describe('Cron: BullMQ Worker Router', () => {
         };
 
         await mocks.workerCb.current(mockJob);
+
+        // The week's arrivals are by Issue.fileAddedAt (#206 follow-up) — a download filling an old
+        // placeholder is this week's news even though its row was born earlier.
+        const digestQuery = mocks.issueFindMany.mock.calls.map((c: any) => c[0]).find((a: any) => a?.where?.filePath);
+        expect(digestQuery.where.fileAddedAt.gte).toBeInstanceOf(Date);
+        expect(digestQuery.where.createdAt).toBeUndefined();
 
         // Verify the Mailer was dispatched with the correct compiled payload
         expect(mocks.sendWeeklyDigest).toHaveBeenCalledWith(

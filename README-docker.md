@@ -109,7 +109,7 @@ services:
       - /path/to/your/nas/config:/config
       
       # -------------------------------------------------------------------------
-      # OPTION 1: The Recommended Single Data Mount (Fast Atomic Moves/Hardlinks)
+      # OPTION 1: The Recommended Single Data Mount (Fast Atomic Moves)
       # -------------------------------------------------------------------------
       # Maps your entire media/download root to /data for optimal performance
       - /path/to/your/nas/data:/data 

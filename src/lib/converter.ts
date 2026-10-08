@@ -37,6 +37,15 @@ export async function convertCbrToCbz(cbrPath: string): Promise<string | null> {
     if (!cbrPath || !cbrPath.toLowerCase().match(/\.(cbr|rar|cb7)$/)) return null;
     const cbzPath = cbrPath.replace(/\.(cbr|rar|cb7)$/i, '.cbz');
 
+    // Never clobber an existing .cbz (the engine's rule for conversion, page removal and cover
+    // insertion). Checked before the engine call too: a conversion the engine refuses answers 500,
+    // and the local pipeline below must not then overwrite the file it protected. The original
+    // stays as it is - CBR/CB7 read natively through the engine.
+    if (fs.existsSync(cbzPath)) {
+        Logger.log(`[Converter] ${path.basename(cbzPath)} already exists next to ${path.basename(cbrPath)} — keeping the original; resolve the duplicate first.`, 'warn');
+        return null;
+    }
+
     // --- ENGINE OFFLOAD ---
     // The Rust engine runs the identical pipeline (unrar-primary native extraction, WebP settings,
     // Issue.filePath repoint) without tying up the Node event loop or heap. Any failure falls
@@ -63,6 +72,8 @@ export async function convertCbrToCbz(cbrPath: string): Promise<string | null> {
 
     // --- THE FIX: Safe local fallback path to /config/cache ---
     const tempDir = path.join(CACHE_DIR, `cbr_${crypto.randomBytes(8).toString('hex')}`);
+    // The new archive is built beside the original under this name, then moved into place.
+    const tempCbzPath = `${cbzPath}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     try {
         await fs.ensureDir(tempDir);
         Logger.log(`[Converter] Starting conversion for: ${path.basename(cbrPath)}`, 'info');
@@ -197,8 +208,21 @@ export async function convertCbrToCbz(cbrPath: string): Promise<string | null> {
             zip.addLocalFile(comicInfoPath, "", "ComicInfo.xml");
         }
 
-        zip.writeZip(cbzPath);
-        
+        // Written to a temp file and moved into place without overwriting: an interrupted run never
+        // leaves a half-written .cbz, and an existing file is never written into (AdmZip's writeZip
+        // truncates its target). A .cbz that arrived while this one was built wins; the original stays.
+        zip.writeZip(tempCbzPath);
+        try {
+            await fs.move(tempCbzPath, cbzPath, { overwrite: false });
+        } catch (moveErr) {
+            await fs.remove(tempCbzPath).catch(() => {});
+            if (fs.existsSync(cbzPath)) {
+                Logger.log(`[Converter] ${path.basename(cbzPath)} appeared while converting ${path.basename(cbrPath)} — keeping the original; resolve the duplicate first.`, 'warn');
+                return null;
+            }
+            throw moveErr;
+        }
+
         if (fs.existsSync(cbrPath)) {
             await fs.remove(cbrPath);
         }
@@ -221,6 +245,9 @@ export async function convertCbrToCbz(cbrPath: string): Promise<string | null> {
         Logger.log(`[Converter] Failed to convert ${path.basename(cbrPath)}: ${getErrorMessage(error)}`, 'error');
         return null;
     } finally {
+        if (fs.existsSync(tempCbzPath)) {
+            await fs.remove(tempCbzPath).catch(() => {});
+        }
         if (fs.existsSync(tempDir)) {
             await fs.remove(tempDir).catch(() => {});
         }

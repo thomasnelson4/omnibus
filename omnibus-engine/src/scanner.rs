@@ -831,6 +831,96 @@ fn issue_file_meta(info: Option<&ScanComicInfo>) -> IssueFileMeta {
     }
 }
 
+/// The archive that speaks for a folder outside a full scan — the cover backfill's page and the
+/// unmatched sweep's identity evidence: the lowest natural-sorted archive that isn't an annual, by
+/// the same signals as `identity_info`. #237: the lowest file alone can be an annual — ComicVine
+/// names annual volumes without "The", so "Amazing Spider-Man Annual 001" sorts before "The Amazing
+/// Spider-Man 001" — and the series wore the annual's cover; an attached annual's ComicInfo names
+/// the ANNUAL volume, so the sweep could have matched the folder to it. A name that says "Annual" is
+/// skipped without opening the file; the rest are checked against their ComicInfo ('96-style
+/// one-offs). An all-annual folder falls back to its first file.
+fn folder_run_witness(folder: &Path) -> Option<(std::path::PathBuf, Option<ScanComicInfo>)> {
+    let files = crate::converter::comic_files_sorted(folder);
+    for path in &files {
+        let file_name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        if annual_flag_for_signals(None, None, &file_name) {
+            continue;
+        }
+        let info = parse_comic_info(path);
+        let format = info.as_ref().and_then(|i| i.format.as_deref());
+        let number = info.as_ref().and_then(|i| i.number.as_deref());
+        if !annual_flag_for_signals(format, number, &file_name) {
+            return Some((path.clone(), info));
+        }
+    }
+    let first = files.into_iter().next()?;
+    let info = parse_comic_info(&first);
+    Some((first, info))
+}
+
+/// 5C's per-folder work: the folder's existing cover, else the first page of the archive that
+/// speaks for it, as the cover route URL the Series row stores.
+fn backfill_folder_cover(folder: &Path) -> Option<String> {
+    let (witness, _) = folder_run_witness(folder)?;
+    let cover = crate::converter::ensure_folder_cover(folder, &witness)?;
+    Some(format!("/api/library/cover?path={}", urlencoding::encode(&cover.to_string_lossy())))
+}
+
+/// Folder-level identity evidence for the unmatched-retry sweep (matcher.rs): the folder's first
+/// main-run file's ComicInfo (`folder_run_witness`, never an annual's) + the folder's series.json
+/// — the same precedence the scanner uses — with the
+/// live issue-id→volume resolution gated behind `allow_api` (budget-aware callers). Returns
+/// (metadataSource, metadataId, cv_id, metron_id) when the files identify the series.
+pub(crate) async fn folder_match_evidence(
+    db: &Db,
+    client: &reqwest::Client,
+    folder: &Path,
+    allow_api: bool,
+) -> Option<(String, String, Option<i32>, Option<i32>)> {
+    let f = folder.to_path_buf();
+    let (info, sj) = tokio::task::spawn_blocking(move || {
+        let info = folder_run_witness(&f).and_then(|(_, info)| info);
+        let sj = read_series_json(&f);
+        (info, sj)
+    })
+    .await
+    .ok()?;
+
+    let mut derived = info.as_ref().map(derive_meta);
+    if let Some(sj_id) = sj.as_ref().and_then(|j| j.comicid) {
+        match derived.as_mut() {
+            Some(d) => {
+                if d.cv_id.is_none() && d.metron_id.is_none() {
+                    d.cv_id = Some(sj_id as i32);
+                    d.recompute_resolved();
+                }
+            }
+            None => {
+                derived = Some(DerivedMeta {
+                    cv_id: Some(sj_id as i32),
+                    metron_id: None,
+                    cv_issue_id: None,
+                    metron_issue_id: None,
+                    metadata_id: Some(sj_id.to_string()),
+                    metadata_issue_id: None,
+                    metadata_source: "COMICVINE".to_string(),
+                    is_manga: false,
+                    parsed_year: sj.as_ref().and_then(|j| j.year),
+                });
+            }
+        }
+    }
+    if allow_api {
+        if let Some(d) = derived.as_mut() {
+            if d.metadata_id.is_none() {
+                let name = info.as_ref().and_then(|i| i.series.as_deref()).map(str::trim).filter(|s| !s.is_empty())
+                    .or_else(|| sj.as_ref().and_then(|j| j.name.as_deref()));
+                resolve_dynamic_ids(db, client, d, name).await;
+            }
+        }
+    }
+    derived.and_then(|d| d.metadata_id.clone().map(|id| (d.metadata_source.clone(), id, d.cv_id, d.metron_id)))
+}
 
 fn derive_meta(info: &ScanComicInfo) -> DerivedMeta {
     let mut cv_id = info.comic_vine_volume_id.as_deref().and_then(parse_i32);
@@ -1024,22 +1114,15 @@ async fn resolve_dynamic_ids(db: &Db, client: &reqwest::Client, d: &mut DerivedM
         }
         if let Some(auth) = crate::metadata::metron_auth(&db.pool).await {
             let url = format!("{}/api/series/?name={}", metron_base_url(), urlencoding::encode(series_name));
-            let resp = client
-                .get(&url)
-                .basic_auth(&auth.0, Some(&auth.1))
-                .header("User-Agent", "Omnibus/1.0")
-                .timeout(std::time::Duration::from_secs(15))
-                .send()
-                .await;
-            match resp {
-                Ok(r) if r.status().is_success() => {
-                    if let Ok(body) = r.json::<serde_json::Value>().await {
-                        let results = body.get("results").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-                        if let Some(id) = pick_metron_series(&results, series_name, d.parsed_year) {
-                            log::info!("[Scanner] Resolved Metron Series ID {} from Series Name search (Year Checked: {}).", id, d.parsed_year.map(|y| y.to_string()).unwrap_or_else(|| "None".to_string()));
-                            d.metron_id = Some(id);
-                            resolution_cache_set(metron_key, id).await;
-                        }
+            // Through the shared Metron client: paced from Metron's rate-limit headers, 429s honoured,
+            // counted in the usage panel, cached.
+            match crate::metron_client::metron_get(db, client, &auth, crate::metron_client::MetronRequest::new(&url)).await {
+                Ok((200, body)) => {
+                    let results = body.get("results").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    if let Some(id) = pick_metron_series(&results, series_name, d.parsed_year) {
+                        log::info!("[Scanner] Resolved Metron Series ID {} from Series Name search (Year Checked: {}).", id, d.parsed_year.map(|y| y.to_string()).unwrap_or_else(|| "None".to_string()));
+                        d.metron_id = Some(id);
+                        resolution_cache_set(metron_key, id).await;
                     }
                 }
                 _ => log::warn!("[Scanner] Failed to dynamically resolve Metron Series ID for: {}", series_name),
@@ -1348,8 +1431,8 @@ async fn exec_issue_insert(
            (id, "seriesId", "metadataId", "metadataSource", "matchState", number, "isAnnual", status, "filePath", "pageCount",
             name, description, "releaseDate", genres, writers, artists, "coverArtists", colorists, letterers, characters, teams, locations, "storyArcs", inker, editor, translator,
             tags, "mainCharacterOrTeam", "alternateSeries", "alternateNumber", "alternateCount", "storyArcNumber", gtin, notes, "scanInformation", review, "communityRating", "blackAndWhite",
-            "attachedVolumeId", "createdAt", "updatedAt")
-           VALUES ($1, $2, $3, $4, $5, $6, {annual}, 'DOWNLOADED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, {bw}, $36, {now}, {now})"#,
+            "attachedVolumeId", "fileAddedAt", "createdAt", "updatedAt")
+           VALUES ($1, $2, $3, $4, $5, $6, {annual}, 'DOWNLOADED', $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, {bw}, $36, {now}, {now}, {now})"#,
         annual = annual,
         bw = bw,
         now = db.now_expr()
@@ -2387,10 +2470,15 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
         for write in chunk {
             match write {
                 PendingIssueWrite::Repoint { issue_id, file, page_count } => {
+                    // Issue.fileAddedAt (#206 follow-up): a placeholder the scan fills is an
+                    // arrival; a matched file renamed on disk (the ghost pass nulled its path)
+                    // keeps its stamp.
                     if let Err(e) = sqlx::query(&format!(
                         r#"UPDATE "Issue" SET "filePath"=$1, status='DOWNLOADED',
                                "pageCount"=CASE WHEN $2 > 0 THEN $2 ELSE "pageCount" END,
+                               {stamp},
                                "updatedAt"={now} WHERE id=$3"#,
+                        stamp = crate::file_added::rescan_set(&db),
                         now = db.now_expr()
                     ))
                     .bind(file).bind(*page_count).bind(issue_id).execute(&mut *tx).await
@@ -2417,7 +2505,8 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
     // 5C. COVER BACKFILL → give cover-less series a real first-page cover
     // ---------------------------------------------------------
     // Unmatched / un-synced series never reach the provider sync's resolve_cover, so they'd otherwise
-    // show the placeholder. Pull the first page of their lowest archive into <folder>/cover.<ext>.
+    // show the placeholder. Pull the first page of their first main-run archive (never an annual's,
+    // #237 — see folder_run_witness) into <folder>/cover.<ext>.
     // Idempotent + cheap on re-scans: skips series that already have a coverUrl or a custom cover.
     let cover_source = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'cover_source'"#)
         .fetch_optional(&db.pool).await.ok().flatten().unwrap_or_else(|| "metadata".to_string());
@@ -2444,10 +2533,7 @@ pub async fn scan_library(db: Db, library_path: String, library_id: String, spec
                 cover_set.spawn(async move {
                     let _permit = sem.acquire_owned().await.ok();
                     tokio::task::spawn_blocking(move || {
-                        let folder_path = Path::new(&folder);
-                        let first = crate::converter::first_comic_file(folder_path)?;
-                        let cover = crate::converter::ensure_folder_cover(folder_path, &first)?;
-                        Some((id, format!("/api/library/cover?path={}", urlencoding::encode(&cover.to_string_lossy()))))
+                        backfill_folder_cover(Path::new(&folder)).map(|url| (id, url))
                     })
                     .await
                     .ok()
@@ -2991,6 +3077,88 @@ mod tests {
             identity_info(&only_annual, &only_annual_infos).and_then(|i| i.comic_vine_volume_id.as_deref()),
             Some("49197")
         );
+    }
+
+    /// A CBZ whose one page holds `page` (nothing on these paths decodes it) plus an optional ComicInfo.
+    fn write_test_cbz(path: &Path, page: &[u8], comic_info: Option<&str>) {
+        use std::io::Write as _;
+        let f = File::create(path).expect("create fixture cbz");
+        let mut zw = zip::ZipWriter::new(f);
+        if let Some(xml) = comic_info {
+            zw.start_file("ComicInfo.xml", zip::write::FileOptions::default()).unwrap();
+            zw.write_all(xml.as_bytes()).unwrap();
+        }
+        zw.start_file("01.jpg", zip::write::FileOptions::default()).unwrap();
+        zw.write_all(page).unwrap();
+        zw.finish().unwrap();
+    }
+
+    /// #237's folder: ComicVine names the annual volume without "The", so Mylar's annual file sorts
+    /// FIRST; a '96-style one-off (no Annual token in its name) sorts before the run's #1 too.
+    fn asm_folder_with_annuals_first() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("omnibus_run_witness_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture folder");
+        write_test_cbz(&dir.join("Amazing Spider-Man Annual 001 (2026).cbz"), b"ANNUAL",
+            Some("<ComicInfo><Number>1</Number><Format>Annual</Format><ComicVineVolumeId>170303</ComicVineVolumeId></ComicInfo>"));
+        write_test_cbz(&dir.join("The Amazing Spider-Man '96 001 (1996).cbz"), b"ONEOFF",
+            Some("<ComicInfo><Number>1</Number><Format>Annual</Format><ComicVineVolumeId>60436</ComicVineVolumeId></ComicInfo>"));
+        write_test_cbz(&dir.join("The Amazing Spider-Man 001 (2025).cbz"), b"MAIN",
+            Some("<ComicInfo><Number>1</Number><ComicVineVolumeId>163325</ComicVineVolumeId></ComicInfo>"));
+        write_test_cbz(&dir.join("The Amazing Spider-Man 002 (2025).cbz"), b"MAIN2", None);
+        std::fs::write(dir.join("notes.txt"), b"not a comic").unwrap();
+        dir
+    }
+
+    #[test]
+    fn folder_run_witness_skips_annuals_by_name_and_by_comicinfo() {
+        let dir = asm_folder_with_annuals_first();
+        let (path, info) = folder_run_witness(&dir).expect("a witness");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "The Amazing Spider-Man 001 (2025).cbz");
+        assert_eq!(info.and_then(|i| i.comic_vine_volume_id), Some("163325".to_string()));
+
+        // A folder of nothing but annuals has no run to prefer — it speaks for itself.
+        let only = std::env::temp_dir().join(format!("omnibus_run_witness_only_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&only).unwrap();
+        write_test_cbz(&only.join("Batman Annual 002 (2013).cbz"), b"A2", None);
+        write_test_cbz(&only.join("Batman Annual 001 (2012).cbz"), b"A1", None);
+        let (path, _) = folder_run_witness(&only).expect("a witness");
+        assert_eq!(path.file_name().unwrap().to_string_lossy(), "Batman Annual 001 (2012).cbz");
+
+        // No comics at all → no witness.
+        let empty = std::env::temp_dir().join(format!("omnibus_run_witness_empty_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("cover.jpg"), b"x").unwrap();
+        assert!(folder_run_witness(&empty).is_none());
+
+        for d in [dir, only, empty] { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn cover_backfill_takes_the_runs_first_page_never_an_annuals() {
+        // #237: the series wore its annual's cover in the library grid.
+        let dir = asm_folder_with_annuals_first();
+        let url = backfill_folder_cover(&dir).expect("a cover");
+        assert_eq!(std::fs::read(dir.join("cover.jpg")).unwrap(), b"MAIN");
+        assert!(url.starts_with("/api/library/cover?path="), "{url}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unmatched_sweep_evidence_never_comes_from_an_annual() {
+        // The annual's ComicInfo names the ANNUAL volume (that's how #203 restores the link), so
+        // reading the folder's identity from it would match "The Amazing Spider-Man (2025)" to
+        // "Amazing Spider-Man Annual". allow_api = false: the evidence is the files alone.
+        let dir = asm_folder_with_annuals_first();
+        let db_file = dir.join("sweep.db");
+        File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = crate::db::Db::connect(&db_url, 1).await.expect("connect file-backed sqlite");
+
+        let got = folder_match_evidence(&db, &reqwest::Client::new(), &dir, false).await;
+        assert_eq!(got.map(|(source, id, _, _)| (source, id)), Some(("COMICVINE".to_string(), "163325".to_string())));
+
+        db.pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ==== Discussion #182: local-first ingest — file-complete issues skip provider enrichment. ====
@@ -3867,7 +4035,7 @@ mod tests {
         // ComicInfo.xml injection into the fixture cbz via metadata_writer), and the
         // updatedAt/lastMetadataSync bump through the per-dialect now/now-UTC expressions.
         let series_id_owned: String = row.get("id");
-        crate::metadata::sync_metadata(db.clone(), Some(vec![series_id_owned.clone()]))
+        crate::metadata::sync_metadata(db.clone(), Some(vec![series_id_owned.clone()]), false)
             .await
             .expect("sync_metadata through the Any pool");
 
@@ -4041,7 +4209,7 @@ mod tests {
                 "alternateCount" INTEGER, "storyArcNumber" TEXT, gtin TEXT, notes TEXT,
                 "scanInformation" TEXT, review TEXT, "communityRating" REAL, "blackAndWhite" INTEGER,
                 universe TEXT, "hasCustomMetadata" INTEGER DEFAULT 0, "hasCustomCover" INTEGER DEFAULT 0,
-                "coverUrl" TEXT, "attachedVolumeId" TEXT, "createdAt" TEXT, "updatedAt" TEXT)"#,
+                "coverUrl" TEXT, "attachedVolumeId" TEXT, "fileAddedAt" INTEGER, "createdAt" TEXT, "updatedAt" TEXT)"#,
             // #203 Phase 1: the round-trip's embed + series.json legs both reach for it.
             r#"CREATE TABLE "AttachedVolume" (id TEXT PRIMARY KEY, "seriesId" TEXT, "metadataSource" TEXT,
                 "volumeId" TEXT, kind TEXT, name TEXT, "startYear" INTEGER, "issueCount" INTEGER DEFAULT 0,
@@ -4112,6 +4280,15 @@ mod tests {
         scan_library(db.clone(), base.to_string_lossy().replace('\\', "/"), "rt_lib".to_string(), None)
             .await
             .expect("rescan after wipe");
+
+        // Issue.fileAddedAt (#206 follow-up): a file the scan indexes is an arrival, stamped in
+        // Prisma's SQLite form (INTEGER epoch-ms) so it sorts with every Node-written stamp.
+        let fa = sqlx::query(r#"SELECT "fileAddedAt" AS fa, typeof("fileAddedAt") AS t FROM "Issue""#)
+            .fetch_one(&db.pool).await.expect("the rebuilt issue");
+        assert_eq!(fa.get::<String, _>("t"), "integer", "fileAddedAt is epoch-ms like Prisma writes it");
+        let fa_ms: i64 = fa.get("fa");
+        let sys_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        assert!((sys_ms - fa_ms).abs() < 3_600_000, "stamped at scan time, got {}", fa_ms);
 
         // -- 4. The series came back identical, from ComicInfo + series.json.
         let s = sqlx::query(

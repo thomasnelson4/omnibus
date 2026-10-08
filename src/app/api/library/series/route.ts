@@ -18,6 +18,7 @@ import { COMIC_EXT_REGEX } from '@/lib/utils/formats';
 import { sanitizeDescription, providerWikiBase } from '@/lib/utils/sanitize';
 import { safeParse } from '@/lib/utils/safe-parse';
 import { getAccessibleLibraryPaths, canAccessPath } from '@/lib/library-access';
+import { arrivalStamp, rescanStamp } from '@/lib/file-added';
 
 export async function GET(request: Request) {
   // `request.url` is absolute by construction in Next.js, but guard anyway so a malformed URL
@@ -287,7 +288,9 @@ export async function GET(request: Request) {
                     if (existingIssue.filePath !== fullPath) {
                         updateOperations.push(prisma.issue.update({
                             where: { id: existingIssue.id },
-                            data: { filePath: fullPath, status: "DOWNLOADED" }
+                            // #206 follow-up: a placeholder that finally has its file is an arrival;
+                            // a row re-pointed at its renamed file keeps its stamp.
+                            data: { filePath: fullPath, status: "DOWNLOADED", ...rescanStamp(existingIssue) }
                         }));
                     }
                 } else if (!creatingNums.has(key)) {
@@ -300,7 +303,8 @@ export async function GET(request: Request) {
                         number: group.number,
                         isAnnual: group.isAnnual,
                         status: "DOWNLOADED",
-                        filePath: fullPath
+                        filePath: fullPath,
+                        ...arrivalStamp(null),
                     });
                     creatingNums.add(key);
                 }

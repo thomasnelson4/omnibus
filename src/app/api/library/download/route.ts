@@ -1,10 +1,11 @@
 import { NextResponse } from 'next/server';
 import fs from 'fs';
-import path from 'path';
 import { prisma } from '@/lib/db';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { isPathWithinRoots } from '@/lib/utils/paths';
+import { rememberKoreaderDocumentForPath } from '@/lib/koreader-documents';
+import { sendFileResponse } from '@/lib/file-download';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 
@@ -45,26 +46,13 @@ export async function GET(request: Request) {
       return new Response("File not found on network share", { status: 404 });
     }
 
-    const stat = fs.statSync(filePath);
-    const fileName = path.basename(filePath);
+    // A book downloaded here and copied to a KOReader device syncs to its issue too: record KOReader's
+    // document IDs for these bytes when the path is an issue's file (#211). Never fails the download.
+    await rememberKoreaderDocumentForPath(filePath);
 
-    const stream = fs.createReadStream(filePath);
-    const readableStream = new ReadableStream({
-        start(controller) {
-            stream.on('data', (chunk) => controller.enqueue(chunk));
-            stream.on('end', () => controller.close());
-            stream.on('error', (err) => controller.error(err));
-        },
-        cancel() { stream.destroy(); }
-    });
-
-    return new Response(readableStream, {
-        headers: {
-            'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`,
-            'Content-Type': 'application/vnd.comicbook+zip',
-            'Content-Length': stat.size.toString()
-        }
-    });
+    // Same response shape as the OPDS acquisition download (#219, #220): the media type comes from
+    // the extension, Content-Disposition is RFC 6266, and Range is honoured.
+    return sendFileResponse(request, filePath);
 
   } catch (error: unknown) {
     Logger.log(`Download Error: ${getErrorMessage(error)}`, 'error');

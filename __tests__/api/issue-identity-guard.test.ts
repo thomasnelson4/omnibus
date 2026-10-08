@@ -129,6 +129,45 @@ describe('issueIdentityMismatch (unit)', () => {
     });
 });
 
+// #238 (anacronismo): an annual or collected edition attached to a series (#203) belongs to its
+// ATTACHED volume, not the series' own. Comparing it to the series refused every enrichment for it —
+// "stored metadataId 1061866 resolved to volume 158693 but the series is volume 142577" — so attached
+// books never got their credits or synopsis.
+describe('issueIdentityMismatch — attached-lane rows (#238)', () => {
+    // The Amazing Spider-Man (2022) = CV 142577; The Amazing Spider-Man Annual (2024) = CV 158693.
+    const lane = {
+        rowNumber: '1', seriesMetadataId: '142577', seriesMetadataSource: 'COMICVINE',
+        attachedVolume: { volumeId: '158693', metadataSource: 'COMICVINE' },
+        expectedSource: 'COMICVINE',
+    };
+
+    it('accepts a payload from the attached volume, though the series is another volume', () => {
+        expect(issueIdentityMismatch({ ...lane, fetchedParentId: '158693', fetchedIssueNumber: '1' })).toBeNull();
+    });
+
+    it("rejects a payload from any other volume — the series' own included — naming the attached volume", () => {
+        expect(issueIdentityMismatch({ ...lane, fetchedParentId: '142577', fetchedIssueNumber: '1' }))
+            .toBe('resolved to volume 142577 but the attached volume is volume 158693');
+        expect(issueIdentityMismatch({ ...lane, fetchedParentId: '999', fetchedIssueNumber: '1' })).toMatch(/attached volume is volume 158693/);
+    });
+
+    it('trusts a renumbered lane row once the payload is proven to be from its attached volume', () => {
+        // The lane binds by provider id; the number is the user's curation (chronological renumbering).
+        expect(issueIdentityMismatch({ ...lane, rowNumber: '1996', fetchedParentId: '158693', fetchedIssueNumber: '1' })).toBeNull();
+    });
+
+    it('falls back to the number check when the attached volume cannot be proven', () => {
+        // No parent id on the payload: the number is the only evidence left, so it still decides.
+        expect(issueIdentityMismatch({ ...lane, fetchedParentId: null, fetchedIssueNumber: '1' })).toBeNull();
+        expect(issueIdentityMismatch({ ...lane, rowNumber: '1996', fetchedParentId: null, fetchedIssueNumber: '1' })).toMatch(/issue #1/);
+        // An attachment from another provider isn't comparable either.
+        expect(issueIdentityMismatch({
+            ...lane, attachedVolume: { volumeId: 'local_abc', metadataSource: 'LOCAL' },
+            rowNumber: '2', fetchedParentId: '158693', fetchedIssueNumber: '1',
+        })).toMatch(/issue #1/);
+    });
+});
+
 describe('GET /api/library/issue — view-time enrichment guard', () => {
     const req = () => new Request('http://localhost/api/library/issue?id=i1');
 
@@ -194,6 +233,38 @@ describe('GET /api/library/issue — view-time enrichment guard', () => {
         expect(json.description).toBe('db description');
         expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('Skipping Metron deep-fetch'), 'warn');
     });
+
+    it("loads the row's attached volume for the guard (#238)", async () => {
+        mocks.cachedCvGet.mockResolvedValue(cvDetail(130175, '1'));
+
+        await GET(req());
+
+        expect(mocks.issueFindUnique).toHaveBeenCalledWith(expect.objectContaining({
+            include: expect.objectContaining({ attachedVolume: expect.anything() }),
+        }));
+    });
+
+    it('enriches an attached annual from its own volume (#238 — the anacronismo log shape)', async () => {
+        mocks.issueFindUnique.mockResolvedValue(attachedAnnualRow());
+        mocks.cachedCvGet.mockResolvedValue(cvDetail(158693, '1'));
+
+        const res = await GET(req());
+        const json = await res.json();
+
+        expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'i1' },
+            data: expect.objectContaining({ matchState: 'DEEP_SYNCED', description: 'provider description' }),
+        }));
+        expect(json.description).toBe('provider description');
+        expect(loggerLog).not.toHaveBeenCalledWith(expect.stringContaining('Skipping CV deep-fetch'), 'warn');
+    });
+});
+
+// ASM Annual #1 (2024): attached to The Amazing Spider-Man (2022), bound to CV issue 1061866.
+const attachedAnnualRow = () => ({
+    ...row(), metadataId: '1061866', isAnnual: true, attachedVolumeId: 'att1',
+    attachedVolume: { volumeId: '158693', metadataSource: 'COMICVINE' },
+    series: { libraryId: 'lib1', metadataId: '142577', metadataSource: 'COMICVINE', name: 'The Amazing Spider-Man' },
 });
 
 describe('DELETE /api/library/issue/cover-upload — cover-reset guard', () => {
@@ -230,5 +301,21 @@ describe('DELETE /api/library/issue/cover-upload — cover-reset guard', () => {
         }));
         expect(auditLog).toHaveBeenCalledWith('RESET_ISSUE_COVER',
             expect.objectContaining({ restored: true }), 'admin1');
+    });
+
+    it("restores an attached annual's cover from its own volume (#238)", async () => {
+        mocks.issueFindUnique.mockResolvedValue(attachedAnnualRow());
+        mocks.cachedCvGet.mockResolvedValue(cvDetail(158693, '1'));
+
+        const res = await DELETE(req());
+        const json = await res.json();
+
+        expect(mocks.issueFindUnique).toHaveBeenCalledWith(expect.objectContaining({
+            include: expect.objectContaining({ attachedVolume: expect.anything() }),
+        }));
+        expect(json.coverUrl).toBe('http://cv/img.jpg');
+        expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            data: { coverUrl: 'http://cv/img.jpg', hasCustomCover: false },
+        }));
     });
 });

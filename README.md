@@ -34,10 +34,17 @@ While I know AI-assisted ("vibe-coded") projects can sometimes be met with skept
 
 ---
 
-## Recent Highlights (September 2026)
+## Recent Highlights (October 2026)
 
 The last several releases added a lot. The biggest things to be aware of:
 
+* **Paperback Reads Omnibus:** Paperback for iPhone and iPad connects through its built-in source — Omnibus answers it with a Komga-compatible endpoint at `/komga`, so you get series, covers, page streaming (CBZ and CBR), search, Continue Reading and read-progress sync with nothing extra to install ([#206](https://github.com/hankscafe/omnibus/issues/206)).
+* **KOReader Sync, End to End (Community!):** KOReader progress sync logs in for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213) by [realAbitbol](https://github.com/realAbitbol)), lands on the page you stopped on instead of one page late, and finds its issue by KOReader's own checksum for books downloaded from Omnibus — no "Send document metadata" or "Use server filenames" needed ([#211](https://github.com/hankscafe/omnibus/issues/211), [#217](https://github.com/hankscafe/omnibus/issues/217)).
+* **An OPDS Overhaul (Community!):** Search the catalog from your reading app; a home screen with Continue Reading, Recently Added, On Deck and Libraries; streamed issues resume on the page you last read; every cover loads, local and custom ones included; feeds carry real authors and dates and publish the address you actually reached, proxy or not; and downloads keep the file's real type and name and can resume. Built largely by [realAbitbol](https://github.com/realAbitbol) across [#212](https://github.com/hankscafe/omnibus/pull/212), [#234](https://github.com/hankscafe/omnibus/pull/234), [#235](https://github.com/hankscafe/omnibus/pull/235) and [#236](https://github.com/hankscafe/omnibus/pull/236).
+* **Metron, a Good Neighbor:** Every Metron request follows Metron's published best practices — one client paced by Metron's own rate-limit headers, a 429 pauses everything instead of being retried, each install runs its scheduled jobs at its own time of day instead of all at once, the Series Monitor asks only for what changed, and covers and per-issue credits are fetched only where someone will see them. Sign in with a Metron API token (encrypted, never logged), and System Health shows Metron's real limits with live countdowns ([#216](https://github.com/hankscafe/omnibus/issues/216)).
+* **`{Imprint}` Naming Token (Community!):** File series under their publisher imprint — `{Publisher}/{Imprint}/{Series} ({Year})` puts The Sandman under `DC Comics/Vertigo/` — the same way in every import, rename and match. Contributed by [CaptainEpix](https://github.com/CaptainEpix) in [#214](https://github.com/hankscafe/omnibus/pull/214).
+* **Read Your Trades and Compendiums in the Browser:** Collected editions you own get a Read/Resume button and their reading progress, and the web reader opens very large archives — files over 2 GB included, crop mode too — without loading them into memory ([#215](https://github.com/hankscafe/omnibus/issues/215)).
+* **Annuals, Polished:** Attached annuals and collected editions get their credits and synopsis from their own volume, an attach rewrites the claimed files' `ComicInfo.xml` right away, and a series never wears its annual's cover in the library again ([#237](https://github.com/hankscafe/omnibus/issues/237), [#238](https://github.com/hankscafe/omnibus/issues/238)).
 * **Annuals Live With Their Series (Community!):** An annual gets its own numbering, so "Batman Annual #1" never fights "Batman #1". Attach a provider's annual volume from the series page and its issues join the run — claimed by issue id, or by name for one-offs like "The Amazing Spider-Man '96 #001". Every attached row names its volume, a sort control orders the series by number or by release date (annuals fall in between the issues they were published among), and the Duplicate Resolver knows seven annual volumes' "#1"s are seven comics. Requested and field-tested across five rounds by [anacronismo](https://github.com/anacronismo) in [#203](https://github.com/hankscafe/omnibus/issues/203).
 * **Collected Editions Get a Shelf:** Attach a trade or omnibus volume to its series and its books sit on their own shelf, numbered in the order you want to read them. A trade the provider doesn't know can be attached by name alone — from the Smart Matcher's **Attach to Series** or from the shelf — and Standardize keeps its books named after the edition.
 * **A Trade You Own Counts Everywhere:** Each collected book has a **Covers** field, prefilled from ComicVine's "Collects #1-6" line and hand-editable. Issues covered by a trade you own leave Missing on the series page, hide in Missing Issues behind a toggle, and drop out of Discover's "Request Missing", volume requests, and the monitor's automatic asks.
@@ -79,7 +86,7 @@ The last several releases added a lot. The biggest things to be aware of:
 ---
 
 ## Table of Contents
-- [Recent Highlights](#recent-highlights-august-2026)
+- [Recent Highlights](#recent-highlights-october-2026)
 - [About Omnibus](#about-omnibus)
 - [Features & Navigation](#features--navigation)
   - [Authentication & Security](#authentication--security)
@@ -189,11 +196,11 @@ A meticulously organized, highly performant view of your physical files, built t
 * **Embedded Metadata (ComicInfo.xml):** Omnibus doesn't just read metadata—it writes it. Omnibus can automatically generate and embed standard `ComicInfo.xml` files directly into your `.cbz` archives, ensuring your metadata travels with your files.
 * **Self-Describing Library (series.json + Local-First Scans):** Omnibus writes Mylar-format `series.json` files to your series folders (on by default; it never overwrites a `series.json` it didn't create, so curated Mylar libraries are safe) and reads them — plus embedded `ComicInfo.xml`, even inside RAR archives — during every scan. A properly tagged library gets its provider IDs, release dates, issue numbers, credits, and covers straight from the files: browsing, the calendar, and even a full rescan into a fresh database work with **zero metadata-provider API calls**. External readers like Komga and Kavita mapped to the same storage recognize your metadata instantly.
 * **Dual Metadata Engines:** Choose between ComicVine (default) or Metron.Cloud as your primary metadata source. Omnibus reads embedded ComicInfo.xml files inside your archives and seamlessly syncs with your selected provider to pull high-res covers, synopses, creator credits, and genres. (Note: Metron integration also powers the forward-looking Release Calendar!)
-* **Per-Issue Credits & Genres:** Syncs capture writers, artists, characters, story arcs, and genres down to the individual issue. Metron users can opt in to a per-issue credit pass that's budgeted against Metron's daily API quota and resumes across syncs.
+* **Per-Issue Credits & Genres:** Syncs capture writers, artists, characters, story arcs, and genres down to the individual issue. Metron users can opt in to a per-issue credit pass for the issues they own, budgeted against Metron's daily API quota and resumed across syncs; with it off, a series' Refresh Metadata offers to fetch them (showing how many Metron requests that takes), and opening an issue fetches its own.
 * **Provider Response Cache (Opt-In):** A shared, database-backed cache for ComicVine/Metron responses with admin-tunable freshness windows and a size cap. Repeat lookups cost zero rate limit across both the app and the Rust engine, and an explicit "Refresh Metadata" always fetches live.
 * **In-App Metadata Editor:** Edit series-level and per-issue metadata (title, year, publisher, summary, creators, and more) right in the browser. Changes can optionally be written straight back into each archive's `ComicInfo.xml`, and a sync-lock keeps your manual edits from being overwritten by the next provider refresh.
 * **ComicInfo Defaults (Full Tag Set):** A tabbed editor — General / Credits / Story & Tags / Details — covers the complete ComicInfo schema: imprint, format, language, age rating, per-role credits, tags, story arcs, alternate series, community rating, black & white, and more. Available in both the Smart Matcher (set values at match time) and Edit Series Metadata (edit them any time after). Series-level values act as *defaults*: an issue's own provider or scanned data always wins, and the defaults fill the blanks. Scans read the tags back from files, so your values survive even a full database rebuild. Built for libraries the metadata providers don't cover.
-* **Series Groups & Universes:** Organize related runs with the `{SeriesGroup}` and `{UniverseName}` naming variables — perfect for shelving a multi-title crossover event or an entire publisher universe together.
+* **Series Groups, Imprints & Universes:** Organize related runs with the `{SeriesGroup}`, `{Imprint}`, and `{UniverseName}` naming variables — for example, `{Imprint}/{SeriesGroup}/{Series} ({Year})` places an Absolute Batman run under its publisher imprint and umbrella. `{Imprint}` uses the series' imprint, filled from ComicInfo `<Imprint>` when blank; when no imprint is available, that folder tier is omitted.
 * **Cover Art Management:** Omnibus extracts a cover from the first page of each archive, lets you choose your preferred cover source, and allows admins to upload a custom cover for any series (locked so automated syncs never overwrite it).
 * **Advanced Search Syntax:** Use prefix modifiers in the search bar (e.g., `character:"Spider-Man"`, `team:"X-Men"`, `arc:"Secret Wars"`) to pinpoint exact crossovers and appearances across your entire collection.
 * **Multi-Library Routing:** Map distinct folders for standard Comics and Manga. Omnibus automatically detects Manga based on publishers, AniList cross-referencing, and tags to route them to the correct directory.
@@ -251,7 +258,7 @@ The dedicated hub for an individual comic run or manga volume. This page aggrega
 * **Missing Issue Detection:** Visually highlights gaps in your collection (e.g., if you have issues #1 and #3, it flags #2 as missing). Click "Request Missing" to queue them all up at once.
 * **Sorting Options:** A sort control in the Downloaded Issues header orders the run by number, low to high or high to low, or by release date, oldest or newest first — where annuals fall into place between the issues they were published among. One choice, remembered across every series page.
 * **Annuals & Attached Volumes:** Attach a provider's annual volume (search by name or paste the id) and its issues join the series in their own numbering — claimed by issue id, or by name for one-offs whose filenames carry the volume's name. Every attached row names its volume ("The Amazing Spider-Man '96 · Annual #1"), the attachment survives a wipe-and-rescan through `series.json` and the files' own `ComicInfo.xml`, and the number stays yours to renumber for reading order.
-* **Collected Editions Shelf:** Trades and omnibuses attach the same way and sit on their own shelf, out of the run's issue count. Each book has a **Covers** field ("1-6, 8"), prefilled from the provider's "Collects" line; issues covered by a book you own move from Missing to a "Covered by" section. A trade the provider doesn't know attaches by name alone, and Standardize names its books after the edition.
+* **Collected Editions Shelf:** Trades and omnibuses attach the same way and sit on their own shelf, out of the run's issue count. Each book has a **Covers** field ("1-6, 8"), prefilled from the provider's "Collects" line; issues covered by a book you own move from Missing to a "Covered by" section. Books you own open straight into the reader with a Read/Resume button and their reading progress. A trade the provider doesn't know attaches by name alone, and Standardize names its books after the edition.
 * **Offline Downloading:** Admins can grant users permission to download raw .cbz files directly from the browser for offline reading in third-party apps.
 * **Community Reviews & Ratings:** Users can leave a 1-5 star rating and written review for any series. The series page aggregates these into a total community score, allowing users to share their thoughts and recommendations with others on the server.
 * **Issue Reporting System:** Users can report broken files, incorrect metadata, or bad archives directly from the series page. Admins receive an alert and can resolve the issue, sending a direct inbox message back to the user upon completion.
@@ -287,8 +294,10 @@ A completely custom, zero-friction reading experience built natively into the br
 ### External Readers & OPDS Support
 Omnibus features a native OPDS 1.2 server with the **Page Streaming Extension (PSE)**, allowing you to read your server's library directly in your favorite mobile and tablet apps without downloading the entire file first. Streaming covers `.cbz` and `.cbr`/`.rar` alike — RAR pages are served through the Rust engine, so Panels and friends can read your unconverted archives too.
 
+The catalog's home screen has **All Series**, **Continue Reading**, **Recently Added**, **On Deck** and, when you can see more than one library, **Libraries**, and apps that support OPDS search can search it by series or issue title. Streaming apps that support it resume each issue on the page Omnibus last recorded for you - from the web reader, KOReader sync or Paperback. Downloads carry the file's real type and name, and interrupted downloads can resume.
+
 **Supported OPDS Apps:**
-* **iOS / iPadOS:** Panels, Paperback, Chunky
+* **iOS / iPadOS:** Panels, Chunky
 * **Android:** Mihon, Tachiyomi, Moon+ Reader
 
 **How to Connect:**
@@ -301,15 +310,24 @@ For security, external apps do not use your main account password.
    * **Username:** Your Omnibus username
    * **Password:** The API Key you just generated
 
+**Paperback (iOS / iPadOS):** Paperback doesn't read OPDS — its built-in "Paperback" source is a Komga client — so Omnibus answers it with a Komga-compatible endpoint instead. In Paperback, open the pre-installed **Paperback** source → **Server Settings** and enter:
+   * **Server URL:** `http://<your-omnibus-ip>:3000/komga`
+   * **Email:** Your Omnibus username
+   * **Password:** An API Key (generated the same way as above — never your account password)
+
+Tap **Try settings** to confirm the connection. Series, covers, page streaming (CBZ and CBR alike), search, the Recently added / Recently updated shelves, and marking issues read all work; an issue you finish in Paperback counts on your Omnibus profile like one finished in the web reader.
+
 ### Native e-Ink Sync (KOReader)
 Omnibus acts as a master "save state" for your physical e-ink devices (Kobo, Kindle, Pocketbook). Using our custom KOReader sync endpoints, your eReader will automatically ping Omnibus every time you turn a page, and you can view your real-time progress right on your Omnibus Profile!
 
 **How to Configure KOReader:**
-1. Connect your eReader to Wi-Fi and open the top KOReader menu.
-2. Navigate to **Settings > Progress Sync > Custom sync server**.
-3. Enter your Omnibus URL: `http://<your-omnibus-ip>:3000/api/koreader`
-4. Tap **Register / Login** and use your Omnibus **Username** and an **Omnibus API Key** (generated from your Profile) as the password.
-5. **Crucial Step:** Go to **Progress Sync > Document matching method** and select **Path**. (This ensures Omnibus can perfectly map your device's progress back to your web library).
+1. Create a **new API key** from **Profile → Manage API Keys** (or the admin API-key page). Keys created before KOReader sync support was added cannot be upgraded because their raw values are not stored; create a new key for sync.
+2. Connect your eReader to Wi-Fi and open the top KOReader menu.
+3. Navigate to **Settings → Progress Sync → Custom sync server**.
+4. Enter your Omnibus URL: `http://<your-omnibus-ip>:3000/api/koreader`
+5. Tap **Login** and use your Omnibus **Username** and the new **Omnibus API Key** as the password.
+6. Leave **Document matching method** on **Binary** (KOReader's default). Omnibus records each book's KOReader checksum when you download it - through the OPDS catalog or the web download button - so your progress lands on the right issue with no other KOReader settings, and resumes on the same page in the web reader.
+7. For books that reached your device some other way (copied from the library folder, say), enable **Progress Sync → Send document metadata** (off by default) so Omnibus can match them by filename; in KOReader's OPDS catalog settings, **Use server filenames** keeps the library's file names. With the **Filename** matching method, downloaded books also need **Use server filenames**. Without a match, KOReader device-to-device sync still works but the progress doesn't appear in Omnibus.
 
 ### Reading Lists
 Perfect for navigating the complex web of massive comic book crossover events or creating your own curated reading orders.
@@ -468,7 +486,7 @@ Settings are organized into **8 task-focused tabs** — Metadata, Library & File
   * **Push Notifications:** Native support for Discord Webhooks, Telegram Bots, Pushover, and Apprise (supporting 80+ external services).
   * **SMTP Email Notifications:** Send beautiful HTML emails for approvals, completed requests, and Weekly Digests.
   * **Custom Email Templates:** A built-in code editor allows admins to customize the exact text and HTML layout of all outgoing automated emails using dynamic variables.
-* **API & Service Configuration:** Securely plug in your ComicVine API keys, Metron credentials, Indexer details, and Download Client URLs.
+* **API & Service Configuration:** Securely plug in your ComicVine API keys, Metron API token, Indexer details, and Download Client URLs. (Create the Metron token on [metron.cloud](https://metron.cloud/) under Profile → API Tokens. Metron is retiring username and password sign-in for its API; they still work until then, and System Health reminds you to switch.)
 * [**External API Integrations:**](https://github.com/hankscafe/omnibus/blob/main/docs/API.md) Generate an API key to allow external applications (like Discord Bots or Dashboards) to fetch stats and interact with Omnibus securely. Includes a ready-made [Homepage](https://gethomepage.dev) dashboard widget config exposing system health, library totals, monthly growth, and active downloads — plus a live in-app API tester.
 * **Safe Configuration:** Dual-guard unsaved changes protection to ensure admins never accidentally lose their configuration progress.
 * **Scheduled Tasks (Cron):** Configure how often Omnibus should scan your disk for new files, refresh metadata, embed ComicInfo.xml, export series.json, convert archives, back up the database, or check indexers for missing requested issues — each job with its own cadence and a manual "Run Now" trigger.
@@ -561,7 +579,7 @@ services:
       - /path/to/your/nas/config:/config
       
       # -------------------------------------------------------------------------
-      # OPTION 1: The Recommended Single Data Mount (Fast Atomic Moves/Hardlinks)
+      # OPTION 1: The Recommended Single Data Mount (Fast Atomic Moves)
       # -------------------------------------------------------------------------
       # Maps your entire media/download root to /data for optimal performance
       - /path/to/your/nas/data:/data 
@@ -660,12 +678,17 @@ Omnibus is built in the open, and it gets better every time someone sends a pull
 </a>
 
 * **[JoeJoeflyn](https://github.com/JoeJoeflyn)** — the comic panel-frame header navigation and app-wide button polish ([#186](https://github.com/hankscafe/omnibus/pull/186)), Omnibus' first merged community feature
+* **[realAbitbol](https://github.com/realAbitbol)** — OPDS feeds that publish the address your reader actually reached instead of the server's bind address ([#212](https://github.com/hankscafe/omnibus/pull/212), reported in [#210](https://github.com/hankscafe/omnibus/issues/210)), and KOReader progress sync that logs in and works end to end for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213), reported in [#211](https://github.com/hankscafe/omnibus/issues/211)), downloads with the real file type, a correct filename and resumable Range requests ([#234](https://github.com/hankscafe/omnibus/pull/234), reported in [#219](https://github.com/hankscafe/omnibus/issues/219) and [#220](https://github.com/hankscafe/omnibus/issues/220)), standards-conforming OPDS feeds with real authors and dates ([#235](https://github.com/hankscafe/omnibus/pull/235), reported in [#218](https://github.com/hankscafe/omnibus/issues/218)), and OPDS search, Continue Reading / Recently Added / On Deck / Libraries sections and page-stream resume ([#236](https://github.com/hankscafe/omnibus/pull/236), reported in [#221](https://github.com/hankscafe/omnibus/issues/221))
+* **[CaptainEpix](https://github.com/CaptainEpix)** — the `{Imprint}` naming token, which files a series under its publisher imprint the same way everywhere Omnibus names folders and files: imports, watched folders, the Smart Matcher and Standardize ([#214](https://github.com/hankscafe/omnibus/pull/214), proposed in [#207](https://github.com/hankscafe/omnibus/issues/207))
 
 ### Bug Hunters & Field Testers
 
 Special thanks to the people whose reports and hands-on testing turned into real fixes and features:
 
-* **[anacronismo](https://github.com/anacronismo)** — tracked down the cover-corruption bug and field-verified the repair tooling ([#194](https://github.com/hankscafe/omnibus/issues/194), [#196](https://github.com/hankscafe/omnibus/issues/196)), kept the download and library pipelines honest with a string of sharp, log-attached reports ([#197](https://github.com/hankscafe/omnibus/issues/197), [#198](https://github.com/hankscafe/omnibus/issues/198), [#200](https://github.com/hankscafe/omnibus/issues/200), [#201](https://github.com/hankscafe/omnibus/issues/201), [#202](https://github.com/hankscafe/omnibus/issues/202)), then asked for Series-Annual Integration and field-tested it through five rounds ([#203](https://github.com/hankscafe/omnibus/issues/203)) and verified the half-issue fix ([#205](https://github.com/hankscafe/omnibus/issues/205))
+* **[anacronismo](https://github.com/anacronismo)** — tracked down the cover-corruption bug and field-verified the repair tooling ([#194](https://github.com/hankscafe/omnibus/issues/194), [#196](https://github.com/hankscafe/omnibus/issues/196)), kept the download and library pipelines honest with a string of sharp, log-attached reports ([#197](https://github.com/hankscafe/omnibus/issues/197), [#198](https://github.com/hankscafe/omnibus/issues/198), [#200](https://github.com/hankscafe/omnibus/issues/200), [#201](https://github.com/hankscafe/omnibus/issues/201), [#202](https://github.com/hankscafe/omnibus/issues/202)), then asked for Series-Annual Integration and field-tested it through five rounds ([#203](https://github.com/hankscafe/omnibus/issues/203)) and verified the half-issue fix ([#205](https://github.com/hankscafe/omnibus/issues/205)); in v1.4.6, the Series Monitor's same-name volume mix-up ([#208](https://github.com/hankscafe/omnibus/issues/208)), PixelDrain behind GetComics' redirect ([#209](https://github.com/hankscafe/omnibus/issues/209)), reading collected editions in the browser ([#215](https://github.com/hankscafe/omnibus/issues/215)) and the annual cover and metadata fixes ([#237](https://github.com/hankscafe/omnibus/issues/237), [#238](https://github.com/hankscafe/omnibus/issues/238))
+* **[bpepple](https://github.com/bpepple)** — spotted from Metron's side the nightly burst every Omnibus install sent its servers at the same moment ([#216](https://github.com/hankscafe/omnibus/issues/216)), which became Metron best practices across the whole app
+* **[jdcrensh](https://github.com/jdcrensh)** — the hardlink import request ([#222](https://github.com/hankscafe/omnibus/issues/222)) whose investigation turned up a CBR conversion that could overwrite a CBZ you already had
+* **A Paperback user from the Discord** — tested Omnibus' Paperback support on a real iPhone through several rounds ([#206](https://github.com/hankscafe/omnibus/issues/206))
 * **robotshavehearts2** — three thorough write-ups from a manual-matching, trade-heavy library that became fourteen betas: the Ignore state, collected editions and their coverage, the Missing Issues view, the For Your Library shelf, the folder-collision guard and local-only trades
 * **[de6oliveira-droid](https://github.com/de6oliveira-droid)** — the session-expiry report that turned the Smart Matcher's "Unauthorized Access" dead-end into a proper sign-in bounce ([#204](https://github.com/hankscafe/omnibus/issues/204))
 * **[BeepbopbeepityBop](https://github.com/BeepbopbeepityBop)** — the half-issue split, reported with a database analysis that nailed its exact shape ([#205](https://github.com/hankscafe/omnibus/issues/205))

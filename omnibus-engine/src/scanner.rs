@@ -871,6 +871,7 @@ fn backfill_folder_cover(folder: &Path) -> Option<String> {
 /// — the same precedence the scanner uses — with the
 /// live issue-id→volume resolution gated behind `allow_api` (budget-aware callers). Returns
 /// (metadataSource, metadataId, cv_id, metron_id) when the files identify the series.
+#[allow(dead_code)] // upstream's auto-matcher sweep caller was replaced by the fork's matcher; kept for parity + tests
 pub(crate) async fn folder_match_evidence(
     db: &Db,
     client: &reqwest::Client,

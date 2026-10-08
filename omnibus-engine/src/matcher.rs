@@ -363,6 +363,7 @@ async fn request_decision(client: &reqwest::Client, series_id: &str, max_request
 /// True when the sweep should stop searching to protect the ComicVine budget: calls made in the
 /// rolling window have reached `limit - reserve`. Counting is shared with the health check's
 /// cv_api_usage accounting.
+#[allow(dead_code)] // only the test module calls this after the fork reworked the sweep flow
 pub(crate) fn budget_exhausted(calls_last_window: usize, limit: usize, reserve: usize) -> bool {
     calls_last_window + reserve >= limit
 }

@@ -33,6 +33,8 @@ struct ComicInfo {
     #[serde(default)]
     series_group: Option<String>,
     #[serde(default)]
+    imprint: Option<String>,
+    #[serde(default)]
     writer: Option<String>,
     #[serde(default)]
     penciller: Option<String>,
@@ -255,12 +257,16 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
             // or shadow a real ID match on a stale name collision.
             let existing_series = sqlx::query(
                 // isManga is CAST for the Any driver (no SQLite BOOLEAN mapping).
-                r#"SELECT id, CAST("isManga" AS INTEGER) AS "isManga", "libraryId", "folderPath" FROM "Series"
+                r#"SELECT id, CAST("isManga" AS INTEGER) AS "isManga", "libraryId", "folderPath", imprint,
+                          CAST("hasCustomMetadata" AS INTEGER) AS "hasCustomMetadata" FROM "Series"
                    WHERE "metadataSource" = $1 AND "metadataId" = $2"#
             )
             .bind(&meta_source).bind(&meta_id)
             .fetch_optional(&db.pool).await?;
 
+            let had_existing_series = existing_series.is_some();
+            let mut existing_imprint: Option<String> = None;
+            let mut existing_has_custom_metadata = false;
             let series_id: String;
             let target_lib_id: String;
             let dest_folder: PathBuf;
@@ -270,6 +276,8 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 is_manga = series_row.get::<i64, _>("isManga") != 0;
                 target_lib_id = series_row.get("libraryId");
                 dest_folder = PathBuf::from(series_row.get::<String, _>("folderPath"));
+                existing_imprint = series_row.try_get("imprint").unwrap_or(None);
+                existing_has_custom_metadata = series_row.try_get::<i64, _>("hasCustomMetadata").unwrap_or(0) != 0;
             } else {
                 series_id = uuid::Uuid::new_v4().to_string();
 
@@ -313,23 +321,36 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 }
 
                 target_lib_id = fallback_lib_id;
-                let series_group_fs = clean_fs_name(&info.series_group.clone().unwrap_or_default());
-                let universe_fs = clean_fs_name(&info.universe.clone().unwrap_or_default());
-                let rel_folder = clean_naming_leftovers(&folder_pattern
-                    .replace("{Publisher}", &clean_fs_name(&publisher))
-                    .replace("{Series}", &clean_fs_name(&series_name))
-                    .replace("{Year}", &year_str)
-                    .replace("{VolumeYear}", &year_str)
-                    .replace("{UniverseName}", &universe_fs)
-                    .replace("{SeriesGroup}", &series_group_fs));
-                // Build the path one segment at a time, dropping any that resolved to empty (e.g. a
-                // blank {SeriesGroup}) — a leading "" segment would otherwise make join() absolute on Unix.
-                let mut folder = PathBuf::from(&fallback_lib_path);
-                for seg in rel_folder.split(['/', '\\']).map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    folder.push(seg);
-                }
+                let rel_folder = expand_folder_pattern(
+                    &folder_pattern,
+                    info.imprint.as_deref(),
+                    &publisher,
+                    &series_name,
+                    &year_str,
+                    info.universe.as_deref().unwrap_or_default(),
+                    info.series_group.as_deref().unwrap_or_default(),
+                ).join("/");
+                // Build the path one segment at a time under the library root (blank segments were
+                // already dropped); anything that would leave the root is refused and sent to unmatched.
+                let Some(folder) = library_subfolder(&fallback_lib_path, &rel_folder) else {
+                    log::warn!("[Watched Sync] Folder pattern for '{}' expanded to '{}', which leaves the library root; routing to unmatched for review.", series_name, rel_folder);
+                    if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                    continue;
+                };
                 dest_folder = folder;
             }
+
+            // A curated nonblank Series imprint is authoritative. Otherwise a new or unlocked
+            // existing series may adopt the archive's standard ComicInfo value for this import.
+            let effective_imprint = resolve_effective_imprint(
+                had_existing_series,
+                existing_imprint.as_deref(),
+                existing_has_custom_metadata,
+                info.imprint.as_deref(),
+            );
+            let imprint_db = if effective_imprint.is_empty() { None } else { Some(effective_imprint.clone()) };
+            let should_adopt_imprint = imprint_db.is_some()
+                && (!had_existing_series || (!existing_has_custom_metadata && existing_imprint.as_deref().map(str::trim).unwrap_or("").is_empty()));
 
             let _ = std::fs::create_dir_all(&dest_folder);
 
@@ -345,17 +366,22 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
             } else {
                 &file_pattern
             };
-            
-            let new_filename = clean_naming_leftovers(&pattern_to_use
-                .replace("{Publisher}", &clean_fs_name(&publisher))
-                .replace("{Series}", &clean_fs_name(&series_name))
-                .replace("{Year}", &year_str)
-                .replace("{VolumeYear}", &year_str)
-                .replace("{IssueYear}", &year_str)
-                .replace("{Issue}", &formatted_num)
-                .replace("{IssueTitle}", &clean_fs_name(&info.title.clone().unwrap_or_default()))
-                .replace("{UniverseName}", &clean_fs_name(&info.universe.clone().unwrap_or_default()))
-                .replace("{SeriesGroup}", &clean_fs_name(&info.series_group.clone().unwrap_or_default())));
+
+            let new_filename = expand_file_pattern(
+                pattern_to_use,
+                Some(&effective_imprint),
+                &[
+                    ("{Publisher}", publisher.as_str()),
+                    ("{Series}", series_name.as_str()),
+                    ("{Year}", year_str.as_str()),
+                    ("{VolumeYear}", year_str.as_str()),
+                    ("{IssueYear}", year_str.as_str()),
+                    ("{Issue}", formatted_num.as_str()),
+                    ("{IssueTitle}", info.title.as_deref().unwrap_or_default()),
+                    ("{UniverseName}", info.universe.as_deref().unwrap_or_default()),
+                    ("{SeriesGroup}", info.series_group.as_deref().unwrap_or_default()),
+                ],
+            );
 
             // Converted archives (cbr/rar/cb7) and zip/cbz all normalize to .cbz; an .epub is left as
             // .epub so a renamed EPUB isn't mislabeled as a comic archive.
@@ -403,6 +429,13 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 .bind(dest_folder.to_string_lossy().to_string())
                 .bind(&meta_id).bind(&meta_source).bind(is_manga).bind(&series_group_db).bind(&target_lib_id)
                 .execute(&db.pool).await;
+
+                if should_adopt_imprint {
+                    if let Some(imprint_value) = imprint_db.as_deref() {
+                        let _ = sqlx::query(r#"UPDATE "Series" SET imprint = $1 WHERE id = $2"#)
+                            .bind(imprint_value).bind(&series_id).execute(&db.pool).await;
+                    }
+                }
 
                 let issue_id = uuid::Uuid::new_v4().to_string();
 
@@ -469,14 +502,17 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 });
 
                 let res = if let Some(eid) = existing_issue_id {
-                    sqlx::query(
+                    sqlx::query(&format!(
                         // Preserve already-present data on re-import (parity with importer.ts dedupe):
                         // keep existing non-empty name/description/credits and a real metadataId; only
                         // upgrade metadataSource from LOCAL and matchState from UNMATCHED — never clobber
                         // a richly-matched issue with freshly-parsed (possibly empty) values.
+                        // Issue.fileAddedAt (#206 follow-up, importer.ts parity): filling a placeholder
+                        // is an arrival; replacing a file the row already had is not.
                         r#"UPDATE "Issue" SET
                                number=$1,
                                status='DOWNLOADED',
+                               {stamp},
                                "filePath"=$2,
                                name=COALESCE(NULLIF(name, ''), $3),
                                description=COALESCE(NULLIF(description, ''), $4),
@@ -489,7 +525,8 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                                "matchState"=CASE WHEN "matchState" = 'UNMATCHED' THEN $10 ELSE "matchState" END,
                                "pageCount"=CASE WHEN $11 > 0 THEN $11 ELSE "pageCount" END
                            WHERE id=$12"#,
-                    )
+                        stamp = crate::file_added::arrival_set(&db)
+                    ))
                     .bind(&issue_num).bind(&file_path_str).bind(&issue_title).bind(&issue_summary)
                     .bind(&writers_json).bind(&artists_json).bind(&characters_json)
                     .bind(&issue_meta_id).bind(&issue_meta_source).bind(issue_match_state).bind(page_count).bind(&eid)
@@ -498,8 +535,8 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 } else {
                     sqlx::query(&format!(
                         // isAnnual as a SQL literal — the Any-driver bool rule (#203).
-                        r#"INSERT INTO "Issue" (id, "seriesId", number, "isAnnual", status, "filePath", name, description, writers, artists, characters, "matchState", "metadataId", "metadataSource", "pageCount", "releaseDate", "createdAt")
-                           VALUES ($1, $2, $3, {annual}, 'DOWNLOADED', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, {now})"#,
+                        r#"INSERT INTO "Issue" (id, "seriesId", number, "isAnnual", status, "filePath", name, description, writers, artists, characters, "matchState", "metadataId", "metadataSource", "pageCount", "releaseDate", "fileAddedAt", "createdAt")
+                           VALUES ($1, $2, $3, {annual}, 'DOWNLOADED', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, {now}, {now})"#,
                         annual = if is_annual { "true" } else { "false" },
                         now = db.now_expr()
                     ))
@@ -541,7 +578,8 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
         let series_list: Vec<String> = synced_series_ids.into_iter().collect();
         let db_clone = db.clone();
         tokio::spawn(async move {
-            let _ = crate::metadata::sync_metadata(db_clone, Some(series_list)).await;
+            // An automatic import never asks for per-issue Metron credits: the setting decides.
+            let _ = crate::metadata::sync_metadata(db_clone, Some(series_list), false).await;
         });
     }
 
@@ -611,8 +649,94 @@ fn clean_empty_folders(dir: &Path, base_dir: &Path) -> Result<bool> {
     Ok(is_empty)
 }
 
+/// Strips characters invalid in file/folder names and neutralizes dot-only traversal values — the
+/// same rules as renamer's sanitize_component and Node's sanitizeFilename. ComicInfo feeds this, so
+/// a `<Publisher>..</Publisher>` becomes "_" instead of a ".." segment above the library root.
 fn clean_fs_name(input: &str) -> String {
-    input.replace(&['<', '>', ':', '"', '/', '\\', '|', '?', '*'][..], "").trim().to_string()
+    let cleaned = input.replace(&['<', '>', ':', '"', '/', '\\', '|', '?', '*'][..], "");
+    let cleaned = cleaned.trim();
+    let safe = cleaned.trim_matches('.').trim();
+    if safe.is_empty() && !cleaned.is_empty() {
+        return "_".to_string();
+    }
+    safe.to_string()
+}
+
+/// Joins an expanded folder pattern onto the library root one segment at a time, dropping blank
+/// segments. Refuses (None) any segment that isn't a single plain name — "..", ".", a dots-only run,
+/// a drive prefix — so no pattern + metadata combination can place a series outside the library
+/// root (defence in depth behind clean_fs_name).
+fn library_subfolder(root: &str, rel_folder: &str) -> Option<PathBuf> {
+    let mut folder = PathBuf::from(root);
+    for seg in rel_folder.split(['/', '\\']).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let mut parts = Path::new(seg).components();
+        let plain = matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None));
+        if !plain || seg.chars().all(|c| c == '.') {
+            return None;
+        }
+        folder.push(seg);
+    }
+    Some(folder)
+}
+
+fn replace_imprint_token(pattern: &str, imprint: Option<&str>) -> String {
+    let safe_imprint = crate::renamer::sanitize_component(imprint.unwrap_or_default().trim());
+    crate::renamer::replace_token_ci(pattern, "{Imprint}", &safe_imprint)
+}
+
+fn expand_folder_pattern(
+    pattern: &str,
+    imprint: Option<&str>,
+    publisher: &str,
+    series: &str,
+    year: &str,
+    universe: &str,
+    series_group: &str,
+) -> Vec<String> {
+    let expanded = replace_imprint_token(pattern, imprint)
+        .replace("{Publisher}", &clean_fs_name(publisher))
+        .replace("{Series}", &clean_fs_name(series))
+        .replace("{Year}", year)
+        .replace("{VolumeYear}", year)
+        .replace("{UniverseName}", &clean_fs_name(universe))
+        .replace("{SeriesGroup}", &clean_fs_name(series_group));
+
+    clean_naming_leftovers(&expanded)
+        .split(['/', '\\'])
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn expand_file_pattern(
+    pattern: &str,
+    imprint: Option<&str>,
+    tokens: &[(&str, &str)],
+) -> String {
+    let mut expanded = replace_imprint_token(pattern, imprint);
+    for (token, value) in tokens {
+        let value = match *token {
+            "{Publisher}" | "{Series}" | "{IssueTitle}" | "{UniverseName}" | "{SeriesGroup}" => clean_fs_name(value),
+            _ => value.to_string(),
+        };
+        expanded = expanded.replace(token, &value);
+    }
+
+    clean_naming_leftovers(&expanded)
+}
+
+fn resolve_effective_imprint(
+    had_existing_series: bool,
+    stored_imprint: Option<&str>,
+    has_custom_metadata: bool,
+    comic_info_imprint: Option<&str>,
+) -> String {
+    match stored_imprint.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.to_string(),
+        None if had_existing_series && has_custom_metadata => String::new(),
+        None => comic_info_imprint.unwrap_or_default().trim().to_string(),
+    }
 }
 
 /// Removes the debris an unfilled naming variable leaves behind — empty `()`/`[]` groups (e.g. a
@@ -643,10 +767,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn comicinfo_imprint_deserializes() {
+        let info: ComicInfo = quick_xml::de::from_str(
+            "<ComicInfo><Imprint>Absolute</Imprint></ComicInfo>",
+        ).expect("parse ComicInfo imprint");
+        assert_eq!(info.imprint.as_deref(), Some("Absolute"));
+    }
+
+    #[test]
+    fn stored_or_locked_imprint_precedence_is_respected() {
+        assert_eq!(resolve_effective_imprint(true, Some(" Vertigo "), true, Some("Absolute")), "Vertigo");
+        assert_eq!(resolve_effective_imprint(false, None, false, Some(" Absolute ")), "Absolute");
+        assert_eq!(resolve_effective_imprint(true, None, false, Some(" Absolute ")), "Absolute");
+        assert_eq!(resolve_effective_imprint(true, None, true, Some("Absolute")), "");
+    }
+
+    #[test]
     fn fs_name_strips_invalid_characters() {
         assert_eq!(clean_fs_name("Bat: Man?"), "Bat Man");
         assert_eq!(clean_fs_name("  A/B\\C|D  "), "ABCD");
         assert_eq!(clean_fs_name("Plain Name"), "Plain Name");
+    }
+
+    #[test]
+    fn fs_name_neutralizes_dot_only_traversal_values() {
+        // ComicInfo values are untrusted: <Publisher>..</Publisher> must never survive as a ".."
+        // path segment (parity with renamer's sanitize_component + Node's sanitizeFilename).
+        assert_eq!(clean_fs_name(".."), "_");
+        assert_eq!(clean_fs_name("."), "_");
+        assert_eq!(clean_fs_name("..."), "_");
+        assert_eq!(clean_fs_name(" .. "), "_");
+        assert_eq!(clean_fs_name("..Name"), "Name");
+        assert_eq!(clean_fs_name("Name..."), "Name");
+        // Separators are stripped first, so a smuggled "../.." collapses to dots and then to "_".
+        assert_eq!(clean_fs_name("../.."), "_");
+        assert_eq!(clean_fs_name("..\\etc"), "etc");
+        // Interior dots are ordinary name characters; a blank value stays blank (dropped token).
+        assert_eq!(clean_fs_name("Mr. Miracle"), "Mr. Miracle");
+        assert_eq!(clean_fs_name(""), "");
+    }
+
+    /// The watched-sync folder expansion for a NEW series, token for token.
+    fn expand_folder(pattern: &str, publisher: &str, series: &str, year: &str, universe: &str, group: &str) -> String {
+        clean_naming_leftovers(&pattern
+            .replace("{Publisher}", &clean_fs_name(publisher))
+            .replace("{Series}", &clean_fs_name(series))
+            .replace("{Year}", year)
+            .replace("{VolumeYear}", year)
+            .replace("{UniverseName}", &clean_fs_name(universe))
+            .replace("{SeriesGroup}", &clean_fs_name(group)))
+    }
+
+    fn assert_plainly_under(root: &Path, folder: &Path) {
+        assert!(folder.starts_with(root), "{:?} is not under {:?}", folder, root);
+        let rel = folder.strip_prefix(root).unwrap();
+        assert!(
+            rel.components().all(|c| matches!(c, std::path::Component::Normal(_))),
+            "{:?} has a non-plain component",
+            folder
+        );
+    }
+
+    #[test]
+    fn dot_dot_comicinfo_values_cannot_climb_out_of_the_library_root() {
+        let root = if cfg!(windows) { r"C:\comics" } else { "/comics" };
+        for pattern in ["{Publisher}/{Series} ({Year})", "{Series}", "{UniverseName}/{SeriesGroup}/{Series}"] {
+            for hostile in ["..", ".", "...", " .. ", "../..", "..\\.."] {
+                for (publisher, series, universe, group) in [
+                    (hostile, "Saga", "", ""),
+                    ("Image", hostile, "", ""),
+                    (hostile, hostile, hostile, hostile),
+                ] {
+                    let rel = expand_folder(pattern, publisher, series, "", universe, group);
+                    let folder = library_subfolder(root, &rel)
+                        .unwrap_or_else(|| panic!("{:?} with {:?} was refused; clean_fs_name should defuse it", pattern, hostile));
+                    assert_plainly_under(Path::new(root), &folder);
+                }
+            }
+        }
+        // The default pattern still reads naturally around the neutralized value.
+        let rel = expand_folder("{Publisher}/{Series} ({Year})", "..", "Saga", "2012", "", "");
+        assert_eq!(library_subfolder(root, &rel).unwrap(), Path::new(root).join("_").join("Saga (2012)"));
+    }
+
+    #[test]
+    fn library_subfolder_refuses_any_segment_that_is_not_a_plain_name() {
+        // Defence in depth behind clean_fs_name: pattern literals + blank tokens (or a future
+        // unsanitized token) must still never yield a path that leaves the root.
+        let root = if cfg!(windows) { r"C:\comics" } else { "/comics" };
+        for rel in ["..", "../escape", "Marvel/../../etc", "Marvel\\..\\x", ".", "Marvel/./x", "...", "Marvel/ .. /x"] {
+            assert_eq!(library_subfolder(root, rel), None, "{:?} should be refused", rel);
+        }
+        #[cfg(windows)]
+        assert_eq!(library_subfolder(root, "D:/Marvel"), None); // a drive prefix would replace the root
+        // Ordinary expansions are untouched: blank segments dropped, interior dots kept.
+        assert_eq!(library_subfolder(root, "Marvel//X-Men (1991)"), Some(Path::new(root).join("Marvel").join("X-Men (1991)")));
+        assert_eq!(library_subfolder(root, " DC Comics / Mr. Miracle (2017) "), Some(Path::new(root).join("DC Comics").join("Mr. Miracle (2017)")));
+        assert_eq!(library_subfolder(root, ""), Some(PathBuf::from(root)));
     }
 
     #[test]
@@ -655,6 +872,29 @@ mod tests {
         assert_eq!(clean_naming_leftovers("Saga ()"), "Saga");
         assert_eq!(clean_naming_leftovers("Saga [] #01"), "Saga #01");
         assert_eq!(clean_naming_leftovers("Saga  (2014)  #01"), "Saga (2014) #01");
+    }
+
+    #[test]
+    fn imprint_expands_in_watched_folder_and_file_patterns() {
+        let folder_pattern = "{Imprint}/{Series} ({Year})";
+        let file_pattern = "{Imprint} {Series} #{Issue}";
+
+        assert_eq!(
+            expand_folder_pattern(folder_pattern, Some("Absolute"), "DC Comics", "Batman", "2016", "", ""),
+            vec!["Absolute", "Batman (2016)"],
+        );
+        assert_eq!(
+            expand_folder_pattern(folder_pattern, None, "DC Comics", "Batman", "2016", "", ""),
+            vec!["Batman (2016)"],
+        );
+        assert_eq!(
+            expand_file_pattern(file_pattern, Some("Absolute"), &[("{Series}", "Batman"), ("{Issue}", "001")]),
+            "Absolute Batman #001",
+        );
+        assert_eq!(
+            expand_file_pattern(file_pattern, None, &[("{Series}", "Batman"), ("{Issue}", "001")]),
+            "Batman #001",
+        );
     }
 
     #[test]

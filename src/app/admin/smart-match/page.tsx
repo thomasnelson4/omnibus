@@ -24,6 +24,7 @@ import { AttachLocalCollectedDialog } from "@/components/attach-local-collected-
 import { BookMarked } from "lucide-react"
 import SmartMatchBoundIssue from "@/components/smart-match-bound-issue"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
+import { hasMetronCredentials } from "@/lib/metron/credentials"
 
 // Matching decisions live on the server and are revalidated before acceptance.
 // Remove legacy suggestion caches so a page refresh never restores a stale bulk decision.
@@ -339,12 +340,10 @@ export default function SmartMatchPage() {
             .then(res => res.ok ? res.json() : null)
             .then(data => {
                 if (data?.settings) {
-                    const mUser = data.settings.find((s: any) => s.key === 'metron_user')?.value;
-                    const mPass = data.settings.find((s: any) => s.key === 'metron_pass')?.value;
                     const primary = data.settings.find((s: any) => s.key === 'primary_metadata_source')?.value;
                     const pattern = data.settings.find((s: any) => s.key === 'folder_naming_pattern')?.value;
                     const writeDefault = data.settings.find((s: any) => s.key === 'metadata_write_comicinfo')?.value;
-                    if (mUser && mPass) setMetronConfigured(true);
+                    if (hasMetronCredentials(data.settings)) setMetronConfigured(true);
                     if (primary) setSearchProvider(primary);
                     if (pattern) setFolderPattern(pattern);
                     setWriteToFileDefault(writeDefault !== 'false');
@@ -469,7 +468,13 @@ export default function SmartMatchPage() {
                 // #199 ComicInfo defaults (Credits/Story & Tags/Details tabs) — series-wide values
                 // embedded into every issue's ComicInfo.xml. Strings keep the undefined-means-
                 // untouched contract (same as universe above)…
-                ...Object.fromEntries(COMIC_INFO_DEFAULT_KEYS.map(k => [k, meta[k] || undefined])),
+                ...Object.fromEntries(COMIC_INFO_DEFAULT_KEYS.map(k => [
+                    k,
+                    // Unlike other fields, an explicitly empty imprint is meaningful: it clears
+                    // the optional folder tier. Keep undefined as "untouched" for the dialog's
+                    // ordinary ComicInfo fields and preserve '' only when the editor sent it.
+                    k === 'imprint' ? (meta.imprint ?? undefined) : (meta[k] || undefined),
+                ])),
                 // …but the B&W switch is two-way by design: false clears a mistaken Yes back to
                 // unset (the route stores null, never a false "No" claim).
                 blackAndWhite: !!meta.blackAndWhite,
@@ -1340,6 +1345,7 @@ export default function SmartMatchPage() {
                                                     publisher: metadataOverrides[series.id].publisher || suggestion?.publisher,
                                                     universe: metadataOverrides[series.id].universe,
                                                     seriesGroup: metadataOverrides[series.id].seriesGroup,
+                                                    imprint: metadataOverrides[series.id].imprint ?? series.imprint,
                                                 }) || 'Custom metadata set'}
                                             </span>
                                         </div>
@@ -1860,7 +1866,10 @@ export default function SmartMatchPage() {
                 targetLabel={metaEditorTarget?.name}
                 seed={metaEditorSeed}
                 folderPattern={folderPattern}
-                initialOverride={metaEditorTarget ? metadataOverrides[metaEditorTarget.id] : undefined}
+                initialOverride={metaEditorTarget ? {
+                    ...metadataOverrides[metaEditorTarget.id],
+                    imprint: metadataOverrides[metaEditorTarget.id]?.imprint ?? metaEditorTarget.imprint ?? undefined,
+                } : undefined}
                 defaultWriteToFile={writeToFileDefault}
                 showIssueCover={!!metaEditorTarget?.isRawFile}
                 archiveFilePath={metaEditorTarget?.isRawFile ? metaEditorTarget.folderPath : undefined}

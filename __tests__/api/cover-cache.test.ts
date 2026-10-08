@@ -72,6 +72,9 @@ vi.mock('@/lib/engine', () => ({
 const req = (qs: string, headers?: Record<string, string>) =>
     new NextRequest(`http://localhost/api/library/cover?${qs}`, headers ? { headers } : undefined);
 
+/** An unversioned local cover: stored, but revalidated before every reuse (#237). */
+const REVALIDATE = 'public, no-cache';
+
 const FOLDER = '/data/comics/Saga (2012)';
 const FILE = '/data/comics/Saga (2012)/cover.jpg';
 const MTIME = 1111;
@@ -117,7 +120,7 @@ describe('local ?w= thumbnails (task A)', () => {
         expect(res.status).toBe(200);
         expect(res.headers.get('Content-Type')).toBe('image/webp');
         expect(res.headers.get('ETag')).toBe(fileEtag(480));
-        expect(res.headers.get('Cache-Control')).toContain('max-age=604800');
+        expect(res.headers.get('Cache-Control')).toBe(REVALIDATE); // unversioned URL (#237)
 
         const body = Buffer.from(await res.arrayBuffer());
         expect(body.length).toBeLessThan(bigJpeg.length);
@@ -153,7 +156,7 @@ describe('local ?w= thumbnails (task A)', () => {
 
         expect(res.status).toBe(304);
         expect(res.headers.get('ETag')).toBe(fileEtag(480));
-        expect(res.headers.get('Cache-Control')).toContain('max-age=604800');
+        expect(res.headers.get('Cache-Control')).toBe(REVALIDATE);
         expect(mocks.fsPromisesReadFile).not.toHaveBeenCalled();
     });
 
@@ -178,13 +181,13 @@ describe('local ?w= thumbnails (task A)', () => {
         expect(Buffer.compare(Buffer.from(await res.arrayBuffer()), bigJpeg)).toBe(0);
     });
 
-    it('keeps no-w responses byte-identical, now with a validator + long fresh window (task B)', async () => {
+    it('keeps no-w responses byte-identical, with a validator (task B)', async () => {
         const res = await GET(req(`path=${encodeURIComponent(FILE)}`));
 
         expect(res.status).toBe(200);
         expect(res.headers.get('Content-Type')).toBe('image/jpeg');
         expect(res.headers.get('ETag')).toBe(fileEtag());
-        expect(res.headers.get('Cache-Control')).toContain('stale-while-revalidate');
+        expect(res.headers.get('Cache-Control')).toBe(REVALIDATE);
         expect(Buffer.compare(Buffer.from(await res.arrayBuffer()), bigJpeg)).toBe(0);
     });
 
@@ -206,6 +209,55 @@ describe('local ?w= thumbnails (task A)', () => {
         expect(res.headers.get('Content-Type')).toBe('image/jpeg');
         expect(Buffer.compare(Buffer.from(await res.arrayBuffer()), junk)).toBe(0);
         expect(mocks.fsPromisesWriteFile).not.toHaveBeenCalled();
+    });
+});
+
+// #237 (anacronismo): a provider sync rewrites <folder>/cover.jpg IN PLACE, so the stored URL never
+// changes — and with a 7-day fresh window the browser kept showing the old art (the annual page the
+// scan had extracted) in the library grid without asking, while the series page, whose full-size URL
+// it had not cached, showed the new cover. An unversioned local cover is now revalidated on every
+// use (the 304 costs one stat); a &v=-stamped URL changes whenever its cover does, so it keeps the
+// long window.
+describe('freshness of local covers rewritten in place (#237)', () => {
+    it('makes the browser revalidate an unversioned cover, so a rewritten cover.jpg shows on the next load', async () => {
+        const first = await GET(req(`path=${encodeURIComponent(FILE)}&w=480`));
+        expect(first.headers.get('Cache-Control')).toBe(REVALIDATE);
+        const etag = first.headers.get('ETag')!;
+
+        // A provider sync overwrites cover.jpg: same path, same URL, new mtime.
+        mocks.fsPromisesStat.mockImplementation(async (p: string) => {
+            if (norm(p) === FILE) return fileStat({ mtimeMs: 2222 });
+            throw enoent();
+        });
+        const next = await GET(req(`path=${encodeURIComponent(FILE)}&w=480`, { 'if-none-match': etag }));
+
+        expect(next.status).toBe(200);
+        expect(next.headers.get('ETag')).toBe(`"c-2222-${bigJpeg.length}-w480"`);
+        expect(next.headers.get('Cache-Control')).toBe(REVALIDATE);
+    });
+
+    it('keeps the long fresh window for a &v=-stamped URL, 304s included', async () => {
+        const res = await GET(req(`path=${encodeURIComponent(FILE)}&v=1727800000000&w=480`));
+        expect(res.status).toBe(200);
+        expect(res.headers.get('Cache-Control')).toContain('max-age=604800');
+
+        const revalidated = await GET(req(`path=${encodeURIComponent(FILE)}&v=1727800000000&w=480`, { 'if-none-match': fileEtag(480) }));
+        expect(revalidated.status).toBe(304);
+        expect(revalidated.headers.get('Cache-Control')).toContain('max-age=604800');
+    });
+
+    it('revalidates a folder cover too (the library grid stores the folder path for unmatched series)', async () => {
+        mocks.fsPromisesStat.mockImplementation(async (p: string) => {
+            const s = norm(p);
+            if (s === FOLDER) return { mtimeMs: 5, size: 0, isDirectory: () => true, isFile: () => false };
+            if (s.endsWith('cover.jpg')) return fileStat();
+            throw enoent();
+        });
+
+        const res = await GET(req(`path=${encodeURIComponent(FOLDER)}&w=480`));
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get('Cache-Control')).toBe(REVALIDATE);
     });
 });
 
@@ -245,6 +297,8 @@ describe('remote provider covers with ?w=', () => {
         expect(res.status).toBe(200);
         expect(res.headers.get('Content-Type')).toBe('image/webp');
         expect(res.headers.get('ETag')).toBe(remoteEtag);
+        // Provider art is content-stable per URL — it keeps the long window (#237 left it alone).
+        expect(res.headers.get('Cache-Control')).toContain('max-age=604800');
         const meta = await sharp(Buffer.from(await res.arrayBuffer())).metadata();
         expect(meta.width).toBe(480);
         const writes = mocks.fsPromisesWriteFile.mock.calls.map(c => String(c[0]));
@@ -316,6 +370,7 @@ describe('issue first-page renders carry validators too (task B)', () => {
         expect(res.status).toBe(200);
         expect(res.headers.get('Content-Type')).toBe('image/webp');
         expect(res.headers.get('ETag')).toBe(issueEtag);
+        expect(res.headers.get('Cache-Control')).toContain('max-age=604800'); // unchanged by #237
         expect(mocks.fetch).not.toHaveBeenCalled();
     });
 

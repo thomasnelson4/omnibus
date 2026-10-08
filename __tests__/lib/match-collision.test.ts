@@ -119,6 +119,22 @@ describe('attachAsCollected', () => {
         expect(result).toEqual(expect.objectContaining({ attachmentId: 'attX', moved: 1, absorbed: 1, skeletonsReplaced: 1, conflicts: 0 }));
     });
 
+    it.each([
+        { imprint: null, suffix: '' },
+        { imprint: 'Black $& Label', suffix: ' [Black $& Label]' },
+    ])('cleans the collected imprint suffix before adding the extension: $imprint', async ({ imprint, suffix }) => {
+        const result = await attachAsCollected({
+            ...input,
+            owner: { ...OWNER, imprint },
+            config: { collected_file_naming_pattern: '{Series} Vol. {Issue} [{Imprint}]' },
+        });
+        expect(result.moved).toBe(1);
+        expect(mocks.moveFileSafe).toHaveBeenCalledWith(
+            '/unmatched/Saga TPB/Saga v01.cbz',
+            `/comics/Image/Saga (2012)/Saga Vol. 01${suffix}.cbz`,
+        );
+    });
+
     it('leaves a file whose collected name is already taken exactly where it is — row, folder and series untouched', async () => {
         vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p).replace(/\\/g, '/') === '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz');
         mocks.issueCount.mockResolvedValue(1);
@@ -154,6 +170,24 @@ describe('attachAsCollected', () => {
         expect(mocks.issueDelete).not.toHaveBeenCalled();
         expect(mocks.seriesDelete).not.toHaveBeenCalled();
         expect(result).toEqual(expect.objectContaining({ moved: 1, claimed: 1, conflicts: 0 }));
+    });
+
+    // Issue.fileAddedAt (#206 follow-up): a file that brings its own row keeps that row's arrival
+    // time (it was announced when the scan found it); a file with no row is new to the library.
+    it('keeps the arrival time on a row that brings its file along, and stamps a file that had no row', async () => {
+        await attachAsCollected(input);
+        const absorbed = mocks.issueUpdate.mock.calls.map(c => c[0]).find(c => c.where.id === 'u1');
+        expect('fileAddedAt' in absorbed.data).toBe(false);
+
+        vi.clearAllMocks();
+        vi.mocked(fs.promises.stat as any).mockResolvedValue({ isFile: () => true });
+        mocks.avUpsert.mockResolvedValue({ id: 'attX' });
+        mocks.engineFetchLong.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, results: [{ total: 1, created: 1 }] }) });
+        const before = Date.now();
+        await attachAsCollected({ ...input, source: '/unmatched/Saga v01.cbz', sourceSeriesId: null });
+        const claimed = mocks.issueUpdate.mock.calls.map(c => c[0]).find(c => c.where.id === 'sk1');
+        expect(claimed.data.fileAddedAt).toBeInstanceOf(Date);
+        expect(claimed.data.fileAddedAt.getTime()).toBeGreaterThanOrEqual(before);
     });
 
     it('stops before touching a file when the engine cannot import the volume', async () => {
@@ -206,6 +240,8 @@ describe('attachAsCollected', () => {
             }));
             expect(mocks.issueUpdate).not.toHaveBeenCalled();
             expect(result).toEqual(expect.objectContaining({ moved: 1, claimed: 1, absorbed: 0 }));
+            // A loose file with no row of its own is new to the library.
+            expect(mocks.issueCreate.mock.calls[0][0].data.fileAddedAt).toBeInstanceOf(Date);
         });
     });
 });

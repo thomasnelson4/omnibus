@@ -4,6 +4,7 @@ import { filePatternForIssue, seriesTokenForIssue } from '@/lib/utils/file-patte
 import path from 'path';
 import { getToken } from 'next-auth/jwt';
 import { Logger } from '@/lib/logger';
+import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
 
 export async function POST(request: NextRequest) {
     try {
@@ -64,18 +65,18 @@ export async function POST(request: NextRequest) {
             const safeYear = series.year ? series.year.toString() : "";
             const safeUniverse = (series as any).universe ? (series as any).universe.replace(/[<>:"/\\|?*]/g, '').trim() : "";
             const safeSeriesGroup = (series as any).seriesGroup ? (series as any).seriesGroup.replace(/[<>:"/\\|?*]/g, '').trim() : "";
+            const safeImprint = (series as any).imprint ? sanitizeNamingPart((series as any).imprint) : "";
 
-            const relFolderPath = folderPattern
+            let relFolderPath = folderPattern
                 .replace(/{Publisher}/gi, safePublisher)
                 .replace(/{Series}/gi, safeName)
                 .replace(/{Year}/gi, safeYear)
                 .replace(/{VolumeYear}/gi, safeYear)
                 .replace(/{UniverseName}/gi, safeUniverse)
-                .replace(/{SeriesGroup}/gi, safeSeriesGroup)
-                .replace(/\(\s*\)/g, '')
-                .replace(/\[\s*\]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
+                .replace(/{SeriesGroup}/gi, safeSeriesGroup);
+
+            relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint);
+            relFolderPath = relFolderPath.replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '').replace(/\s+/g, ' ').trim();
 
             const folderParts = relFolderPath.split(/[/\\]/).map((p: string) => p.trim()).filter(Boolean);
             const targetFolderPath = path.join(libraryRoot, ...folderParts).replace(/\\/g, '/');
@@ -129,7 +130,7 @@ export async function POST(request: NextRequest) {
                     seriesName: safeName,
                 }).replace(/[<>:"/\\|?*]/g, '').trim();
 
-                const newFileName = patternForIssue
+                let newFileName = patternForIssue
                     .replace(/{Publisher}/gi, safePublisher)
                     .replace(/{Series}/gi, seriesToken)
                     .replace(/{Year}/gi, safeYear)
@@ -138,11 +139,13 @@ export async function POST(request: NextRequest) {
                     .replace(/{Issue}/gi, formattedNum || "")
                     .replace(/{IssueTitle}/gi, cleanIssueName.replace(/[<>:"/\\|?*]/g, '').trim()) // <-- ADD THIS
                     .replace(/{UniverseName}/gi, safeUniverse) // <-- ADD THIS
-                    .replace(/{SeriesGroup}/gi, safeSeriesGroup)
+                    .replace(/{SeriesGroup}/gi, safeSeriesGroup);
+
+                newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
                     .replace(/\(\s*\)/g, '')
                     .replace(/\[\s*\]/g, '')
-                    .replace(/\s*-\s*-/g, ' - ') // <-- ADD THIS
-                    .replace(/(^\s*-\s*|\s*-\s*$)/g, '') // <-- ADD THIS
+                    .replace(/\s*-\s*-/g, ' - ')
+                    .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
                     .replace(/\s+/g, ' ')
                     .trim() + ext;
 

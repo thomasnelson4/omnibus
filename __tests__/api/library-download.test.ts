@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { Readable } from 'stream';
 import { GET } from '@/app/api/library/download/route';
 
 // 1. Hoist our mocks
@@ -7,8 +8,13 @@ const mocks = vi.hoisted(() => ({
     findUniqueUser: vi.fn(),
     findManyLibraries: vi.fn(),
     existsSync: vi.fn(),
+    statSync: vi.fn(),
+    createReadStream: vi.fn(),
+    rememberForPath: vi.fn(async () => undefined),
     log: vi.fn()
 }));
+
+vi.mock('@/lib/koreader-documents', () => ({ rememberKoreaderDocumentForPath: mocks.rememberForPath }));
 
 // 2. Mock NextAuth
 vi.mock('next-auth/next', () => ({ getServerSession: mocks.getServerSession }));
@@ -25,8 +31,8 @@ vi.mock('@/lib/db', () => ({
 vi.mock('fs', () => ({
     default: {
         existsSync: mocks.existsSync,
-        statSync: vi.fn(),
-        createReadStream: vi.fn()
+        statSync: mocks.statSync,
+        createReadStream: mocks.createReadStream
     }
 }));
 
@@ -79,5 +85,66 @@ describe('API Route: Library File Download Permissions', () => {
 
         const res = await GET(createReq('/etc/passwd'));
         expect(res.status).toBe(403);
+    });
+
+    // #211 follow-up: a book downloaded here and copied to a KOReader device by hand syncs to its issue
+    // too - the download records KOReader's document IDs for the file.
+    it('records the KOReader document IDs of the file it serves', async () => {
+        mocks.getServerSession.mockResolvedValueOnce({ user: { id: 'user_2' } });
+        mocks.findUniqueUser.mockResolvedValueOnce({ id: 'user_2', role: 'USER', canDownload: true });
+        mocks.existsSync.mockReturnValueOnce(true);
+        const fs = (await import('fs')).default as any;
+        fs.statSync.mockReturnValueOnce({ size: 1234, mtime: new Date('2026-01-01T00:00:00Z') });
+        fs.createReadStream.mockReturnValueOnce(Readable.from([]));
+
+        const res = await GET(createReq('/library/Batman/issue1.cbz'));
+
+        expect(res.status).toBe(200);
+        expect(mocks.rememberForPath).toHaveBeenCalledWith('/library/Batman/issue1.cbz');
+    });
+});
+
+// #219/#220: the web download shares lib/file-download.ts with the OPDS acquisition download, so it
+// answers the same way — extension media type, RFC 6266 disposition, and Range support.
+describe('API Route: Library File Download - response shape', () => {
+    const PATH = '/library/Batman/Batman #001.cbz';
+    const SIZE = 2048;
+    const MTIME = new Date('2026-01-01T00:00:00Z');
+    const withRange = (range: string) =>
+        GET(new Request(
+            `http://localhost/api/library/download?path=${encodeURIComponent(PATH)}`,
+            { headers: { Range: range } },
+        ));
+
+    beforeEach(() => {
+        mocks.findManyLibraries.mockResolvedValue([{ path: '/library' }]);
+        mocks.getServerSession.mockResolvedValue({ user: { id: 'user_2' } });
+        mocks.findUniqueUser.mockResolvedValue({ id: 'user_2', role: 'USER', canDownload: true });
+        mocks.existsSync.mockReturnValue(true);
+        mocks.statSync.mockReturnValue({ size: SIZE, mtime: MTIME });
+        mocks.createReadStream.mockReturnValue(Readable.from([]));
+    });
+
+    it('declares the media type from the file extension', async () => {
+        const res = await GET(createReq(PATH));
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get('Content-Type')).toBe('application/vnd.comicbook+zip');
+    });
+
+    it('emits an unencoded ASCII filename plus filename*', async () => {
+        const res = await GET(createReq(PATH));
+
+        expect(res.headers.get('Content-Disposition'))
+            .toBe(`attachment; filename="Batman #001.cbz"; filename*=UTF-8''Batman%20%23001.cbz`);
+    });
+
+    it('advertises and honours byte ranges', async () => {
+        expect((await GET(createReq(PATH))).headers.get('Accept-Ranges')).toBe('bytes');
+
+        const res = await withRange('bytes=0-511');
+        expect(res.status).toBe(206);
+        expect(res.headers.get('Content-Range')).toBe(`bytes 0-511/${SIZE}`);
+        expect(mocks.createReadStream).toHaveBeenCalledWith(PATH, { start: 0, end: 511 });
     });
 });

@@ -16,11 +16,13 @@ import { syncSeriesMetadata } from '@/lib/metadata-fetcher';
 import { AuditLogger } from '@/lib/audit-logger';
 import { MetronProvider } from '@/lib/metadata/providers/metron';
 import { getMetronCover } from '@/lib/metadata/providers/metron-cover';
+import { lazyMetronAuth } from '@/lib/metron/client';
 import { normalizeFractionNumbers } from '@/lib/utils/issue-parser';
 import { ownedCoverageBySeries } from '@/lib/coverage-ownership';
 import { omnibusQueue } from '@/lib/queue';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { followSeries, followSeriesByCatalogId } from '@/lib/follows';
+import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
 
 export const dynamic = 'force-dynamic';
 
@@ -41,8 +43,7 @@ export async function GET(request: NextRequest) {
         where: { metadataId: { in: volumeIds } } 
     });
 
-    const metronUserSetting = await prisma.systemSetting.findUnique({ where: { key: 'metron_user' } });
-    const metronPassSetting = await prisma.systemSetting.findUnique({ where: { key: 'metron_pass' } });
+    const metronAuth = lazyMetronAuth();
 
     const formattedRequests = await Promise.all(requests.map(async req => {
       const series = seriesList.find(s => 
@@ -66,7 +67,7 @@ export async function GET(request: NextRequest) {
       if (req.status === 'UNRELEASED' && (!finalImageUrl || finalImageUrl.includes('placeholder') || finalImageUrl.includes('default'))) {
           const seriesNameStr = series?.name || req.activeDownloadName?.replace(/#.*/, '').trim();
           if (regexMatch && seriesNameStr) {
-              const fallback = await getMetronCover(seriesNameStr, regexMatch[1], metronUserSetting?.value, metronPassSetting?.value);
+              const fallback = await getMetronCover(seriesNameStr, regexMatch[1], await metronAuth());
               if (fallback) {
                   finalImageUrl = fallback;
                   prisma.request.update({ where: { id: req.id }, data: { imageUrl: fallback } }).catch(()=>{});
@@ -113,8 +114,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Your session is invalid. Please log out and log back in.' }, { status: 401 });
   }
 
-  const metronUserSetting = await prisma.systemSetting.findUnique({ where: { key: 'metron_user' } });
-  const metronPassSetting = await prisma.systemSetting.findUnique({ where: { key: 'metron_pass' } });
+  const metronAuth = lazyMetronAuth();
 
   try {
     const body = await request.json();
@@ -219,12 +219,12 @@ export async function POST(request: NextRequest) {
     const safePublisher = publisher || "Unknown";
     // Detection precedence: an existing Series row's isManga (set by the scanner's full waterfall,
     // incl. ComicInfo + AniList) beats a request-time re-detection, which only has name+publisher.
-    let existingSeries: { isManga: boolean } | null = null;
+    let existingSeries: { isManga: boolean; imprint: string | null } | null = null;
     if (resolvedCvId) {
         try {
             existingSeries = (await prisma.series.findUnique({
                 where: { metadataSource_metadataId: { metadataSource, metadataId: resolvedCvId.toString() } },
-                select: { isManga: true }
+                select: { isManga: true, imprint: true }
             })) ?? null;
         } catch {}
     }
@@ -251,18 +251,21 @@ export async function POST(request: NextRequest) {
 
       const safeFolderName = name.replace(/[<>:"/\\|?*]/g, ' - ').replace(/\s+/g, ' ').trim();
       const safePubFolder = safePublisher !== "Unknown" ? safePublisher.replace(/[<>:"/\\|?*]/g, '').trim() : "Other";
+      const safeImprint = sanitizeNamingPart(existingSeries?.imprint || '');
 
       const settings = await prisma.systemSetting.findMany();
       const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
       const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
 
-      const relFolderPath = folderPattern
+      let relFolderPath = folderPattern
           .replace(/{Publisher}/gi, safePubFolder)
           .replace(/{Series}/gi, safeFolderName)
           .replace(/{Year}/gi, year ? year.toString() : "")
-          .replace(/{VolumeYear}/gi, year ? year.toString() : "")
-          .replace(/\(\s*\)/g, '') 
-          .replace(/\[\s*\]/g, '') 
+          .replace(/{VolumeYear}/gi, year ? year.toString() : "");
+
+      relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
+          .replace(/\(\s*\)/g, '')
+          .replace(/\[\s*\]/g, '')
           .replace(/\s+/g, ' ')
           .trim();
 
@@ -279,7 +282,7 @@ export async function POST(request: NextRequest) {
               name, 
               cvId: metadataSource === 'COMICVINE' ? parseInt(resolvedCvId.toString()) : null, 
               matchState: 'MATCHED',
-              year: parseInt(year) 
+              year: parseInt(year)
           },
           create: { 
               cvId: metadataSource === 'COMICVINE' ? parseInt(resolvedCvId.toString()) : null, 
@@ -421,7 +424,7 @@ export async function POST(request: NextRequest) {
             let issueImage = issue.image?.medium_url || issue.image?.small_url || image;
             
             if (!isReleased && (!issueImage || issueImage.includes('placeholder') || issueImage.includes('default'))) {
-                const fallback = await getMetronCover(name, issue.issue_number, metronUserSetting?.value, metronPassSetting?.value);
+                const fallback = await getMetronCover(name, issue.issue_number, await metronAuth());
                 if (fallback) issueImage = fallback;
             }
 
@@ -461,7 +464,7 @@ export async function POST(request: NextRequest) {
         ? `${name} #${body.issueNumber}` : name;
 
       if (body.issueNumber && (!image || image.includes('placeholder') || image.includes('default'))) {
-         const fallback = await getMetronCover(name, body.issueNumber, metronUserSetting?.value, metronPassSetting?.value);
+         const fallback = await getMetronCover(name, body.issueNumber, await metronAuth());
          if (fallback) image = fallback;
       }
 

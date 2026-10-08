@@ -71,8 +71,8 @@ prisma/schema - BACKUP.prisma
 .claude/worktrees/
 .claude/plans/
 
-# Ignore .pi runtime state (session scratch, background-task logs) but keep
-# .pi/skills/ tracked — those are durable project knowledge, not temp files.
+# Ignore .pi runtime state (background-task logs, session scratch) but keep
+# .pi/skills/ trackable — those are durable project knowledge, not temp files.
 .pi/*
 !.pi/skills/
 

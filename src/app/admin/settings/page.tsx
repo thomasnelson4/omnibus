@@ -35,6 +35,7 @@ import { SystemTab } from "./tabs/system-tab"
 import { MegaAccountFields } from "@/components/mega-account-fields"
 
 import type { LibraryConfig, IndexerConfig, CustomHeader, AcronymConfig, ScoringRule, ClientConfig, WebhookConfig, HosterAccountConfig } from "./tabs/shared"
+import { hasMetronCredentials } from "@/lib/metron/credentials"
 
 // --- Constants & Global Mappings ---
 // RECOMMENDED_PUBLISHERS / RECOMMENDED_KEYWORDS now live in @/lib/filter-defaults (shared with the setup wizard).
@@ -106,7 +107,7 @@ export default function SettingsPage() {
   const [config, setConfig] = useState<any>({
     primary_metadata_source: "COMICVINE",
     prowlarr_url: "", prowlarr_key: "", prowlarr_categories: "7030", download_path: "", cv_api_key: "",
-    metron_user: "", metron_pass: "",
+    metron_api_token: "", metron_user: "", metron_pass: "",
     export_series_json: "true",
     metadata_write_comicinfo: "true",
     cover_source: "metadata",
@@ -200,7 +201,8 @@ export default function SettingsPage() {
     if (source === "COMICVINE") {
       return !!config.cv_api_key && config.cv_api_key.trim() !== "";
     } else if (source === "METRON") {
-      return !!config.metron_user && config.metron_user.trim() !== "" && !!config.metron_pass && config.metron_pass.trim() !== "";
+      // An API token alone is a complete Metron setup (Metron is retiring username/password sign-in).
+      return hasMetronCredentials(config);
     }
     return false;
   };
@@ -213,7 +215,7 @@ export default function SettingsPage() {
         setConfig({...config, primary_metadata_source: "METRON", show_popular_issues: "false"});
       }
     }
-  }, [config.cv_api_key, config.metron_user, config.metron_pass, isDataLoaded]);
+  }, [config.cv_api_key, config.metron_api_token, config.metron_user, config.metron_pass, isDataLoaded]);
 
   useEffect(() => {
       if (isDataLoaded && initialStateHash === "") {

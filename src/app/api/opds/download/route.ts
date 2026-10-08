@@ -2,10 +2,11 @@
 import { prisma } from '@/lib/db';
 import { validateApiKey } from '@/lib/api-auth';
 import fs from 'fs';
-import path from 'path';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger';
 import { getAccessibleLibraryIds, canAccessLibraryId } from '@/lib/library-access';
+import { rememberKoreaderDocument } from '@/lib/koreader-documents';
+import { sendFileResponse } from '@/lib/file-download';
 
 export const dynamic = 'force-dynamic';
 
@@ -41,27 +42,14 @@ export async function GET(req: Request) {
             return new Response("Forbidden: you do not have access to this library.", { status: 403 });
         }
 
-        const stat = fs.statSync(issue.filePath);
-        const fileName = path.basename(issue.filePath);
+        // KOReader's document IDs for these exact bytes, so the device's progress syncs find this issue
+        // without "Send document metadata" / "Use server filenames" (#211). Twelve 1 KB reads; never fails the download.
+        await rememberKoreaderDocument(issue.id, issue.filePath);
 
-        // 3. Stream the file directly to the client app
-        const stream = fs.createReadStream(issue.filePath);
-        const readableStream = new ReadableStream({
-            start(controller) {
-                stream.on('data', (chunk) => controller.enqueue(chunk));
-                stream.on('end', () => controller.close());
-                stream.on('error', (err) => controller.error(err));
-            },
-            cancel() { stream.destroy(); }
-        });
-
-        return new Response(readableStream, {
-            headers: {
-                'Content-Disposition': `attachment; filename="${encodeURIComponent(fileName)}"`,
-                'Content-Type': 'application/vnd.comicbook+zip',
-                'Content-Length': stat.size.toString()
-            }
-        });
+        // 3. Stream the file to the client app. The media type (from the extension), the RFC 6266
+        // Content-Disposition and Range support come from the helper the web-app download shares
+        // (#219, #220) — this route keeps only its own auth, permission and library checks.
+        return sendFileResponse(req, issue.filePath);
 
     } catch (error) {
         Logger.log(`[OPDS Download API] Error: ${getErrorMessage(error)}`, 'error');

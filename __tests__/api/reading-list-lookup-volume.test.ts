@@ -10,11 +10,14 @@ import { getReq } from '../helpers/request';
 const mocks = vi.hoisted(() => ({
     settingFindUnique: vi.fn(),
     cachedCvGet: vi.fn(),
+    metronAuth: vi.fn(),
+    metronGet: vi.fn(),
 }));
 
 vi.mock('axios');
 vi.mock('@/lib/db', () => ({ prisma: { systemSetting: { findUnique: mocks.settingFindUnique } } }));
 vi.mock('@/lib/metadata/metadata-cache', () => ({ cachedCvGet: mocks.cachedCvGet }));
+vi.mock('@/lib/metron/client', () => ({ getMetronAuth: mocks.metronAuth, metronGet: mocks.metronGet }));
 
 const req = (params: Record<string, string>) =>
     getReq(`http://localhost/api/reading-lists/lookup-volume?${new URLSearchParams(params)}`);
@@ -49,11 +52,18 @@ describe('GET /api/reading-lists/lookup-volume', () => {
         expect(mocks.settingFindUnique).not.toHaveBeenCalled();
     });
 
-    it('still serves Metron ids', async () => {
-        vi.mocked(axios.get).mockResolvedValue({ data: { series: { id: 77 }, cover_date: '2012-03-14' } });
+    it('still serves Metron ids through the shared Metron client', async () => {
+        mocks.metronAuth.mockResolvedValue({ kind: 'basic', user: 'u', pass: 'p' });
+        mocks.metronGet.mockResolvedValue({ data: { series: { id: 77 }, cover_date: '2012-03-14' } });
         const res = await GET(req({ issueId: '4521', provider: 'METRON' }));
         expect(await res.json()).toEqual({ volumeId: 77, year: '2012' });
-        expect(vi.mocked(axios.get).mock.calls[0][0]).toBe('https://metron.cloud/api/issue/4521/');
+        expect(mocks.metronGet.mock.calls[0][0]).toBe('https://metron.cloud/api/issue/4521/');
+    });
+
+    it('returns the empty answer when Metron has no credentials', async () => {
+        mocks.metronAuth.mockResolvedValue(null);
+        expect(await (await GET(req({ issueId: '4521', provider: 'METRON' }))).json()).toEqual({ volumeId: 0, year: null });
+        expect(mocks.metronGet).not.toHaveBeenCalled();
     });
 
     it('returns the empty answer when no issueId is given', async () => {

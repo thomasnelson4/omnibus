@@ -5,16 +5,18 @@
 // pin that failFast never sleeps or retries, and that usage/caching accounting stays honest.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { MetronProvider } from '@/lib/metadata/providers/metron';
+import { __resetMetronLimiterForTests } from '@/lib/metron/client';
 
 const mocks = vi.hoisted(() => ({
     findManySettings: vi.fn(),
     logApiUsage: vi.fn(),
+    markSystemFlag: vi.fn(),
     getCachedResponse: vi.fn(),
     putCachedResponse: vi.fn(),
 }));
 
 vi.mock('@/lib/db', () => ({ prisma: { systemSetting: { findMany: mocks.findManySettings } } }));
-vi.mock('@/lib/utils/system-flags', () => ({ logApiUsage: mocks.logApiUsage }));
+vi.mock('@/lib/utils/system-flags', () => ({ logApiUsage: mocks.logApiUsage, markSystemFlag: mocks.markSystemFlag }));
 vi.mock('@/lib/metadata/metadata-cache', () => ({
     getCachedResponse: mocks.getCachedResponse,
     putCachedResponse: mocks.putCachedResponse,
@@ -48,6 +50,9 @@ describe('MetronProvider.getIssueSummary', () => {
     let fetchMock: ReturnType<typeof vi.fn>;
 
     beforeEach(() => {
+        // The shared client's in-memory limiter persists across tests; a 429 in one test would
+        // poison the next. Reset it exactly like metron-client.test.ts does.
+        __resetMetronLimiterForTests();
         mocks.findManySettings.mockResolvedValue(creds);
         mocks.getCachedResponse.mockResolvedValue(null);
         mocks.putCachedResponse.mockResolvedValue(undefined);
@@ -73,7 +78,7 @@ describe('MetronProvider.getIssueSummary', () => {
         expect(fetchMock.mock.calls[0][0]).toBe('https://metron.cloud/api/issue/4521/');
         expect(fetchMock.mock.calls[0][1].headers.Authorization).toMatch(/^Basic /);
         expect(mocks.logApiUsage).toHaveBeenCalledOnce();
-        expect(mocks.logApiUsage).toHaveBeenCalledWith('metron', '/issue');
+        expect(mocks.logApiUsage).toHaveBeenCalledWith('metron', '/issue/{id}');
     });
 
     it('prefers title over name, drops placeholders, and tolerates sparse payloads', async () => {
@@ -102,7 +107,7 @@ describe('MetronProvider.getIssueSummary', () => {
     it('resolves null on a 404 and still counts the call', async () => {
         fetchMock.mockResolvedValueOnce(response(404, { detail: 'Not found.' }));
         await expect(provider.getIssueSummary('999999')).resolves.toBeNull();
-        expect(mocks.logApiUsage).toHaveBeenCalledWith('metron', '/issue');
+        expect(mocks.logApiUsage).toHaveBeenCalledWith('metron', '/issue/{id}');
         expect(mocks.putCachedResponse).not.toHaveBeenCalled();
     });
 

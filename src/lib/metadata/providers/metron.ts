@@ -294,7 +294,9 @@ export class MetronProvider implements IMetadataProvider {
                         parsedSeriesId = parseInt(searchRes.data.results[0].id);
                     }
                 }
-            } catch(e) {}
+            } catch(e) {
+                // Optional enrichment only: a failed series-id lookup must not fail the match.
+            }
         }
         
         let fullName = seriesName ? `${seriesName} #${issue.number || '0'}` : `Issue #${issue.number || '0'}`;
@@ -347,8 +349,10 @@ export class MetronProvider implements IMetadataProvider {
         if (!/^\d+$/.test(id)) throw new Error('METRON_INVALID_ID');
         const auth = await getMetronAuth();
         // An undecryptable secret (enc:…, e.g. after a NEXTAUTH_SECRET change) can only be rejected.
-        const rawSecret = auth && (auth.kind === 'token' ? auth.token : `${auth.user}:${auth.pass}`);
-        if (!auth || rawSecret?.startsWith('enc:')) throw new Error('METRON_NOT_CONFIGURED');
+        // Check the secret field itself — not a user:pass concatenation, which hides the enc: prefix —
+        // and the settings UI's '********' mask, which is not a credential.
+        const secret = auth ? (auth.kind === 'token' ? auth.token : auth.pass) : undefined;
+        if (!auth || /^(enc:|\*{8})/.test(secret ?? '')) throw new Error('METRON_NOT_CONFIGURED');
 
         let res;
         try {
@@ -358,6 +362,9 @@ export class MetronProvider implements IMetadataProvider {
             // 404 is still a real upstream call, so usage counting stays inside metronGet too.
             if (e instanceof MetronRateLimitError) throw new Error('FATAL_RATE_LIMIT');
             const status = e instanceof MetronHttpError ? e.status : undefined;
+            // A short 429 (inline-wait sized) exhausts maxAttempts:1 as a plain MetronHttpError;
+            // issue-match still needs the typed METRON_RATE_LIMITED string to react to it.
+            if (status === 429) throw new Error('METRON_RATE_LIMITED');
             if (status === 401 || status === 403) throw new Error(`HTTP Error: ${status}`);
             throw e;
         }

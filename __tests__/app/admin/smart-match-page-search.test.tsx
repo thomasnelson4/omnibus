@@ -468,17 +468,28 @@ describe('Smart Matcher — Search Match dialog', () => {
     });
 });
 
-// Metron beta 4 (#216 follow-up): the Auto-Scan searches once per unmatched series and shows one
-// suggestion, but each search paid for up to ten Metron cover requests. It now searches without
-// covers and asks for the cover of the one suggestion it shows.
-describe('Smart Matcher — Auto-Scan covers', () => {
-    let scanSearches: string[] = [];
+// Metron beta 4 (#216 follow-up) originally pinned the client-side scan: one covers=none search per
+// series plus a single cover fetch for the shown suggestion. The evidence-first decision service
+// (cf2ae35) moved the search server-side: Auto-Scan now POSTs /api/admin/smart-match once per
+// unmatched series and the picked candidate's cover arrives baked into the decision, so the page
+// makes NO client-side /api/search or /api/search/cover calls during a scan. This pins that contract.
+describe('Smart Matcher — Auto-Scan decision flow', () => {
+    let scanPosts: Array<Record<string, unknown>> = [];
+    let searchCalls: string[] = [];
     let coverCalls: string[] = [];
-    const PROXIED = `/api/library/cover?path=${encodeURIComponent('https://static.metron.cloud/16180.jpg')}`;
+    const CANDIDATE_IMAGE = 'https://static.metron.cloud/16180.jpg';
+
+    const DECISION = {
+        status: 'high', confidence: 'high', safeToAccept: true, autoAccept: false,
+        selected: { id: '16180', metadataSource: 'METRON', name: 'Conan & Dragonero', year: 2026,
+            publisher: 'Sergio Bonelli Editore', count: 5, image: CANDIDATE_IMAGE },
+        candidates: [], reasons: ['exact id match from the filename'],
+        parsed: { title: 'Conan & Dragonero 001', alternateTitles: [], domain: 'issue', releaseTags: [], warnings: [] },
+        files: [], queries: ['conan dragonero'],
+    };
 
     beforeEach(() => {
-        scanSearches = [];
-        coverCalls = [];
+        scanPosts = []; searchCalls = []; coverCalls = [];
         toast.mockClear();
         localStorage.clear();
         stubFetchRouter([
@@ -490,24 +501,25 @@ describe('Smart Matcher — Auto-Scan covers', () => {
                 ],
             })],
             ['/api/admin/sweep', () => ok({})],
-            ['/api/search/cover', (u) => { coverCalls.push(u); return ok({ image: PROXIED }); }],
-            ['/api/search', (u) => { scanSearches.push(u); return ok({ results: [SEARCH_RESULT, { ...SEARCH_RESULT, id: 77, name: 'Dragonero' }], hasMore: false }); }],
+            ['/api/admin/smart-match', (_u, init) => { scanPosts.push(JSON.parse(init?.body || '{}')); return ok(DECISION); }],
+            ['/api/search/cover', (u) => { coverCalls.push(u); return ok({ image: '/api/library/cover?path=x' }); }],
+            ['/api/search', (u) => { searchCalls.push(u); return ok({ results: [], hasMore: false }); }],
         ]);
     });
     afterEach(() => vi.unstubAllGlobals());
 
-    it('searches without covers, then fetches only the picked suggestion\'s cover', async () => {
+    it('auto-scan posts the decision service once per series and renders the returned candidate', async () => {
         render(<SmartMatchPage />);
         await screen.findByText('Conan & Dragonero 001');
 
         fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
 
-        await waitFor(() => expect(coverCalls).toHaveLength(1));
-        expect(scanSearches).toHaveLength(1);
-        expect(scanSearches[0]).toContain('covers=none');
-        expect(coverCalls[0]).toContain('provider=METRON');
-        expect(coverCalls[0]).toContain('id=16180');
-        await waitFor(() => expect(screen.getByAltText('Suggestion').getAttribute('src')).toBe(PROXIED));
+        await waitFor(() => expect(scanPosts).toHaveLength(1));
+        expect(scanPosts[0]).toMatchObject({ itemId: RAW_ITEM.id, provider: 'METRON' });
+        await screen.findByAltText('Suggestion');
+        expect(screen.getByAltText('Suggestion').getAttribute('src')).toBe(CANDIDATE_IMAGE);
+        // The cover storm is gone for good: no client-side search or cover fetches during a scan.
+        expect(searchCalls).toHaveLength(0);
+        expect(coverCalls).toHaveLength(0);
     });
 });
-

@@ -86,22 +86,64 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       # --- DOCKER BUILD STEPS ---
+      # Buildx's container driver bootstraps its buildkit image from Docker Hub,
+      # and runner egress to auth.docker.io is intermittently unreachable —
+      # run 37993709247 saw both jobs die at this step with "Client.Timeout
+      # exceeded" before any credential was used. Pre-pull with retries so a
+      # flaky window survives, and so the failure is named rather than buried
+      # inside the setup action.
+      - name: Pre-pull buildkit image (retry on Docker Hub flake)
+        run: |
+          for i in 1 2 3 4 5; do
+            if docker pull moby/buildkit:buildx-stable-1; then
+              echo "buildkit pulled on attempt $i"
+              break
+            fi
+            echo "attempt $i failed; retrying in 30s"
+            sleep 30
+          done
+          # Fail explicitly rather than inside setup-buildx.
+          docker image inspect moby/buildkit:buildx-stable-1 >/dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "buildkit pull failed after 5 attempts"
+            exit 1
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: image=moby/buildkit:buildx-stable-1
 
       - name: Log in to the Container registry (GHCR)
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }} 
+          password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub publishing is upstream-only: this fork publishes to
+      # GHCR alone. The DOCKERHUB secrets are not configured here, but the
+      # repository guard makes that intent structural rather than
+      # dependent on absent secrets.
       - name: Log in to Docker Hub
-        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        if: >-
+          env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+          && github.repository == 'hankscafe/omnibus'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # The Docker Hub image entry is computed in its own step, outside the
+      # `|` literal block — a long expression cannot wrap inside one, because
+      # each line would parse as a separate image entry.
+      - name: Compute Docker Hub image name
+        if: >-
+          env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+          && github.repository == 'hankscafe/omnibus'
+        run: |
+          echo "DOCKERHUB_IMAGE=${{ env.DOCKERHUB_USERNAME }}" \
+            "/${{ env.DOCKERHUB_REPO }}" >> $GITHUB_ENV
 
       - name: Extract metadata (tags, labels) for Docker
         id: meta
@@ -109,7 +151,7 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && format('{0}/{1}', env.DOCKERHUB_USERNAME, env.DOCKERHUB_REPO) || '' }}
+            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
             type=raw,value=v${{ env.VERSION }},enable=${{ github.ref == format('refs/heads/{0}', 'main') }}
@@ -130,7 +172,11 @@ jobs:
             CACHEBUST=${{ github.run_id }}
 
       - name: Update Docker Hub Description
-        if: success() && env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != '' && github.ref == format('refs/heads/{0}', 'main')
+        if: >-
+          success() && env.DOCKERHUB_USERNAME != ''
+          && env.DOCKERHUB_TOKEN != ''
+          && github.repository == 'hankscafe/omnibus'
+          && github.ref == format('refs/heads/{0}', 'main')
         uses: peter-evans/dockerhub-description@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}

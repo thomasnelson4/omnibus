@@ -3,7 +3,8 @@
 // admin config route (which also masks every one of them on the way out); existing plaintext is
 // migrated by db-init. The Rust engine has a matching decrypt (omnibus-engine/src/secret_crypto.rs)
 // for the keys it reads (cv_api_key, prowlarr_key, metron_api_token, metron_pass). Usernames/URLs
-// (metron_user, smtp_user, prowlarr_url, …) are NOT secrets and stay in plaintext.
+// (metron_user, smtp_user, prowlarr_url, komga_url, …) are NOT secrets and stay in plaintext.
+// komga_api_key is a full Komga ADMIN credential, read only by Node (the engine never calls Komga).
 export const SECRET_SETTING_KEYS = new Set<string>([
   'cv_api_key',
   'prowlarr_key',
@@ -14,4 +15,5 @@ export const SECRET_SETTING_KEYS = new Set<string>([
   'pushover_token',
   'telegram_bot_token',
   'apprise_url',
+  'komga_api_key',
 ]);

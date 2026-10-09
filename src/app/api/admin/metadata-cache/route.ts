@@ -11,6 +11,7 @@ import { prisma } from '@/lib/db';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { Logger } from '@/lib/logger';
+import crypto from 'crypto';
 
 export const dynamic = 'force-dynamic';
 
@@ -44,6 +45,14 @@ export async function DELETE() {
     const userId = (session?.user as any)?.id;
 
     const deleted = await prisma.metadataCache.deleteMany({});
+    // Matching decisions and formatted provider responses are derived from these same bodies.
+    // A generation fences already-open pages; their server-owned decision tokens become stale.
+    await prisma.systemSetting.upsert({ where: { key: 'smart_match_cache_epoch' },
+      update: { value: crypto.randomUUID() }, create: { key: 'smart_match_cache_epoch', value: crypto.randomUUID() } });
+    await prisma.systemSetting.deleteMany({ where: { OR: [
+      { key: { startsWith: 'search_v3_' } }, { key: { startsWith: 'meta_details_' } },
+      { key: { startsWith: 'cv_details_cache_' } }, { key: { startsWith: 'smart_match_v1_' } },
+    ] } });
     if (userId) await AuditLogger.log('CLEARED_METADATA_CACHE', { count: deleted.count }, userId);
     Logger.log(`[Metadata Cache API] Admin cleared ${deleted.count} cached provider responses.`, 'info');
 

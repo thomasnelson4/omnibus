@@ -17,7 +17,7 @@ import Link from "next/link"
 import { Logger } from "@/lib/logger"
 import { getErrorMessage } from "@/lib/utils/error"
 import { extractIssueNumber } from "@/lib/utils/issue-parser"
-import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName, pickSuggestion } from "@/lib/utils/smart-match-search"
+import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName } from "@/lib/utils/smart-match-search"
 import SmartMatchMetadataDialog, { type SmartMatchOverride, buildFolderPreview, shouldEmbedIssueCover, COMIC_INFO_DEFAULT_KEYS } from "@/components/smart-match-metadata-dialog"
 import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
 import { AttachLocalCollectedDialog } from "@/components/attach-local-collected-dialog"
@@ -26,36 +26,14 @@ import SmartMatchBoundIssue from "@/components/smart-match-bound-issue"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 import { hasMetronCredentials } from "@/lib/metron/credentials"
 
-// Auto-scan results (the ComicVine/Metron match suggestions) are kept in sessionStorage so a page
-// refresh or navigate-away-and-back restores them instead of re-running the scan. The cache is
-// provider-scoped and shares the 12h TTL of the server-side /api/search cache so client and server
-// expire in lockstep. sessionStorage (not localStorage) clears on tab close, which matches the
-// volatile nature of a matching session.
-const SCAN_CACHE_PREFIX = 'omnibus-smartmatch-suggestions';
-const SCAN_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-
-function readScanCache(provider: string): Record<string, any> {
+// Matching decisions live on the server and are revalidated before acceptance.
+// Remove legacy suggestion caches so a page refresh never restores a stale bulk decision.
+function clearLegacyScanCache() {
     try {
-        const raw = sessionStorage.getItem(`${SCAN_CACHE_PREFIX}-${provider}`);
-        if (!raw) return {};
-        const env = JSON.parse(raw);
-        if (!env || typeof env.ts !== 'number' || Date.now() - env.ts > SCAN_CACHE_TTL_MS) {
-            sessionStorage.removeItem(`${SCAN_CACHE_PREFIX}-${provider}`);
-            return {};
+        for (let i = sessionStorage.length - 1; i >= 0; i--) {
+            const key = sessionStorage.key(i);
+            if (key?.startsWith('omnibus-smartmatch-suggestions')) sessionStorage.removeItem(key);
         }
-        return env.data && typeof env.data === 'object' ? env.data : {};
-    } catch {
-        return {};
-    }
-}
-
-function writeScanCache(provider: string, data: Record<string, any>) {
-    try {
-        if (!data || Object.keys(data).length === 0) {
-            sessionStorage.removeItem(`${SCAN_CACHE_PREFIX}-${provider}`);
-            return;
-        }
-        sessionStorage.setItem(`${SCAN_CACHE_PREFIX}-${provider}`, JSON.stringify({ ts: Date.now(), data }));
     } catch {}
 }
 
@@ -102,6 +80,7 @@ export default function SmartMatchPage() {
     // where the provider already gave us covers (Metron), otherwise in ONE batch call (ComicVine).
     const [issueCovers, setIssueCovers] = useState<Record<string, string>>({});
     const [suggestions, setSuggestions] = useState<Record<string, any>>({});
+    const [decisions, setDecisions] = useState<Record<string, any>>({});
     const [isScanning, setIsScanning] = useState(false);
     const [processingId, setProcessingId] = useState<string | null>(null);
     // A match whose folder another series already owns (409 from match-series): the admin chooses
@@ -173,10 +152,11 @@ export default function SmartMatchPage() {
     };
     const [manualMatchResult, setManualMatchResult] = useState<any>(null);
     
-    // --- NEW: Multi-Select & Bulk Processing State ---
+    // Select entries, then assign one series or accept their individual suggestions.
     const [isSelectionMode, setIsSelectionMode] = useState(false);
     const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
     const [isBulkProcessing, setIsBulkProcessing] = useState(false);
+    const [bulkProgress, setBulkProgress] = useState<{ done: number; total: number } | null>(null);
     // Accept All progress: null = idle, otherwise {done, total} across the chunked bulk calls.
     const [acceptAllProgress, setAcceptAllProgress] = useState<{ done: number; total: number } | null>(null);
     const [isBulkManualMatch, setIsBulkManualMatch] = useState(false);
@@ -399,105 +379,60 @@ export default function SmartMatchPage() {
             });
     }, [toast]);
 
-    // Which provider the live `suggestions` belong to. The persist effect writes under this ref (not
-    // the latest searchProvider) so a provider switch — which re-hydrates suggestions on the next
-    // render — can't momentarily clobber the other provider's cache with stale data.
-    const suggestionsProviderRef = useRef<string>('COMICVINE');
-
-    // Hydrate cached suggestions whenever the active provider changes (incl. the initial settle from
-    // saved config). Stale entries for series no longer unmatched simply don't render and age out by TTL.
     useEffect(() => {
-        suggestionsProviderRef.current = searchProvider;
-        setSuggestions(readScanCache(searchProvider));
+        clearLegacyScanCache();
+        setSuggestions({});
+        setDecisions({});
     }, [searchProvider]);
 
-    // Persist live suggestions under the provider they belong to.
-    useEffect(() => {
-        writeScanCache(suggestionsProviderRef.current, suggestions);
-    }, [suggestions]);
+    const scanItem = async (series: any, refresh = false) => {
+        const res = await fetch('/api/admin/smart-match', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId: series.id, provider: searchProvider, refresh }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Matching failed');
+        setDecisions(prev => ({ ...prev, [series.id]: data }));
+        const selected = data.selected;
+        setSuggestions(prev => ({ ...prev, [series.id]: selected
+            ? { ...selected, matchDecision: data }
+            : ['provider_error', 'rate_limited', 'deferred'].includes(data.status) ? 'ERROR' : 'NOT_FOUND' }));
+        return data;
+    };
+
+    const retryMatch = async (series: any) => {
+        setProcessingId(series.id);
+        try { await scanItem(series, true); }
+        catch (error: any) { toast({ title: 'Retry failed', description: error.message, variant: 'destructive' }); }
+        finally { setProcessingId(null); }
+    };
 
     const startSmartScan = async () => {
         setIsScanning(true);
         let matchCount = 0;
-
-        for (const series of visibleUnmatched) {
-            if (suggestions[series.id]) continue;
-            // An ignored series is visible only while the toggle is on; scanning it would put a
-            // suggestion back on a row the admin has already dealt with.
-            if (series.isIgnored) continue;
-
-            try {
-                // The search term is the SERIES, not the file: a loose file arrives as its filename
-                // ("X-Men 001 (2024)"), and the issue number pollutes the provider query. The year is
-                // kept aside for ranking and never sent — the search route would only turn it into a
-                // boolean sort that pulls every same-year volume ahead of the exact name.
-                const { query: cleanName, year: nameYear } = seriesQueryFromName(series.name);
-                const wantedYear = series.year > 0 ? series.year : nameYear;
-                const query = `${cleanName} ${wantedYear ?? ''}`.trim();
-
-                Logger.log(`[Smart Match Debug] Auto-scanning for "${query}" using provider: ${searchProvider}`, 'debug');
-
-                // covers=none: the scan shows one suggestion per series, so it asks for that one's cover
-                // below instead of paying Metron for every result's (Metron beta 4).
-                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&provider=${searchProvider}&covers=none`);
-                
-                if (res.status === 429) {
-                    throw new Error("FATAL_RATE_LIMIT");
-                }
-
-                const data = await res.json();
-
-                // Score every candidate — name similarity first, the year as a tiebreaker — instead of
-                // trusting results[0]. A best candidate that barely resembles the name becomes
-                // NOT_FOUND on purpose: Accept All takes any row with a suggestion, and a confident-
-                // looking wrong answer there costs a folder move to undo.
-                const results: { id: string | number; name?: string; year?: string | number | null; image?: string | null; metadataSource?: string }[] = data.results || [];
-                const picked = pickSuggestion(cleanName, wantedYear, results);
-                if (picked) {
-                    setSuggestions(prev => ({ ...prev, [series.id]: picked }));
-                    matchCount++;
-                    if (!picked.image && picked.metadataSource === 'METRON') {
-                        try {
-                            const coverRes = await fetch(`/api/search/cover?provider=METRON&id=${encodeURIComponent(picked.id)}`);
-                            const { image } = coverRes.ok ? await coverRes.json() : { image: null };
-                            if (image) {
-                                setSuggestions(prev => {
-                                    const current = prev[series.id];
-                                    return current && typeof current === 'object' && current.id === picked.id
-                                        ? { ...prev, [series.id]: { ...current, image } }
-                                        : prev;
-                                });
-                            }
-                        } catch { /* a cover is a nice-to-have */ }
+        try {
+            for (const series of visibleUnmatched) {
+                if (series.isIgnored) continue;
+                try {
+                    const decision = await scanItem(series);
+                    if (decision.selected) matchCount++;
+                    if (['rate_limited', 'deferred'].includes(decision.status)) {
+                        toast({ title: 'Scan paused', description: decision.reasons.join(' '), variant: 'destructive' });
+                        break;
                     }
-                } else {
-                    setSuggestions(prev => ({ ...prev, [series.id]: 'NOT_FOUND' }));
-                }
-            } catch (e: any) {
-                setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
-
-                if (e.message === "FATAL_RATE_LIMIT" || e.message?.includes("429")) {
-                    toast({ 
-                        title: "Rate Limit Exceeded", 
-                        description: "Omnibus has hit the API limits. Pausing the smart scan to protect your connection. Please attempt the scan again later to continue.", 
-                        variant: "destructive" 
-                    });
-                    break;
+                } catch {
+                    setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
                 }
             }
-
-            await new Promise(r => setTimeout(r, 1500));
-        }
-
-        setIsScanning(false);
-        toast({ title: "Scan Complete", description: `Found suggestions for ${matchCount} series.` });
+        } finally { setIsScanning(false); }
+        toast({ title: 'Scan complete', description: `Found candidates for ${matchCount} entries. Only convincing matches can be accepted automatically.` });
     };
 
     // The exact single-accept payload, shared by the per-row accept, Accept Selected, and Accept
     // All — so every path carries the same admin overrides and issue-exact fields. Async since
     // #199 round 4 Beta B: keep-mode reads the item's local evidence at Accept time so curation
     // carries (and locks) even when the admin never opened the editor.
-    const buildMatchPayload = async (series: any, suggestion: any) => {
+    const buildMatchPayload = async (series: any, suggestion: any, assignment?: { seriesGroup: string; universe: string }) => {
         const issueOv = issueOverrides[series.id] || {};
         const meta = metadataOverrides[series.id];
         const dataMode = meta?.dataMode ?? 'keep';
@@ -512,13 +447,17 @@ export default function SmartMatchPage() {
             : undefined;
         return {
             oldFolderPath: series.folderPath,
+            ...(suggestion.matchDecision && !suggestion.manualReviewed ? {
+                automaticMatch: { itemId: series.id, fingerprint: suggestion.matchDecision.fingerprint, provider: searchProvider },
+            } : { manualReview: true }),
             cvId: suggestion.id,
             metadataId: suggestion.id,
             metadataSource: suggestion.metadataSource || 'COMICVINE',
-            // Admin metadata overrides (Edit Metadata) win over the suggestion's values.
-            name: meta?.name || suggestion.name,
-            year: meta?.year || suggestion.year,
-            publisher: meta?.publisher || suggestion.publisher,
+            // A bulk assignment uses the chosen series identity for every entry. Individual
+            // accepts still honor the identity from that entry's metadata editor.
+            name: assignment ? suggestion.name : (meta?.name || suggestion.name),
+            year: assignment ? suggestion.year : (meta?.year || suggestion.year),
+            publisher: assignment ? suggestion.publisher : (meta?.publisher || suggestion.publisher),
             ...(meta ? {
                 universe: meta.universe || undefined,
                 seriesGroup: meta.seriesGroup || undefined,
@@ -540,6 +479,8 @@ export default function SmartMatchPage() {
                 // unset (the route stores null, never a false "No" claim).
                 blackAndWhite: !!meta.blackAndWhite,
             } : (keepCarry ?? {})),
+            ...(assignment?.seriesGroup ? { seriesGroup: assignment.seriesGroup, lockMetadata: true, writeToFile: meta?.writeToFile ?? writeToFileDefault } : {}),
+            ...(assignment?.universe ? { universe: assignment.universe, lockMetadata: true, writeToFile: meta?.writeToFile ?? writeToFileDefault } : {}),
             dataMode,
             ...(issueTitle ? { issueTitle } : {}),
             exactIssueId: issueOv.issueId || undefined,
@@ -597,96 +538,109 @@ export default function SmartMatchPage() {
         }
     };
 
-    const handleBulkAccept = async () => {
-        setIsBulkProcessing(true);
-        let successCount = 0;
-        const failedItems = [];
-
-        for (const id of Array.from(selectedItems)) {
-            const series = unmatched.find(s => s.id === id);
-            const suggestion = suggestions[id];
-            
-            if (series && suggestion && suggestion !== 'NOT_FOUND' && suggestion !== 'ERROR') {
-                const success = await handleAcceptMatch(series, suggestion, { promptOnCollision: false });
-                if (success) {
-                    successCount++;
-                } else {
-                    failedItems.push(series.name);
-                }
-                await new Promise(r => setTimeout(r, 1500));
-            }
-        }
-
-        setIsBulkProcessing(false);
-
-        if (failedItems.length > 0) {
-            toast({ title: "Bulk Match Completed with Errors", description: `Matched ${successCount}. Failed: ${failedItems.length}`, variant: "destructive" });
-        } else if (successCount > 0) {
-            toast({ title: "Bulk Match Complete", description: `Successfully matched ${successCount} items.` });
-            setSelectedItems(new Set());
-            setIsSelectionMode(false);
-        }
-    };
-
-    // Accept All (2026-07-25 worklist item 4): one click accepts every suggestion the auto-scan
-    // produced. Server-side bulk accepts in chunks of 5 — each accept costs a provider fetch plus a
-    // folder move, and one giant request would blow past reverse-proxy/tunnel response ceilings —
-    // with per-chunk UI progress. Failures stay in the list with their errors; successes leave it.
-    const ACCEPT_ALL_CHUNK = 5;
+    // Each bulk action uses the same chunked endpoint; matches run sequentially on the server
+    // because assigning several entries to one series moves files into the same destination.
+    const BULK_MATCH_CHUNK = 5;
     const ignoredCount = unmatched.filter(s => s.isIgnored).length;
     // What the page actually shows and operates on.
     const visibleUnmatched = showIgnored ? unmatched : unmatched.filter(s => !s.isIgnored);
+    const selectableItems = visibleUnmatched.filter(s => !s.isIgnored);
+    const selectedEntries = selectableItems.filter(s => selectedItems.has(s.id));
+    const allSelected = selectableItems.length > 0 && selectedEntries.length === selectableItems.length;
+    const matchBusy = isBulkProcessing || acceptAllProgress !== null || processingId !== null;
+
+    // Sweeps and accepts can remove entries while this page is open. Never keep a hidden,
+    // ignored, or already-matched entry in the selection for a later assignment.
+    useEffect(() => {
+        const availableIds = new Set(unmatched.filter(s => !s.isIgnored).map(s => s.id));
+        setSelectedItems(prev => {
+            const next = new Set(Array.from(prev).filter(id => availableIds.has(id)));
+            return next.size === prev.size ? prev : next;
+        });
+    }, [unmatched]);
     // Accept All never touches an ignored row: the point of ignoring is that a bulk action can't
     // quietly undo it while it happens to be on screen (shared helper, unit-tested).
     const acceptableSeries = acceptableForBulk(unmatched, suggestions);
 
+    const acceptMatches = async (
+        targets: any[],
+        payloadFor: (series: any) => ReturnType<typeof buildMatchPayload>,
+        onProgress: (progress: { done: number; total: number }) => void,
+    ) => {
+        let successCount = 0;
+        let conflictCount = 0;
+        const failedItems: string[] = [];
+        const succeededIds = new Set<string>();
+
+        onProgress({ done: 0, total: targets.length });
+        for (let i = 0; i < targets.length; i += BULK_MATCH_CHUNK) {
+            const chunk = targets.slice(i, i + BULK_MATCH_CHUNK);
+            let results: Array<{ ok: boolean; conflicts?: number; error?: string }> = [];
+            try {
+                const res = await fetch('/api/library/match-series/bulk', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items: await Promise.all(chunk.map(payloadFor)) })
+                });
+                const data = await res.json().catch(() => ({}));
+                results = res.ok && Array.isArray(data.results)
+                    ? data.results
+                    : chunk.map(() => ({ ok: false, error: data.error || `HTTP ${res.status}` }));
+            } catch (e: any) {
+                results = chunk.map(() => ({ ok: false, error: e?.message || 'Network error' }));
+            }
+
+            const chunkSucceededIds = new Set(chunk.filter((_, idx) => results[idx]?.ok).map(s => s.id));
+            chunk.forEach((s, idx) => {
+                if (results[idx]?.ok) {
+                    successCount++;
+                    conflictCount += results[idx].conflicts || 0;
+                    succeededIds.add(s.id);
+                } else failedItems.push(`${s.name}${results[idx]?.error ? ` (${results[idx].error})` : ''}`);
+            });
+            if (chunkSucceededIds.size > 0) {
+                setUnmatched(prev => prev.filter(s => !chunkSucceededIds.has(s.id)));
+                setSelectedItems(prev => new Set(Array.from(prev).filter(id => !chunkSucceededIds.has(id))));
+            }
+            onProgress({ done: Math.min(i + chunk.length, targets.length), total: targets.length });
+        }
+        return { successCount, failedItems, succeededIds, conflictCount };
+    };
+
+    const reportBulkResult = (title: string, total: number, result: Awaited<ReturnType<typeof acceptMatches>>) => {
+        const { successCount, failedItems, conflictCount } = result;
+        toast({
+            title: `${title}${failedItems.length ? " finished with errors" : conflictCount ? " finished with conflicts" : " complete"}`,
+            description: `Matched ${successCount} of ${total} entries.${failedItems.length ? ` Failed: ${failedItems.slice(0, 3).join('; ')}${failedItems.length > 3 ? ` and ${failedItems.length - 3} more` : ''}.` : ''}${conflictCount ? ` ${conflictCount} duplicate file(s) left in place. Check the logs.` : ''}`,
+            variant: failedItems.length || conflictCount ? "destructive" : undefined,
+        });
+    };
+
+    const handleBulkAccept = async () => {
+        if (matchBusy) return;
+        const targets = acceptableForBulk(selectedEntries, suggestions);
+        if (targets.length === 0) return;
+        setIsBulkProcessing(true);
+        try {
+            const result = await acceptMatches(targets, s => buildMatchPayload(s, suggestions[s.id]), setBulkProgress);
+            reportBulkResult("Accept Selected", targets.length, result);
+            if (result.succeededIds.size === selectedEntries.length) setIsSelectionMode(false);
+        } finally {
+            setIsBulkProcessing(false);
+            setBulkProgress(null);
+        }
+    };
+
     const handleAcceptAll = async () => {
+        if (matchBusy) return;
         const targets = acceptableSeries;
         if (targets.length === 0) return;
         setAcceptAllProgress({ done: 0, total: targets.length });
-        let successCount = 0;
-        const failedItems: string[] = [];
-
         try {
-            for (let i = 0; i < targets.length; i += ACCEPT_ALL_CHUNK) {
-                const chunk = targets.slice(i, i + ACCEPT_ALL_CHUNK);
-                let results: Array<{ ok: boolean; error?: string }> = [];
-                try {
-                    const res = await fetch('/api/library/match-series/bulk', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ items: await Promise.all(chunk.map(s => buildMatchPayload(s, suggestions[s.id]))) })
-                    });
-                    const data = await res.json().catch(() => ({}));
-                    results = res.ok && Array.isArray(data.results)
-                        ? data.results
-                        : chunk.map(() => ({ ok: false, error: data.error || `HTTP ${res.status}` }));
-                } catch (e: any) {
-                    results = chunk.map(() => ({ ok: false, error: e?.message || 'Network error' }));
-                }
-
-                const succeededIds = new Set(chunk.filter((_, idx) => results[idx]?.ok).map(s => s.id));
-                chunk.forEach((s, idx) => {
-                    if (results[idx]?.ok) successCount++;
-                    else failedItems.push(`${s.name}${results[idx]?.error ? ` (${results[idx].error})` : ''}`);
-                });
-                if (succeededIds.size > 0) {
-                    setUnmatched(prev => prev.filter(s => !succeededIds.has(s.id)));
-                }
-                setAcceptAllProgress({ done: Math.min(i + chunk.length, targets.length), total: targets.length });
-            }
+            const result = await acceptMatches(targets, s => buildMatchPayload(s, suggestions[s.id]), setAcceptAllProgress);
+            reportBulkResult("Accept All", targets.length, result);
         } finally {
             setAcceptAllProgress(null);
-        }
-
-        if (failedItems.length > 0) {
-            toast({
-                title: "Accept All finished with errors",
-                description: `Matched ${successCount} of ${targets.length}. Failed: ${failedItems.slice(0, 3).join('; ')}${failedItems.length > 3 ? ` and ${failedItems.length - 3} more` : ''}`,
-                variant: "destructive"
-            });
-        } else {
-            toast({ title: "Accept All complete", description: `Successfully matched all ${successCount} suggested series.` });
         }
     };
 
@@ -707,7 +661,7 @@ export default function SmartMatchPage() {
 
                 // AUTO-MAP: Extract issue numbers and match IDs
                 const newOverrides = { ...issueOverrides };
-                const itemsToMap = isBulkManualMatch ? Array.from(selectedItems) : (manualMatchTarget ? [manualMatchTarget.id] : []);
+                const itemsToMap = isBulkManualMatch ? selectedEntries.map(s => s.id) : (manualMatchTarget ? [manualMatchTarget.id] : []);
 
                 itemsToMap.forEach(id => {
                     const item = unmatched.find(s => s.id === id);
@@ -739,7 +693,7 @@ export default function SmartMatchPage() {
                         provider,
                     );
                 }
-                toast({ title: "Series Selected", description: "Review the metadata and issue mappings, then click Apply Match." });
+                toast({ title: "Series Selected", description: `Review the metadata and issue mappings, then click ${isBulkManualMatch ? 'Assign Selected' : 'Apply Match'}.` });
                 return suggestionData;
 
             } else {
@@ -892,12 +846,10 @@ export default function SmartMatchPage() {
     // a single series (match-series collapses duplicate metadataId). Warn first. Loose-file selections
     // (issues of one series, auto-mapped during lookup) are the intended bulk use and don't trigger it.
     const handleApplyManualMatch = () => {
-        if (!manualMatchResult) return;
+        if (!manualMatchResult || matchBusy || isManualMatching || isManualSearching) return;
         if (isBulkManualMatch) {
-            const folderCount = Array.from(selectedItems).filter(id => {
-                const it = unmatched.find(s => s.id === id);
-                return it && !it.isRawFile;
-            }).length;
+            if (selectedEntries.length === 0) return;
+            const folderCount = selectedEntries.filter(s => !s.isRawFile).length;
             if (folderCount > 1) {
                 setMergeWarnCount(folderCount);
                 setMergeWarnOpen(true);
@@ -907,38 +859,25 @@ export default function SmartMatchPage() {
         doApplyManualMatch();
     };
 
-    const doApplyManualMatch = () => {
-        if (!manualMatchResult) return;
+    const doApplyManualMatch = async () => {
+        if (!manualMatchResult || matchBusy) return;
 
         if (isBulkManualMatch) {
-            setSuggestions(prev => {
-                const next = { ...prev };
-                selectedItems.forEach(id => { next[id] = manualMatchResult; });
-                return next;
-            });
-            // Apply the shared Series Group / Universe (when entered) to every selected item, so a set
-            // of related series can be grouped under one umbrella folder in a single pass.
-            const sg = bulkSeriesGroup.trim();
-            const uni = bulkUniverse.trim();
-            if (sg || uni) {
-                setMetadataOverrides(prev => {
-                    const next = { ...prev };
-                    selectedItems.forEach(id => {
-                        next[id] = {
-                            ...next[id],
-                            name: next[id]?.name || manualMatchResult.name,
-                            year: next[id]?.year || (manualMatchResult.year != null ? String(manualMatchResult.year) : ""),
-                            publisher: next[id]?.publisher || manualMatchResult.publisher,
-                            seriesGroup: sg || next[id]?.seriesGroup || "",
-                            universe: uni || next[id]?.universe || "",
-                            writeToFile: next[id]?.writeToFile ?? writeToFileDefault,
-                            locked: true,
-                        };
-                    });
-                    return next;
-                });
+            const targets = selectedEntries;
+            if (targets.length === 0) return;
+            const assignment = { seriesGroup: bulkSeriesGroup.trim(), universe: bulkUniverse.trim() };
+            setIsBulkProcessing(true);
+            try {
+                const result = await acceptMatches(targets, s => buildMatchPayload(s, manualMatchResult, assignment), setBulkProgress);
+                reportBulkResult("Assignment", targets.length, result);
+                // Failed entries remain selected, with this dialog's chosen series and mappings,
+                // so retrying doesn't require another search or reassign entries that succeeded.
+                if (result.failedItems.length > 0) return;
+                setIsSelectionMode(false);
+            } finally {
+                setIsBulkProcessing(false);
+                setBulkProgress(null);
             }
-            toast({ title: "Match Applied", description: (sg || uni) ? "Matches + metadata set for selected items. Click 'Accept Selected' to save." : "Matches set for selected items. Click 'Accept Selected' to confirm and save." });
         } else if (manualMatchTarget) {
             setSuggestions(prev => ({
                 ...prev,
@@ -1036,12 +975,32 @@ export default function SmartMatchPage() {
     };
 
     const toggleSelection = (id: string) => {
+        if (matchBusy || unmatched.find(s => s.id === id)?.isIgnored) return;
+        setIsSelectionMode(true);
         setSelectedItems(prev => {
             const next = new Set(prev);
             if (next.has(id)) next.delete(id);
             else next.add(id);
             return next;
         });
+    };
+
+    const openManualMatch = (series?: any) => {
+        setManualMatchTarget(series ?? null);
+        setIsBulkManualMatch(!series);
+        setManualMatchOpen(true);
+        setManualMatchResult(null);
+        setManualMatchId("");
+        setManualSearchQuery(series ? "" : seriesQueryFromName(selectedEntries[0]?.name || "").query);
+        setManualSearchResults([]);
+        setManualSearchPage(1);
+        setHasMoreManualSearch(false);
+        setIdMatchOpen(false);
+        setBulkSeriesGroup("");
+        setBulkUniverse("");
+        setExactIssueId(series ? issueOverrides[series.id]?.issueId || "" : "");
+        setExactIssueNumber(series ? issueOverrides[series.id]?.issueNumber || "" : "");
+        if (series) fetchPrefill(series);
     };
 
     // Open the per-item metadata editor, seeding from the item's current suggestion / lookup result.
@@ -1121,22 +1080,24 @@ export default function SmartMatchPage() {
                         <p className="text-muted-foreground mt-1 leading-relaxed">
                             You have {visibleUnmatched.length} unmatched files/folders. Let AI find the metadata for you.
                         </p>
+                        <p className="text-sm text-muted-foreground mt-1">Select entries to assign them to the same series in one search.</p>
                     </div>
                 </div>
                 
                 <div className="flex flex-col sm:flex-row flex-wrap gap-3 w-full lg:w-auto shrink-0 items-stretch sm:items-center">
                     <Button 
                         variant={isSelectionMode ? "secondary" : "outline"} 
+                        disabled={matchBusy}
                         onClick={() => { setIsSelectionMode(!isSelectionMode); setSelectedItems(new Set()); }} 
                         className={`h-12 w-full sm:w-auto font-bold flex-1 sm:flex-none ${isSelectionMode ? "bg-primary/20 text-primary hover:bg-primary/30 border-primary/50" : "border-border"}`}
                     >
                         {isSelectionMode ? <Square className="w-4 h-4 mr-2 shrink-0" /> : <CheckSquare className="w-4 h-4 mr-2 shrink-0" />}
-                        <span className="whitespace-nowrap">{isSelectionMode ? "Cancel Select" : "Select"}</span>
+                        <span className="whitespace-nowrap">{isSelectionMode ? "Cancel Selection" : "Select Entries"}</span>
                     </Button>
 
                     {metronConfigured && (
                         <div className="w-full sm:w-[150px] flex-1 sm:flex-none">
-                            <Select value={searchProvider} onValueChange={setSearchProvider}>
+                            <Select value={searchProvider} onValueChange={setSearchProvider} disabled={matchBusy}>
                                 <SelectTrigger className="w-full bg-background border-border h-12 shadow-sm font-bold text-foreground">
                                     <SelectValue placeholder="Source" />
                                 </SelectTrigger>
@@ -1148,13 +1109,13 @@ export default function SmartMatchPage() {
                         </div>
                     )}
                     
-                    <Button onClick={startSmartScan} disabled={isScanning || visibleUnmatched.length === 0} className="h-12 w-full sm:w-auto flex-1 sm:flex-none bg-primary hover:bg-primary/90 text-primary-foreground font-bold px-6 shadow-lg border-0">
+                    <Button onClick={startSmartScan} disabled={isScanning || matchBusy || visibleUnmatched.length === 0} className="h-12 w-full sm:w-auto flex-1 sm:flex-none bg-primary hover:bg-primary/90 text-primary-foreground font-bold px-6 shadow-lg border-0">
                         {isScanning ? <><Loader2 className="w-5 h-5 mr-2 animate-spin shrink-0" /> <span className="whitespace-nowrap">Scanning...</span></> : <><FolderSearch className="w-5 h-5 mr-2 shrink-0" /> <span className="whitespace-nowrap">Start Auto-Scan</span></>}
                     </Button>
 
                     <Button
                         onClick={handleAcceptAll}
-                        disabled={isScanning || isBulkProcessing || acceptAllProgress !== null || acceptableSeries.length === 0}
+                        disabled={isScanning || matchBusy || acceptableSeries.length === 0}
                         title="Accept every suggestion the auto-scan produced (rows without a suggestion are skipped)"
                         className="h-12 w-full sm:w-auto flex-1 sm:flex-none bg-green-600 hover:bg-green-700 text-white font-bold px-6 shadow-lg border-0"
                     >
@@ -1169,7 +1130,7 @@ export default function SmartMatchPage() {
                     <Button
                         variant={showIgnored ? "secondary" : "outline"}
                         onClick={() => setShowIgnored(v => !v)}
-                        disabled={loading}
+                        disabled={matchBusy}
                         title="Series you've marked ignored — hidden from this list and from automatic matching"
                         className="h-12 w-full sm:w-auto flex-1 sm:flex-none font-bold px-4 border-border text-muted-foreground hover:bg-muted"
                     >
@@ -1203,12 +1164,39 @@ export default function SmartMatchPage() {
                                 </p>
                             </div>
                         </div>
-                        <Button variant="outline" onClick={runSweepNow} disabled={sweepQueued} className="shrink-0 font-bold border-border">
+                        <Button variant="outline" onClick={runSweepNow} disabled={sweepQueued || matchBusy} className="shrink-0 font-bold border-border">
                             {sweepQueued
                                 ? <><Loader2 className="w-4 h-4 mr-2 animate-spin shrink-0" /> <span className="whitespace-nowrap">Sweeping...</span></>
                                 : <><RefreshCw className="w-4 h-4 mr-2 shrink-0" /> <span className="whitespace-nowrap">Run Sweep Now</span></>}
                         </Button>
                     </div>
+                </Card>
+            )}
+
+            {isSelectionMode && (
+                <Card className="sticky top-4 mt-6 p-4 z-30 bg-background border-primary/30 shadow-md space-y-3">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                        <span className="font-bold text-sm" role="status">{selectedEntries.length} Selected</span>
+                        <Button variant="ghost" size="sm" disabled={matchBusy || selectableItems.length === 0} onClick={() => {
+                            setSelectedItems(allSelected ? new Set() : new Set(selectableItems.map(s => s.id)));
+                        }}>
+                            {allSelected ? "Deselect All" : "Select All"}
+                        </Button>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                        <Button size="sm" disabled={selectedEntries.length === 0 || matchBusy || isScanning} onClick={() => openManualMatch()} className="font-bold">
+                            <Search className="w-4 h-4 mr-2" /> Assign to Series
+                        </Button>
+                        <Button size="sm" variant="outline" disabled={selectedEntries.length === 0 || matchBusy || pageManagerLoading} onClick={() => openPageManager(selectedEntries)} title="Review and remove junk pages from the selected entries' files">
+                            {pageManagerLoading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Layers className="w-4 h-4 mr-2" />}
+                            Manage Pages
+                        </Button>
+                        <Button size="sm" variant="outline" disabled={matchBusy || isScanning || acceptableForBulk(selectedEntries, suggestions).length === 0} onClick={handleBulkAccept} className="font-bold border-green-600/30 text-green-600">
+                            {isBulkProcessing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Check className="w-4 h-4 mr-2" />}
+                            {bulkProgress ? `Processing ${bulkProgress.done}/${bulkProgress.total}…` : "Accept Selected"}
+                        </Button>
+                    </div>
+                    <p className="text-xs text-muted-foreground">Assign all selected entries to one series, or accept their current suggestions.</p>
                 </Card>
             )}
 
@@ -1229,17 +1217,17 @@ export default function SmartMatchPage() {
                         return (
                             <Card 
                                 key={series.id} 
-                                className={`p-4 flex flex-col md:flex-row items-center gap-6 transition-all border-border bg-background ${isProcessing ? 'opacity-50 pointer-events-none' : ''} ${isSelectionMode && isSelected ? 'ring-2 ring-primary border-primary bg-primary/5' : ''} ${isSelectionMode ? 'cursor-pointer hover:border-primary/50' : ''}`}
+                                className={`p-4 flex flex-col md:flex-row items-center gap-6 transition-all border-border bg-background ${isProcessing ? 'opacity-50 pointer-events-none' : ''} ${isSelectionMode && isSelected ? 'ring-2 ring-primary border-primary bg-primary/5' : ''} ${isSelectionMode && !series.isIgnored ? 'cursor-pointer hover:border-primary/50' : ''}`}
                                 onClick={() => isSelectionMode && toggleSelection(series.id)}
                             >
-                                {/* --- NEW: Checkbox --- */}
-                                {isSelectionMode && (
-                                    <div className="shrink-0 pr-2 md:pr-0">
-                                        <div className="bg-black/50 backdrop-blur-sm rounded p-1 pointer-events-none md:bg-transparent md:p-0">
-                                            {isSelected ? <CheckSquare className="w-5 h-5 text-primary" /> : <Square className="w-5 h-5 text-muted-foreground" />}
-                                        </div>
-                                    </div>
-                                )}
+                                <Checkbox
+                                    checked={isSelected}
+                                    disabled={matchBusy || series.isIgnored}
+                                    aria-label={`Select ${series.name}`}
+                                    className="size-5 self-start md:self-center"
+                                    onClick={e => e.stopPropagation()}
+                                    onCheckedChange={() => toggleSelection(series.id)}
+                                />
 
                                 {/* LOCAL FOLDER/FILE DATA */}
                                 <div className="flex-1 min-w-[200px] w-full md:w-auto">
@@ -1267,7 +1255,7 @@ export default function SmartMatchPage() {
                                                 size="sm"
                                                 variant="ghost"
                                                 className="mt-1.5 h-7 px-2 -ml-2 text-primary hover:bg-primary/10 font-bold"
-                                                disabled={isSelectionMode}
+                                                disabled={isSelectionMode || matchBusy}
                                                 onClick={(e) => { e.stopPropagation(); openPreview(series); }}
                                                 title="Flip through the file's pages to identify it before matching"
                                             >
@@ -1324,6 +1312,28 @@ export default function SmartMatchPage() {
                                         </div>
                                     )}
 
+                                    {decisions[series.id] && (
+                                        <details className="mt-2 text-xs text-muted-foreground" open={decisions[series.id].status !== 'high'}>
+                                            <summary className="cursor-pointer font-semibold">{decisions[series.id].status.replace(/_/g, ' ')} · {decisions[series.id].confidence} confidence</summary>
+                                            <p className="mt-1">Parsed: {decisions[series.id].parsed.title} · {decisions[series.id].parsed.domain}
+                                                {decisions[series.id].parsed.issue ? ` #${decisions[series.id].parsed.issue.value} (${decisions[series.id].parsed.issue.source})` : ' · issue unknown'}
+                                                {decisions[series.id].parsed.publicationYear ? ` · published ${decisions[series.id].parsed.publicationYear.value}` : ''}
+                                                {decisions[series.id].parsed.seriesYear ? ` · run year ${decisions[series.id].parsed.seriesYear.value} (${decisions[series.id].parsed.seriesYear.source})` : ''}
+                                                {decisions[series.id].parsed.run ? ` · volume ${decisions[series.id].parsed.run.value}` : ''}
+                                                {decisions[series.id].parsed.format ? ` · ${decisions[series.id].parsed.format.value}` : ''}</p>
+                                            <p>{decisions[series.id].reasons.join(' ')}</p>
+                                            <ul className="mt-2 space-y-2">
+                                                {decisions[series.id].candidates.map((candidate: any) => (
+                                                    <li key={`${candidate.candidate.metadataSource}:${candidate.candidate.id}`}>
+                                                        <strong>{candidate.candidate.name} ({candidate.candidate.year || '?'}) · {candidate.candidate.metadataSource} · {Math.round(candidate.score * 100)}%</strong>
+                                                        <p>{[...candidate.positive, ...candidate.contradictions, ...candidate.reasons].join('; ') || 'Name similarity only; details not verified'}</p>
+                                                    </li>
+                                                ))}
+                                            </ul>
+                                            {decisions[series.id].status !== 'high' && <p className="mt-2">Use Search Match to review and choose a candidate manually.</p>}
+                                        </details>
+                                    )}
+
                                     {/* Custom metadata preview — shows where this match will actually land. */}
                                     {metadataOverrides[series.id] && (
                                         <div className="mt-2 pt-2 border-t border-border/60 flex items-start gap-1.5 text-[11px] text-primary" title="Folder this match will be organized into">
@@ -1344,11 +1354,12 @@ export default function SmartMatchPage() {
 
                                 {/* ACTIONS */}
                                 <div className="flex md:flex-col gap-2 shrink-0 w-full md:w-auto justify-end">
+                                    <Button size="sm" variant="outline" disabled={matchBusy || isScanning || series.isIgnored} onClick={(e) => { e.stopPropagation(); retryMatch(series); }}>Retry / Refresh</Button>
                                     <Button 
                                         size="sm" 
                                         className="flex-1 md:flex-none bg-green-600 hover:bg-green-700 text-white font-bold disabled:opacity-50 border-0"
-                                        disabled={!suggestion || suggestion === 'NOT_FOUND' || suggestion === 'ERROR' || isSelectionMode}
-                                        onClick={(e) => { e.stopPropagation(); handleAcceptMatch(series, suggestion); }}
+                                        disabled={acceptableForBulk([series], suggestions).length === 0 || isSelectionMode || matchBusy}
+                                        onClick={(e) => { e.stopPropagation(); if (acceptableForBulk([series], suggestions).length) handleAcceptMatch(series, suggestion); }}
                                     >
                                         <Check className="w-5 h-5 md:mr-2" /> <span className="hidden md:inline">Accept</span>
                                     </Button>
@@ -1356,25 +1367,10 @@ export default function SmartMatchPage() {
                                         size="sm" 
                                         variant="outline" 
                                         className="flex-1 md:flex-none font-bold border-primary/30 text-primary hover:bg-primary/10"
-                                        disabled={isSelectionMode}
+                                        disabled={isSelectionMode || matchBusy}
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            setManualMatchTarget(series);
-                                            setIsBulkManualMatch(false);
-                                            setManualMatchOpen(true);
-                                            setManualMatchResult(null);
-                                            setManualMatchId("");
-                                            setManualSearchQuery("");
-                                            setManualSearchResults([]);
-                                            setManualSearchPage(1);
-                                            setHasMoreManualSearch(false);
-                                            setIdMatchOpen(false);
-                                            setExactIssueId(issueOverrides[series.id]?.issueId || "");
-                                            setExactIssueNumber(issueOverrides[series.id]?.issueNumber || "");
-                                            // #199 round 4: kick off the local-evidence read — if the
-                                            // files carry a provider id, the id-assist effect takes it
-                                            // from here and resolves the series without a search.
-                                            fetchPrefill(series);
+                                            openManualMatch(series);
                                         }}
                                     >
                                         <Search className="w-4 h-4 md:mr-2" /> <span className="hidden md:inline">Search Match</span>
@@ -1383,7 +1379,7 @@ export default function SmartMatchPage() {
                                         size="sm"
                                         variant="outline"
                                         className={`flex-1 md:flex-none font-bold border-primary/30 text-primary hover:bg-primary/10 ${metadataOverrides[series.id] ? 'bg-primary/10' : ''}`}
-                                        disabled={!suggestion || suggestion === 'NOT_FOUND' || suggestion === 'ERROR' || isSelectionMode}
+                                        disabled={!suggestion || suggestion === 'NOT_FOUND' || suggestion === 'ERROR' || isSelectionMode || matchBusy}
                                         onClick={(e) => { e.stopPropagation(); openMetaEditor(series, suggestion); }}
                                         title="Fill in Series Group, Universe and other folder-naming details"
                                     >
@@ -1392,7 +1388,7 @@ export default function SmartMatchPage() {
                                     <Button
                                         size="sm"
                                         variant="outline"
-                                        disabled={isSelectionMode}
+                                        disabled={isSelectionMode || matchBusy}
                                         className="flex-1 md:flex-none font-bold border-primary/30 text-primary hover:bg-primary/10"
                                         onClick={(e) => { e.stopPropagation(); setLocalAttachItem(series); }}
                                         title="Not on the provider? Put it under a series you have as a collected edition, by name"
@@ -1402,7 +1398,7 @@ export default function SmartMatchPage() {
                                     <Button
                                         size="sm"
                                         variant="outline"
-                                        disabled={isSelectionMode || pageManagerLoading}
+                                        disabled={isSelectionMode || matchBusy || pageManagerLoading}
                                         className="flex-1 md:flex-none font-bold border-primary/30 text-primary hover:bg-primary/10"
                                         onClick={(e) => { e.stopPropagation(); openPageManager([series]); }}
                                         title="Review and remove junk pages (scan credits) from this item's file(s)"
@@ -1413,7 +1409,7 @@ export default function SmartMatchPage() {
                                         <Button
                                             size="sm"
                                             variant="outline"
-                                            disabled={isSelectionMode}
+                                            disabled={isSelectionMode || matchBusy}
                                             className="shrink-0 md:w-full border-border hover:bg-muted text-muted-foreground"
                                             onClick={(e) => { e.stopPropagation(); handleRestore(series.id); }}
                                             title="List this series as unmatched again"
@@ -1424,7 +1420,7 @@ export default function SmartMatchPage() {
                                         <Button
                                             size="sm"
                                             variant="outline"
-                                            disabled={isSelectionMode}
+                                            disabled={isSelectionMode || matchBusy}
                                             className="shrink-0 md:w-full border-border hover:bg-muted text-muted-foreground"
                                             onClick={(e) => { e.stopPropagation(); handleDismiss(series.id); }}
                                             title={series.isRawFile
@@ -1439,65 +1435,6 @@ export default function SmartMatchPage() {
                             </Card>
                         )
                     })}
-                </div>
-            )}
-
-            {/* --- NEW: BULK SELECTION ACTION BAR --- */}
-            {isSelectionMode && (
-                <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-background text-foreground px-4 sm:px-6 py-3 rounded-full shadow-[0_10px_40px_-10px_rgba(0,0,0,0.5)] flex items-center gap-3 sm:gap-4 z-50 animate-in slide-in-from-bottom-8 border border-border w-[95%] sm:w-auto overflow-x-auto">
-                    <Button variant="ghost" size="sm" className="h-10 sm:h-8 shrink-0 hover:bg-muted text-muted-foreground font-medium" onClick={() => {
-                        if (selectedItems.size === visibleUnmatched.length && visibleUnmatched.length > 0) setSelectedItems(new Set());
-                        else setSelectedItems(new Set(visibleUnmatched.map(s => s.id)));
-                    }}>
-                        {selectedItems.size === visibleUnmatched.length && visibleUnmatched.length > 0 ? "Deselect All" : "Select All"}
-                    </Button>
-                    <div className="h-5 w-px bg-border shrink-0" />
-                    <span className="font-black whitespace-nowrap min-w-[60px] sm:min-w-[100px] text-center text-sm sm:text-base shrink-0">{selectedItems.size} Selected</span>
-                    
-                    <div className="flex gap-2 shrink-0">
-                        <Button 
-                            size="sm" 
-                            variant="outline" 
-                            className="h-10 sm:h-8 shadow-sm font-bold transition-all border-primary/50 text-primary hover:bg-muted" 
-                            disabled={selectedItems.size === 0 || isBulkProcessing} 
-                            onClick={() => {
-                                setIsBulkManualMatch(true);
-                                setManualMatchTarget(null);
-                                setManualMatchOpen(true);
-                                setManualMatchResult(null);
-                                setManualMatchId("");
-                                setManualSearchQuery("");
-                                setManualSearchResults([]);
-                                setManualSearchPage(1);
-                                setHasMoreManualSearch(false);
-                                setIdMatchOpen(false);
-                                setBulkSeriesGroup("");
-                                setBulkUniverse("");
-                            }}
-                        >
-                            <Search className="w-4 h-4 sm:mr-2" /> <span className="hidden sm:inline">Search Match</span>
-                        </Button>
-                        <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-10 sm:h-8 shadow-sm font-bold transition-all border-primary/50 text-primary hover:bg-muted"
-                            disabled={selectedItems.size === 0 || isBulkProcessing || pageManagerLoading}
-                            onClick={() => openPageManager(unmatched.filter(s => selectedItems.has(s.id)))}
-                            title="Review and remove junk pages (scan credits) from the selected items' files"
-                        >
-                            {pageManagerLoading ? <Loader2 className="w-4 h-4 sm:mr-2 animate-spin" /> : <Layers className="w-4 h-4 sm:mr-2" />}
-                            <span className="hidden sm:inline">Manage Pages</span>
-                        </Button>
-                        <Button
-                            size="sm"
-                            className="h-10 sm:h-8 shadow-sm font-bold transition-all bg-green-600 hover:bg-green-700 text-white"
-                            disabled={selectedItems.size === 0 || isBulkProcessing || Array.from(selectedItems).every(id => !suggestions[id] || suggestions[id] === 'NOT_FOUND' || suggestions[id] === 'ERROR')}
-                            onClick={handleBulkAccept}
-                        >
-                            {isBulkProcessing ? <Loader2 className="w-4 h-4 sm:mr-2 animate-spin" /> : <Check className="w-4 h-4 sm:mr-2" />}
-                            <span className="hidden sm:inline">Accept Selected</span>
-                        </Button>
-                    </div>
                 </div>
             )}
 
@@ -1525,22 +1462,30 @@ export default function SmartMatchPage() {
 
             {/* SEARCH MATCH DIALOG — search-by-name first (#199 round 2), exact-ID lookup as the
                 advanced fallback below it. Both paths resolve through resolveVolumeSelection. */}
-            <Dialog open={manualMatchOpen} onOpenChange={setManualMatchOpen}>
+            <Dialog open={manualMatchOpen} onOpenChange={open => { if (!isBulkProcessing) setManualMatchOpen(open); }}>
                 <DialogContent className="sm:max-w-2xl max-h-[90vh] flex flex-col bg-background border-border rounded-xl w-[95%]">
                     <DialogHeader className="shrink-0">
-                        <DialogTitle>Search Match</DialogTitle>
+                        <DialogTitle>{isBulkManualMatch ? "Assign to Series" : "Search Match"}</DialogTitle>
                         <DialogDescription>
                             {isBulkManualMatch
-                                ? `Search for the series to apply to the ${selectedItems.size} selected items.`
+                                ? `Search once to assign all ${selectedEntries.length} selected entries to the same series. Review the issue mappings before saving.`
                                 : `Search for the correct series for ${manualMatchTarget?.name}.`}
                         </DialogDescription>
                     </DialogHeader>
 
-                    <div className="py-2 pr-3 space-y-4 flex-1 min-h-0 overflow-y-auto">
+                    <fieldset disabled={isBulkProcessing} className="py-2 pr-3 space-y-4 flex-1 min-h-0 overflow-y-auto">
+                        {isBulkManualMatch && (
+                            <details className="rounded-lg border border-border p-3 text-xs">
+                                <summary className="cursor-pointer font-semibold">Selected entries ({selectedEntries.length})</summary>
+                                <ul className="mt-2 space-y-1 max-h-32 overflow-y-auto text-muted-foreground">
+                                    {selectedEntries.map(item => <li key={item.id} className="break-words">{item.name}</li>)}
+                                </ul>
+                            </details>
+                        )}
                         {metronConfigured && (
                             <div className="space-y-2">
                                 <Label>Metadata Source</Label>
-                                <Select value={searchProvider} onValueChange={setSearchProvider}>
+                                <Select value={searchProvider} onValueChange={setSearchProvider} disabled={isBulkProcessing || isManualMatching}>
                                     <SelectTrigger className="bg-background border-border">
                                         <SelectValue />
                                     </SelectTrigger>
@@ -1562,7 +1507,7 @@ export default function SmartMatchPage() {
                                     className="bg-background border-border flex-1"
                                     onKeyDown={(e) => e.key === 'Enter' && manualSearchQuery.trim() && handleManualSearch()}
                                 />
-                                <Button onClick={() => handleManualSearch()} disabled={isManualSearching || manualSearchQuery.trim().length < 2} className="shrink-0 bg-primary text-primary-foreground hover:bg-primary/90 font-bold">
+                                <Button onClick={() => handleManualSearch()} disabled={isManualSearching || isManualMatching || manualSearchQuery.trim().length < 2} className="shrink-0 bg-primary text-primary-foreground hover:bg-primary/90 font-bold">
                                     {isManualSearching ? <Loader2 className="w-4 h-4 animate-spin md:mr-2" /> : <Search className="w-4 h-4 md:mr-2" />}
                                     <span className="hidden md:inline">Search</span>
                                 </Button>
@@ -1574,7 +1519,7 @@ export default function SmartMatchPage() {
                                         <button
                                             key={`${item.metadataSource || searchProvider}-${item.id}`}
                                             type="button"
-                                            disabled={isManualMatching}
+                                            disabled={isManualMatching || isManualSearching}
                                             onClick={() => handleSelectSearchResult(item)}
                                             className={`w-full flex items-center gap-3 p-2 rounded-lg text-left transition-colors disabled:opacity-50 ${manualMatchResult?.id === item.id ? 'bg-primary/10 border border-primary/40' : 'border border-transparent hover:bg-muted'}`}
                                         >
@@ -1683,14 +1628,14 @@ export default function SmartMatchPage() {
                             </Button>
                         )}
 
-                        {/* Bulk: a shared Series Group / Universe applied to every selected item on Apply. */}
+                        {/* Shared folder naming, alongside each entry's existing metadata. */}
                         {manualMatchResult && isBulkManualMatch && (
                             <div className="space-y-3 mt-2 pt-4 border-t border-border">
                                 <h4 className="font-bold text-sm text-primary flex items-center gap-2">
                                     <FolderTree className="w-4 h-4" /> Shared Naming (Optional)
                                 </h4>
                                 <p className="text-xs text-muted-foreground leading-tight">
-                                    Group all {selectedItems.size} selected series under one umbrella folder. Applied to each item on Apply.
+                                    Set the Series Group or Universe for all {selectedEntries.length} selected entries when assigning them.
                                 </p>
                                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                     <div className="space-y-1">
@@ -1712,7 +1657,9 @@ export default function SmartMatchPage() {
                                     <FileText className="w-4 h-4" /> Issue Mapping (Auto-Filled)
                                 </h4>
                                 <p className="text-xs text-muted-foreground leading-tight">
-                                    Omnibus has extracted the issue numbers and cross-referenced them with the API to auto-fill exact Issue IDs. You can manually correct these below before applying — got the right series but the wrong issue? Fix the Issue Number, then hit &quot;Refresh from number&quot; to re-resolve the exact ID.
+                                    {isBulkManualMatch
+                                        ? "Issue numbers from each filename have been matched to the selected series. Review or correct each issue number and ID before assigning."
+                                        : <>Omnibus has extracted the issue numbers and cross-referenced them with the API to auto-fill exact Issue IDs. You can manually correct these below before applying — got the right series but the wrong issue? Fix the Issue Number, then hit &quot;Refresh from number&quot; to re-resolve the exact ID.</>}
                                 </p>
                                 
                                 {/* Single Match View */}
@@ -1791,9 +1738,9 @@ export default function SmartMatchPage() {
                                 )}
 
                                 {/* Bulk Match View */}
-                                {isBulkManualMatch && Array.from(selectedItems).map(id => {
-                                    const item = unmatched.find(s => s.id === id);
-                                    if (!item?.isRawFile) return null;
+                                {isBulkManualMatch && selectedEntries.map(item => {
+                                    const id = item.id;
+                                    if (!item.isRawFile) return null;
                                     
                                     return (
                                         <div key={id} className="grid grid-cols-1 sm:grid-cols-12 gap-2 p-2.5 border border-border rounded-lg bg-muted/20 items-center">
@@ -1819,6 +1766,7 @@ export default function SmartMatchPage() {
                                             <div className="sm:col-span-2">
                                                 <Input
                                                     placeholder="Issue #"
+                                                    aria-label={`Issue number for ${item.name}`}
                                                     value={issueOverrides[id]?.issueNumber || ""}
                                                     onChange={e => setIssueOverrides(prev => ({ ...prev, [id]: { ...prev[id], issueNumber: e.target.value, issueId: prev[id]?.issueId || "" } }))}
                                                     className="h-8 text-xs bg-background border-border"
@@ -1827,6 +1775,7 @@ export default function SmartMatchPage() {
                                             <div className="sm:col-span-3">
                                                 <Input
                                                     placeholder="Issue ID"
+                                                    aria-label={`Issue ID for ${item.name}`}
                                                     value={issueOverrides[id]?.issueId || ""}
                                                     onChange={e => setIssueOverrides(prev => ({ ...prev, [id]: { ...prev[id], issueId: e.target.value, issueNumber: prev[id]?.issueNumber || "" } }))}
                                                     // A hand-typed id gets its cover on blur, not per keystroke.
@@ -1857,12 +1806,13 @@ export default function SmartMatchPage() {
                                 })}
                             </div>
                         )}
-                    </div>
+                    </fieldset>
                     
                     <DialogFooter className="gap-2 mt-2 shrink-0">
-                        <Button variant="outline" onClick={() => { setManualMatchOpen(false); setManualMatchResult(null); }} className="border-border hover:bg-muted text-foreground">Cancel</Button>
-                        <Button onClick={handleApplyManualMatch} disabled={!manualMatchResult} className="bg-green-600 text-white hover:bg-green-700 font-bold">
-                            <Check className="w-4 h-4 mr-2" /> Apply Match
+                        <Button variant="outline" disabled={isBulkProcessing} onClick={() => { setManualMatchOpen(false); setManualMatchResult(null); }} className="border-border hover:bg-muted text-foreground">Cancel</Button>
+                        <Button onClick={handleApplyManualMatch} disabled={!manualMatchResult || matchBusy || isManualMatching || isManualSearching || (isBulkManualMatch && selectedEntries.length === 0)} className="bg-green-600 text-white hover:bg-green-700 font-bold">
+                            {isBulkProcessing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Check className="w-4 h-4 mr-2" />}
+                            {isBulkManualMatch ? (bulkProgress ? `Assigning ${bulkProgress.done}/${bulkProgress.total}…` : `Assign Selected (${selectedEntries.length})`) : "Apply Match"}
                         </Button>
                     </DialogFooter>
                 </DialogContent>
@@ -1873,8 +1823,8 @@ export default function SmartMatchPage() {
                 onClose={() => setMergeWarnOpen(false)}
                 onConfirm={() => { setMergeWarnOpen(false); doApplyManualMatch(); }}
                 title="Merge these folders into one series?"
-                description={`You're assigning the same series to ${mergeWarnCount} folders, which combines them into a single series (their issues are moved together). That's rarely what you want for separate series — continue only if these folders really are the same series.`}
-                confirmText="Merge anyway"
+                description={`You're assigning the same series to ${mergeWarnCount} folders. Their issues will be organized together under the selected series.`}
+                confirmText="Assign and Merge"
                 cancelText="Cancel"
                 variant="destructive"
             />

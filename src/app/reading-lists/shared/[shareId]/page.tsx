@@ -1,5 +1,6 @@
 import { prisma } from "@/lib/db";
 import { notFound } from "next/navigation";
+import { isDownloaded } from "@/lib/utils/reading-list-match";
 import { Card, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { BookOpen, ListOrdered } from "lucide-react";
 import Link from "next/link";
@@ -51,6 +52,10 @@ export default async function SharedReadingListPage({ params }: { params: Promis
                 {list.items.map((item, index) => {
                     const issue = item.issue;
                     const series = issue?.series;
+                    // A wanted-but-not-downloaded issue (filePath null) must render NO reader link:
+                    // /reader with an empty path is a dead page, same as the literal "null" one was.
+                    // isDownloaded is the same predicate the owner's list uses, so both agree.
+                    const readable = isDownloaded(item);
                     
                     // Provide a visual fallback if the issue is currently missing from the server
                     if (!issue) return (
@@ -69,12 +74,16 @@ export default async function SharedReadingListPage({ params }: { params: Promis
                                 <p className="text-sm text-muted-foreground truncate">Issue #{issue.number} • {issue.name || "Untitled"}</p>
                             </div>
                             
-                            {/* Send them directly into the reader */}
-                            <Button size="sm" asChild className="shrink-0 bg-primary hover:bg-primary/90 text-primary-foreground font-bold">
-                                <Link href={`/reader?path=${encodeURIComponent(issue.filePath || '')}&series=${encodeURIComponent(series?.folderPath || '')}`}>
-                                    <BookOpen className="w-4 h-4 mr-2" /> Read
-                                </Link>
-                            </Button>
+                            {/* Send them directly into the reader — only when there is a file to read */}
+                            {readable ? (
+                                <Button size="sm" asChild className="shrink-0 bg-primary hover:bg-primary/90 text-primary-foreground font-bold">
+                                    <Link href={`/reader?path=${encodeURIComponent(issue.filePath!)}&series=${encodeURIComponent(series?.folderPath || '')}`}>
+                                        <BookOpen className="w-4 h-4 mr-2" /> Read
+                                    </Link>
+                                </Button>
+                            ) : (
+                                <span className="text-xs uppercase text-orange-500 font-bold tracking-wider shrink-0">Not downloaded</span>
+                            )}
                         </div>
                     );
                 })}

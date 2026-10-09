@@ -56,6 +56,8 @@ Omnibus is two applications that share one database: a **Next.js web app** (Node
 
 **Prerequisites:** Node 22; and for engine work, Rust 1.96 plus the C build deps (`build-essential clang libclang-dev pkg-config`) and the `unrar` / `unar` CLIs at runtime. The easiest way to run the full stack locally is the Docker Compose setup in the [README](README.md).
 
+For development from source with hot reload, see [Local development](docs/DEVELOPMENT.md) for native setup, shared environment variables, database initialization, and startup commands.
+
 **Web app (Node):**
 
 ```bash

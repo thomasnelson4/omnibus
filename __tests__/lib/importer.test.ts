@@ -62,7 +62,10 @@ vi.mock('@/lib/queue', () => ({
     }
 }));
 
-vi.mock('@/lib/utils/path-resolver', () => ({ resolveRemotePath: vi.fn((path) => path) }));
+vi.mock('@/lib/utils/path-resolver', () => ({
+    resolveRemotePath: vi.fn((path) => path),
+    resolveClientPath: vi.fn(async (p, client) => client.remotePath && client.localPath ? p.replace(client.remotePath, client.localPath) : p)
+}));
 vi.mock('@/lib/download-clients', () => ({ DownloadService: { getAllActiveDownloads: mocks.getAllActiveDownloads } }));
 
 // Prevent heavy libraries from loading
@@ -435,6 +438,85 @@ describe('File System: Importer Engine', () => {
 
         expect(result).toBe(true);
         expect(fs.copy).toHaveBeenCalled();
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    function armSabFolder(toggle = 'true') {
+        armUsenetImport('sab', toggle);
+        mocks.findUniqueRequest.mockReset();
+        mocks.findUniqueRequest.mockResolvedValue({ ...usenetRequest, downloadLink: 'indexer-release-guid', clientDownloadId: 'SABnzbd_nzo_42', downloadClientId: 'sab_1' });
+        mocks.getAllActiveDownloads.mockResolvedValue([{
+            id: 'SABnzbd_nzo_42', name: 'Renamed by SAB', clientName: 'SAB', clientId: 'sab_1',
+            clientType: 'sab', isComplete: true, contentPath: '/remote/comics/Final Sorted Folder', status: 'Completed'
+        }]);
+        mocks.findFirstClient.mockResolvedValue({ type: 'sab', id: 'sab_1', name: 'SAB', remotePath: '/remote', localPath: '/downloads' });
+        vi.mocked(fs.statSync).mockImplementation((p: any) => ({ isDirectory: () => p === '/downloads/comics/Final Sorted Folder', size: 1000000 }) as any);
+        vi.mocked(fs.promises.readdir).mockResolvedValue([{ name: 'Batman 001.cbz', isDirectory: () => false }] as any);
+    }
+
+    it('imports a renamed SAB job from mapped history.storage and removes the whole job folder', async () => {
+        armSabFolder();
+        expect(await Importer.importRequest('req_1')).toBe(true);
+        expect(mocks.getAllActiveDownloads).toHaveBeenCalledWith(['SABnzbd_nzo_42']);
+        expect(fs.copy).toHaveBeenCalledWith('/downloads/comics/Final Sorted Folder/Batman 001.cbz', expect.any(String), { overwrite: true });
+        expect(fs.remove).toHaveBeenCalledWith('/downloads/comics/Final Sorted Folder');
+        expect(fs.remove).not.toHaveBeenCalledWith('/downloads/comics/Final Sorted Folder/Batman 001.cbz');
+    });
+
+    it('preserves the SAB job folder if the verified copy fails', async () => {
+        armSabFolder();
+        vi.mocked(fs.copy).mockRejectedValueOnce(new Error('disk full'));
+        expect(await Importer.importRequest('req_1')).toBe(false);
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    it('preserves the SAB job folder when the cleanup setting is disabled', async () => {
+        armSabFolder('false');
+        expect(await Importer.importRequest('req_1')).toBe(true);
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    it('does not import from a SAB job still extracting, even at 100 percent', async () => {
+        armSabFolder();
+        mocks.getAllActiveDownloads.mockResolvedValue([{ id: 'SABnzbd_nzo_42', clientId: 'sab_1', clientType: 'sab', isComplete: false, status: 'Extracting', progress: '100' }]);
+        expect(await Importer.importRequest('req_1')).toBe(false);
+        expect(fs.copy).not.toHaveBeenCalled();
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    it('does not fall back to a same-named job on another client or a guessed source folder', async () => {
+        armSabFolder();
+        mocks.getAllActiveDownloads.mockResolvedValue([{ id: 'SABnzbd_nzo_42', clientId: 'other_sab', clientType: 'sab', isComplete: true, name: usenetRequest.activeDownloadName, contentPath: '/other/job' }]);
+        expect(await Importer.importRequest('req_1')).toBe(false);
+        expect(fs.copy).not.toHaveBeenCalled();
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    it('does not substitute a same-named SAB job when the tracked ID is missing', async () => {
+        armSabFolder();
+        mocks.getAllActiveDownloads.mockResolvedValue([{ id: 'SABnzbd_nzo_other', clientId: 'sab_1', clientType: 'sab', isComplete: true, name: usenetRequest.activeDownloadName, contentPath: '/downloads/other-job' }]);
+        expect(await Importer.importRequest('req_1')).toBe(false);
+        expect(fs.copy).not.toHaveBeenCalled();
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    it('does not guess a folder when completed SAB history lacks storage', async () => {
+        armSabFolder();
+        mocks.getAllActiveDownloads.mockResolvedValue([{ id: 'SABnzbd_nzo_42', clientId: 'sab_1', clientType: 'sab', isComplete: true, status: 'Completed', name: usenetRequest.activeDownloadName }]);
+        expect(await Importer.importRequest('req_1')).toBe(false);
+        expect(fs.copy).not.toHaveBeenCalled();
+        expect(fs.remove).not.toHaveBeenCalled();
+    });
+
+    it('retains the SAB batch job directory when only some extracted comics can be copied', async () => {
+        armSabFolder();
+        vi.mocked(fs.promises.readdir).mockResolvedValue([
+            { name: 'Batman 001.cbz', isDirectory: () => false },
+            { name: 'Batman 002.cbz', isDirectory: () => false }
+        ] as any);
+        vi.mocked(fs.copy).mockRejectedValueOnce(new Error('disk full'));
+        await Importer.importRequest('req_1');
+        expect(fs.copy).toHaveBeenCalledTimes(2);
         expect(fs.remove).not.toHaveBeenCalled();
     });
 });

@@ -11,6 +11,9 @@ import { CACHE_DIR, LOGS_DIR, BACKUPS_DIR, WATCHED_DIR, UNMATCHED_DIR } from '@/
 import { encryptSecret, decryptSecret } from '@/lib/encryption';
 import { SECRET_SETTING_KEYS } from '@/lib/secret-keys';
 import { testAnnasArchiveKey } from '@/lib/annas-test';
+import { normalizeAnnasMirror, parseAnnasMirrors } from '@/lib/annas-mirrors';
+import { KOMGA_KEYS, KOMGA_SETTING_KEYS } from '@/lib/komga/constants';
+import { runKomgaEnableGate, applyKomgaSettingsChange } from '@/lib/komga/settings-hooks';
 
 // Masked on the way out: every credential stored encrypted (apprise_url included - it can carry basic
 // auth), plus two that aren't encrypted but still mustn't reach the browser. Derived from
@@ -20,6 +23,49 @@ const SENSITIVE_KEYS = new Set<string>([
     'discord_webhooks',
     'omnibus_api_key',
 ]);
+
+// Same coercion the save loop applies to every flat setting.
+const toSettingString = (value: unknown): string =>
+    typeof value === 'object' ? JSON.stringify(value) : String(value ?? "");
+
+const KOMGA_BOOLEAN_KEYS: string[] = [KOMGA_KEYS.enabled, KOMGA_KEYS.scanOnChange, KOMGA_KEYS.readListsEnabled];
+
+// Shapes the incoming komga_* values in place before the gate and the save. Booleans are stored as
+// 'true'/'false' strings like every other flag (readers compare with === 'true'), but a JSON client
+// may send real booleans. komga_instance_id is server-managed — it is the read-list ownership
+// marker, so a stale settings page must never overwrite it. Path mappings that are not a JSON list
+// are dropped (the stored value is kept) with a warning instead of failing the save.
+function prepareKomgaSettings(settings: Record<string, unknown>, warnings: string[]): void {
+    for (const key of KOMGA_BOOLEAN_KEYS) {
+        const v = settings[key];
+        if (typeof v === 'boolean') settings[key] = v ? 'true' : 'false';
+        else if (typeof v === 'string' && /^(true|false)$/i.test(v.trim())) settings[key] = v.trim().toLowerCase();
+    }
+    delete settings[KOMGA_KEYS.instanceId];
+
+    const rawMappings = settings[KOMGA_KEYS.pathMappings];
+    if (rawMappings !== undefined && rawMappings !== null && rawMappings !== '') {
+        let parsed: unknown = rawMappings;
+        if (typeof rawMappings === 'string') {
+            try { parsed = JSON.parse(rawMappings); } catch { parsed = undefined; }
+        }
+        if (!Array.isArray(parsed)) {
+            delete settings[KOMGA_KEYS.pathMappings];
+            warnings.push('Komga path mappings were not saved: they must be a JSON list of {"omnibus", "komga"} rows. The previous mappings are unchanged.');
+        }
+    }
+}
+
+// The komga_* values as they will read after the save: masked ('********') and absent keys keep
+// their stored value, exactly as the save loop leaves them.
+function nextKomgaSettings(prior: Record<string, string | undefined>, settings: Record<string, unknown>): Record<string, string | undefined> {
+    const next = { ...prior };
+    for (const key of KOMGA_SETTING_KEYS) {
+        if (!(key in settings) || settings[key] === '********') continue;
+        next[key] = toSettingString(settings[key]);
+    }
+    return next;
+}
 
 export async function GET(request: Request) {
   const authOptions = await getAuthOptions();
@@ -100,6 +146,7 @@ export async function POST(request: Request) {
     const isSetupComplete = setupStatus?.value === 'true';
 
     let userId: string | null = null;
+    let userName: string | undefined;
 
     if (isSetupComplete) {
         const authOptions = await getAuthOptions();
@@ -108,6 +155,7 @@ export async function POST(request: Request) {
             return NextResponse.json({ error: "Unauthorized." }, { status: 403 });
         }
         userId = (session.user as any).id;
+        userName = session.user.name ?? undefined;
     } else {
         const userCount = await prisma.user.count();
         if (userCount === 0) {
@@ -128,6 +176,17 @@ export async function POST(request: Request) {
         searchAcronyms
     } = body;
 
+    try {
+        if (typeof settings?.annas_archive_base_url === 'string' && settings.annas_archive_base_url.trim()) {
+            settings.annas_archive_base_url = normalizeAnnasMirror(settings.annas_archive_base_url);
+        }
+        if (typeof settings?.annas_archive_mirrors === 'string') {
+            settings.annas_archive_mirrors = parseAnnasMirrors(settings.annas_archive_mirrors).join('\n');
+        }
+    } catch (error) {
+        return NextResponse.json({ error: getErrorMessage(error) }, { status: 400 });
+    }
+
     if (settings?.oidc_force_sso === 'true') {
         const adminWithPassword = await prisma.user.findFirst({
             where: {
@@ -141,6 +200,15 @@ export async function POST(request: Request) {
                 error: "Cannot enable Force SSO: No Admin account with a local password exists. Please set a local password for an Admin account first to prevent lockouts." 
             }, { status: 400 });
         }
+    }
+
+    if (Array.isArray(hosterAccounts) && hosterAccounts.some(account => {
+        if (account?.hoster !== 'mega' || account.isActive === false) return false;
+        if (account.username != null && typeof account.username !== 'string') return true;
+        if (account.password != null && typeof account.password !== 'string') return true;
+        return !!account.username?.trim() !== !!account.password;
+    })) {
+        return NextResponse.json({ error: 'Enter both a MEGA email and password, or clear both for anonymous downloads.' }, { status: 400 });
     }
 
     // Encrypt credential fields at rest before persisting. '********' means "unchanged" (the GET
@@ -188,7 +256,7 @@ export async function POST(request: Request) {
                         const dbAcct = await prisma.hosterAccount.findFirst({ where: { hoster: 'annas_archive', isActive: true } });
                         key = dbAcct?.apiKey ? await decryptSecret(dbAcct.apiKey) : "";
                     }
-                    const test = await testAnnasArchiveKey(key, settings.annas_archive_base_url);
+                    const test = await testAnnasArchiveKey(key, settings.annas_archive_base_url, settings.annas_archive_mirrors);
                     if (!test.success) {
                         ssp[annasIdx].enabled = false;
                         settings.search_source_priority = JSON.stringify(ssp);
@@ -200,6 +268,34 @@ export async function POST(request: Request) {
         } catch { /* malformed search_source_priority — leave it untouched */ }
     }
 
+    // --- Komga enable gate ---
+    // Only a save that carries komga_* keys touches Komga at all (the settings page always sends
+    // them; the setup wizard and other callers never do). Like the Anna's gate, the connection test
+    // runs only on the komga_enabled false→true transition and, on failure, saves the flag as
+    // 'false' with a warning. Nothing here may fail the save: an unreadable prior state still gates
+    // (fail closed) but skips the post-save hook, which needs a trustworthy before/after diff.
+    let komgaPrior: Record<string, string | undefined> | null = null;
+    let komgaNext: Record<string, string | undefined> | null = null;
+    if (settings && typeof settings === 'object' && KOMGA_SETTING_KEYS.some(k => k in settings)) {
+        prepareKomgaSettings(settings, gateWarnings);
+        try {
+            const rows = await prisma.systemSetting.findMany({ where: { key: { in: [...KOMGA_SETTING_KEYS] } } });
+            komgaPrior = Object.fromEntries(rows.map((r: { key: string; value: string }) => [r.key, r.value]));
+        } catch (e) {
+            Logger.log(`[Komga] Could not read the saved Komga settings before saving: ${getErrorMessage(e)}`, 'warn');
+        }
+        try {
+            await runKomgaEnableGate(settings, komgaPrior ?? {}, gateWarnings);
+        } catch (e) {
+            if (settings[KOMGA_KEYS.enabled] === 'true' && komgaPrior?.[KOMGA_KEYS.enabled] !== 'true') {
+                settings[KOMGA_KEYS.enabled] = 'false';
+                gateWarnings.push('Komga was not enabled: the connection test could not be run. Check the server logs, then try again.');
+            }
+            Logger.log(`[Komga] Enable gate failed unexpectedly: ${getErrorMessage(e)}`, 'warn');
+        }
+        if (komgaPrior) komgaNext = nextKomgaSettings(komgaPrior, settings);
+    }
+
     // Pre-encrypt the flat settings bag OUTSIDE the transaction (issue #195). encryptSecret →
     // getEncryptionKey used to query the DB through the GLOBAL client mid-transaction; with
     // SQLite's connection_limit=1 pool that query queued behind the open transaction's own
@@ -208,12 +304,13 @@ export async function POST(request: Request) {
     // encryption, which is why long-configured installs never hit it — but the SETUP WIZARD
     // finishes through this route, so every new SQLite install did). Same rule as encryptRows
     // above: no awaited non-transaction work inside an interactive transaction, ever.
-    // NOTE: runs AFTER the Anna's Archive gate, which may rewrite settings.search_source_priority.
+    // NOTE: runs AFTER the Anna's Archive and Komga gates, which may rewrite
+    // settings.search_source_priority / settings.komga_enabled.
     const preparedSettings: Array<[string, string]> = [];
     if (settings) {
         for (const [key, value] of Object.entries(settings)) {
             if (value === '********') continue;
-            let stringValue = typeof value === 'object' ? JSON.stringify(value) : String(value ?? "");
+            let stringValue = toSettingString(value);
             // Encrypt credential settings at rest; reads are auto-decrypted (db.ts extension + engine).
             if (SECRET_SETTING_KEYS.has(key) && stringValue) {
                 stringValue = (await encryptSecret(stringValue)) ?? stringValue;
@@ -336,6 +433,18 @@ export async function POST(request: Request) {
     // Headroom over Prisma's 5s default: a full save is dozens of sequential writes, and on slow
     // storage (SQLite on an Unraid FUSE share, NAS mounts) each fsync is expensive (issue #195).
     }, { timeout: 30000, maxWait: 10000 });
+
+    // Komga post-save hook (cache invalidation, identity reset on a server change, reconcile
+    // enqueue). Committed settings are already final, so it is never awaited and a rejection —
+    // or even a synchronous throw — only logs.
+    if (komgaPrior && komgaNext) {
+        const prior = komgaPrior;
+        const next = komgaNext;
+        const actor = { id: userId ?? undefined, username: userName };
+        void Promise.resolve()
+            .then(() => applyKomgaSettingsChange(prior, next, actor))
+            .catch(e => Logger.log(`[Komga] Settings change hook failed: ${getErrorMessage(e)}`, 'warn'));
+    }
 
     const isFinishingSetup = !isSetupComplete && settings?.setup_complete === 'true';
 

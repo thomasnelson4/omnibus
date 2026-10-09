@@ -45,7 +45,7 @@ export async function POST(req: Request) {
              Logger.log(`[Admin Download] Batch torrent already downloading (${downloadHash}). Queuing for batch extraction.`, 'info');
              await prisma.request.update({
                  where: { id: requestId },
-                 data: { status: 'DOWNLOADING', downloadLink: downloadHash, progress: 0 }
+                 data: { status: 'DOWNLOADING', downloadLink: downloadHash, clientDownloadId: duplicateDownload.clientDownloadId, downloadClientId: duplicateDownload.downloadClientId, progress: 0 }
              });
              return NextResponse.json({ success: true });
         }
@@ -57,13 +57,15 @@ export async function POST(req: Request) {
     const dlSeries = dlReq ? await prisma.series.findFirst({ where: { metadataId: dlReq.volumeId, metadataSource: dlReq.metadataSource }, select: { isManga: true } }) : null;
 
     // Send the link to the unified DownloadService
-    await DownloadService.addDownload(client, urlToDownload, title, 0, 0, dlSeries?.isManga ?? false);
+    const submission = await DownloadService.addDownload(client, urlToDownload, title, 0, 0, dlSeries?.isManga ?? false);
 
     await prisma.request.update({
       where: { id: requestId },
       data: {
         status: 'DOWNLOADING',
-        downloadLink: downloadHash || "PENDING_MATCH", 
+        downloadLink: downloadHash || "PENDING_MATCH",
+        clientDownloadId: submission?.downloadId || null,
+        downloadClientId: client.id,
         progress: 0
       }
     });

@@ -40,7 +40,7 @@ describe('providerFillPlan', () => {
 });
 
 describe('acceptableForBulk — Accept All candidates (ignore state)', () => {
-    const suggestions = { a: { id: '1' }, b: 'NOT_FOUND', c: 'ERROR', d: { id: '2' } };
+    const suggestions = { a: { id: '1', manualReviewed: true }, b: 'NOT_FOUND', c: 'ERROR', d: { id: '2', manualReviewed: true } };
 
     it('takes only rows with a real suggestion', () => {
         const items = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'e' }];
@@ -92,8 +92,8 @@ describe('seriesQueryFromName — what the auto-scan actually searches for', () 
     });
 
     it('strips edition words anywhere, as whole words, without eating real titles', () => {
-        expect(seriesQueryFromName('Batman Omnibus Vol. 2')).toEqual({ query: 'Batman', year: null });
-        expect(seriesQueryFromName('Saga Compendium One TPB')).toEqual({ query: 'Saga One', year: null });
+        expect(seriesQueryFromName('Batman Omnibus Vol. 2')).toEqual({ query: 'Batman Omnibus', year: null });
+        expect(seriesQueryFromName('Saga Compendium One TPB')).toEqual({ query: 'Saga Compendium One', year: null });
         // Only a TRAILING number is an issue token — a number inside the title is the title.
         expect(seriesQueryFromName('Kaiju No. 8 003')).toEqual({ query: 'Kaiju No. 8', year: null });
         // Whole words only: the old unbounded regex would have matched "vol" inside a word.

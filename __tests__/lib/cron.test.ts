@@ -152,6 +152,38 @@ describe('Cron Logic: Automated Download Checker', () => {
         );
     });
 
+    it('tracks a renamed SAB job by ID while retaining its indexer link for deduplication', async () => {
+        mocks.requestFindMany.mockImplementation(async (args) => args.where.status === 'DOWNLOADING' ? [{
+            id: 'req_sab', volumeId: 'vol_1', activeDownloadName: 'Original NZB name', downloadLink: 'indexer-guid',
+            clientDownloadId: 'SABnzbd_nzo_42', downloadClientId: 'sab_1'
+        }] : []);
+        mocks.seriesFindMany.mockResolvedValue([]);
+        mocks.getAllActiveDownloads.mockResolvedValue([{
+            id: 'SABnzbd_nzo_42', clientId: 'sab_1', clientType: 'sab', name: 'Renamed sorted job',
+            isComplete: true, progress: '100', status: 'Completed'
+        }]);
+        initCronJobs();
+        await mocks.cronCb.current();
+        expect(mocks.getAllActiveDownloads).toHaveBeenCalledWith(['SABnzbd_nzo_42']);
+        expect(mocks.importRequest).toHaveBeenCalledWith('req_sab');
+        const update = mocks.requestUpdate.mock.calls.find(c => c[0].data.clientDownloadId === 'SABnzbd_nzo_42');
+        expect(update?.[0].data.downloadLink).toBeUndefined();
+    });
+
+    it('waits for SAB extraction to finish despite 100 percent downloaded progress', async () => {
+        mocks.requestFindMany.mockImplementation(async (args) => args.where.status === 'DOWNLOADING' ? [{
+            id: 'req_sab_extract', volumeId: 'vol_1', clientDownloadId: 'SABnzbd_nzo_42', downloadClientId: 'sab_1'
+        }] : []);
+        mocks.seriesFindMany.mockResolvedValue([]);
+        mocks.getAllActiveDownloads.mockResolvedValue([{
+            id: 'SABnzbd_nzo_42', clientId: 'sab_1', clientType: 'sab', name: 'Extracting job',
+            isComplete: false, progress: '100', status: 'Extracting'
+        }]);
+        initCronJobs();
+        await mocks.cronCb.current();
+        expect(mocks.importRequest).not.toHaveBeenCalled();
+    });
+
     // ==== #202: the fallback matcher's year gate captured group 1 of /(19|20)\d{2}/ — the literal
     // "20" — so every DATED torrent failed the year comparison ("Req: 2011 vs Tor: 20") and could
     // only ever pair via the exact-name/link tiers. These pin the fixed capture both ways.

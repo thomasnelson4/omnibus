@@ -6,6 +6,7 @@
 import { useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import { DEFAULT_SCORING_RULES } from "@/lib/utils/defaults"
+import { defaultHosterPrefs, migrateHosterPrefs, migratePristineHosterOrder, type HosterPref } from "@/lib/hoster-prefs"
 import { RECOMMENDED_PUBLISHERS, RECOMMENDED_KEYWORDS } from "@/lib/filter-defaults"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -28,8 +29,10 @@ import { SearchIndexersTab } from "./tabs/search-indexers-tab"
 import { DownloadsTab } from "./tabs/downloads-tab"
 import { DiscoveryTab } from "./tabs/discovery-tab"
 import { NotificationsTab } from "./tabs/notifications-tab"
+import { MediaServersTab } from "./tabs/media-servers-tab"
 import { AccessSecurityTab } from "./tabs/access-security-tab"
 import { SystemTab } from "./tabs/system-tab"
+import { MegaAccountFields } from "@/components/mega-account-fields"
 
 import type { LibraryConfig, IndexerConfig, CustomHeader, AcronymConfig, ScoringRule, ClientConfig, WebhookConfig, HosterAccountConfig } from "./tabs/shared"
 import { hasMetronCredentials } from "@/lib/metron/credentials"
@@ -48,7 +51,7 @@ export default function SettingsPage() {
   
   const [testResults, setTestResults] = useState<{ [key: string]: { success: boolean, text: string } | null }>({
     comicvine: null, metron: null, prowlarr: null, clients: null, paths: null, mapping: null, webhooks: null, smtp: null, smtp_digest: null, flaresolverr: null,
-    pushover: null, telegram: null, apprise: null
+    pushover: null, telegram: null, apprise: null, komga: null
   })
   
   const [refreshing, setRefreshing] = useState(false)
@@ -65,18 +68,10 @@ export default function SettingsPage() {
   const [scoringRules, setScoringRules] = useState<ScoringRule[]>([])
   const [envPaths, setEnvPaths] = useState<any>({})
   
-  // Hoster States
+  // Hoster States — single source of truth is defaultHosterPrefs() in @/lib/getcomics (mirrored by the
+  // Rust engine's default_hoster_prefs). Hardcoding this list here is what let the two drift before.
   const [configuredHosters, setConfiguredHosters] = useState<HosterAccountConfig[]>([])
-  const [hosterPriority, setHosterPriority] = useState<{hoster: string, enabled: boolean}[]>([
-      { hoster: 'getcomics_direct', enabled: true },
-      { hoster: 'getcomics_main', enabled: true },
-      { hoster: 'mediafire', enabled: true },
-      { hoster: 'mega', enabled: true },
-      { hoster: 'pixeldrain', enabled: true },
-      { hoster: 'rootz', enabled: false },
-      { hoster: 'vikingfile', enabled: false },
-      { hoster: 'terabox', enabled: false }
-  ])
+  const [hosterPriority, setHosterPriority] = useState<{hoster: string, enabled: boolean}[]>(defaultHosterPrefs)
   // Automation search-source order (which source is tried first; separate from hoster-mirror priority).
   const [searchSourcePriority, setSearchSourcePriority] = useState<{source: string, enabled: boolean}[]>([
       { source: 'getcomics', enabled: true },
@@ -147,9 +142,11 @@ export default function SettingsPage() {
     ddl_enabled: "true",
     getcomics_interactive_pages: "4",
     getcomics_automated_pages: "5",
-    annas_archive_interactive_enabled: "false", annas_archive_base_url: "", annas_archive_formats: "cbz,cbr,pdf,epub",
+    annas_archive_interactive_enabled: "false", annas_archive_base_url: "", annas_archive_mirrors: "", annas_archive_formats: "cbz,cbr,pdf,epub",
     engine_max_scan_workers: "", engine_max_convert_workers: "", engine_cpu_cap: "",
-    engine_max_blocking_threads: "", engine_memory_ceiling_mb: "", engine_max_db_connections: ""
+    engine_max_blocking_threads: "", engine_memory_ceiling_mb: "", engine_max_db_connections: "",
+    komga_enabled: "false", komga_url: "", komga_api_key: "", komga_path_mappings: "[]",
+    komga_scan_on_change: "true", komga_readlists_enabled: "false"
   })
 
   const [customProwlarrCategories, setCustomProwlarrCategories] = useState("")
@@ -312,43 +309,29 @@ export default function SettingsPage() {
             }
 
             const hpSetting = data.settings.find((s: any) => s.key === 'hoster_priority');
-            const defaultHosters = [
-                { hoster: 'getcomics_direct', enabled: true },
-                { hoster: 'getcomics_main', enabled: true },
-                { hoster: 'mediafire', enabled: true },
-                { hoster: 'mega', enabled: true },
-                { hoster: 'pixeldrain', enabled: true },
-                { hoster: 'rootz', enabled: false },
-                { hoster: 'vikingfile', enabled: false },
-                { hoster: 'terabox', enabled: false }
-            ];
+            const defaultHosters = defaultHosterPrefs();
 
             if (hpSetting?.value) {
                 try {
                     const savedHosters = JSON.parse(hpSetting.value);
-                    let mergedHosters: any[] = [];
+                    let mergedHosters: HosterPref[] = [];
                     if (savedHosters.length > 0 && typeof savedHosters[0] === 'string') {
                         mergedHosters = savedHosters.map((h: string) => ({ hoster: h, enabled: true }));
                     } else {
                         mergedHosters = [...savedHosters];
                     }
-                    // Migrate a legacy single `getcomics` entry -> `getcomics_direct` (kept in place) +
-                    // `getcomics_main` (inserted right after it, so both stay high-priority). Keeps
-                    // existing configs working post-split.
-                    const gi = mergedHosters.findIndex(mh => mh.hoster === 'getcomics');
-                    if (gi !== -1) {
-                        const en = mergedHosters[gi].enabled !== false;
-                        mergedHosters[gi] = { hoster: 'getcomics_direct', enabled: en };
-                        if (!mergedHosters.some(mh => mh.hoster === 'getcomics_main')) {
-                            mergedHosters.splice(gi + 1, 0, { hoster: 'getcomics_main', enabled: en });
-                        }
-                    }
+                    // Normalise through the SHARED helpers (mirrored by the Rust engine) instead of a
+                    // third inlined copy: the legacy `getcomics` split, then the pristine-default reorder
+                    // that demotes the Cloudflare-gated `getcomics_main` below the scraping mirrors — but
+                    // ONLY when the stored config is still exactly what we shipped, so deliberate user
+                    // ordering is never overwritten. Saving from here persists the migrated order.
+                    mergedHosters = migratePristineHosterOrder(migrateHosterPrefs(mergedHosters));
                     defaultHosters.forEach(dh => {
                         if (!mergedHosters.some(mh => mh.hoster === dh.hoster)) mergedHosters.push(dh);
                     });
                     // Anna's Archive is a search source now, not a hoster mirror — drop any legacy entry
                     // so it no longer shows in the Hoster Priority list (its API key lives in its own section).
-                    mergedHosters = mergedHosters.filter((mh: any) => mh.hoster !== 'annas_archive');
+                    mergedHosters = mergedHosters.filter((mh: HosterPref) => mh.hoster !== 'annas_archive');
                     setHosterPriority(mergedHosters);
                 } catch(e) {
                     setHosterPriority(defaultHosters);
@@ -610,7 +593,7 @@ export default function SettingsPage() {
   };
 
   const openHosterSetup = (hosterName: string) => {
-      setEditingHoster({
+      setEditingHoster(configuredHosters.find(account => account.hoster === hosterName) || {
           id: `tmp_${Math.random().toString(36).substr(2, 9)}`,
           name: hosterDisplayNames[hosterName] || hosterName,
           hoster: hosterName,
@@ -622,6 +605,10 @@ export default function SettingsPage() {
 
   const saveHosterInState = () => {
       if (!editingHoster) return;
+      if (editingHoster.hoster === 'mega' && editingHoster.isActive !== false && !!editingHoster.username?.trim() !== !!editingHoster.password) {
+          toast({ title: "Incomplete MEGA Account", description: "Enter both an email and password, or clear both for anonymous downloads.", variant: "destructive" });
+          return;
+      }
       setConfiguredHosters(prev => {
           const filtered = prev.filter(c => c.id !== editingHoster.id);
           return [...filtered, editingHoster];
@@ -925,6 +912,7 @@ export default function SettingsPage() {
         <TabsContent value="downloads" className="space-y-6"><DownloadsTab s={s} /></TabsContent>
         <TabsContent value="discovery"><DiscoveryTab s={s} /></TabsContent>
         <TabsContent value="notifications"><NotificationsTab s={s} /></TabsContent>
+        <TabsContent value="media-servers" className="space-y-6"><MediaServersTab s={s} /></TabsContent>
         <TabsContent value="access" className="space-y-6"><AccessSecurityTab s={s} /></TabsContent>
         <TabsContent value="system" className="space-y-6"><SystemTab s={s} /></TabsContent>
 
@@ -938,6 +926,8 @@ export default function SettingsPage() {
             <DialogHeader><DialogTitle className="text-foreground">Configure {editingHoster?.name}</DialogTitle></DialogHeader>
             {editingHoster && (
                 <div className="grid gap-4 py-4">
+                    {editingHoster.hoster === 'mega' ? <MegaAccountFields account={editingHoster}
+                        onChange={fields => setEditingHoster({ ...editingHoster, ...fields })} /> : <>
                     <div className="grid gap-2">
                         <Label className="text-foreground font-semibold">API Key (Optional)</Label>
                         <Input type="password" value={editingHoster.apiKey || ""} onChange={e => setEditingHoster({...editingHoster, apiKey: e.target.value})} placeholder="Paste your API key" className="h-12 sm:h-10 bg-muted/20 border-border text-foreground" />
@@ -947,6 +937,7 @@ export default function SettingsPage() {
                             ? <>An API key authenticates with <strong>{editingHoster.name}</strong> — it bypasses guest bandwidth limits (Pixeldrain) or enables automated downloads (Anna&apos;s Archive member key). Leave blank for anonymous downloads.</>
                             : <><strong>{editingHoster.name}</strong> doesn&apos;t use credentials in Omnibus — downloads are anonymous, so this field has no effect. Only <strong>Pixeldrain</strong> and <strong>Anna&apos;s Archive</strong> currently use an API key.</>}
                     </p>
+                    </>}
                 </div>
             )}
             <DialogFooter className="gap-2 sm:gap-0">

@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
     axiosGet: vi.fn(),
     axiosPost: vi.fn(),
     findManyHeaders: vi.fn(),
+    findManyClients: vi.fn(),
     settingFindUnique: vi.fn(),
     log: vi.fn()
 }));
@@ -25,9 +26,79 @@ vi.mock('axios', () => ({
 vi.mock('@/lib/db', () => ({
     prisma: {
         customHeader: { findMany: mocks.findManyHeaders },
+        downloadClient: { findMany: mocks.findManyClients },
         systemSetting: { findUnique: mocks.settingFindUnique }
     }
 }));
+
+describe('SABnzbd job identity and final destination', () => {
+    const sabClient = { id: 'sab_1', name: 'SAB', type: 'sab', url: 'http://sab:8080', apiKey: 'key', category: 'comics' };
+    const nzbUrl = 'https://indexer.example/release.nzb';
+    const jobId = 'SABnzbd_nzo_42';
+
+    beforeEach(() => {
+        mocks.axiosGet.mockReset();
+        mocks.axiosPost.mockReset();
+        mocks.findManyHeaders.mockResolvedValue([]);
+        mocks.findManyClients.mockResolvedValue([sabClient]);
+        mocks.settingFindUnique.mockResolvedValue(null);
+    });
+
+    it('returns the job ID from an NZB file submission', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: Buffer.from('<nzb/>') });
+        mocks.axiosPost.mockResolvedValueOnce({ data: { status: true, nzo_ids: [jobId] } });
+        expect(await DownloadService.addDownload(sabClient, nzbUrl, 'Original release', 0)).toMatchObject({ success: true, downloadId: jobId });
+    });
+
+    it('returns the job ID from a URL submission after the prefetch fails', async () => {
+        mocks.axiosGet.mockRejectedValueOnce(new Error('indexer unavailable'));
+        mocks.axiosGet.mockResolvedValueOnce({ data: { status: true, nzo_ids: [jobId] } });
+        expect(await DownloadService.addDownload(sabClient, nzbUrl, 'Original release', 0)).toMatchObject({ downloadId: jobId });
+    });
+
+    it('retains the returned job ID when a failed file submission falls back to addurl', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: Buffer.from('<nzb/>') });
+        mocks.axiosPost.mockRejectedValueOnce(new Error('upload rejected'));
+        mocks.axiosGet.mockResolvedValueOnce({ data: { status: true, nzo_ids: [jobId] } });
+        expect(await DownloadService.addDownload(sabClient, nzbUrl, 'Original release', 0)).toMatchObject({ downloadId: jobId });
+    });
+
+    it('does not report success for SAB HTTP-200 errors or missing job IDs', async () => {
+        for (const data of [{ status: false, error: 'Invalid NZB' }, { status: true, nzo_ids: [] }]) {
+            mocks.axiosGet.mockRejectedValueOnce(new Error('prefetch failed'));
+            mocks.axiosGet.mockResolvedValueOnce({ data });
+            await expect(DownloadService.addDownload(sabClient, nzbUrl, 'Original release', 0)).rejects.toThrow('SABnzbd rejected');
+        }
+    });
+
+    it('keeps the final storage directory and client identity from completed history', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [] } } });
+        mocks.axiosGet.mockResolvedValueOnce({ data: { history: { slots: [{ nzo_id: jobId, name: 'Renamed release', category: 'comics', status: 'Completed', loaded: false, storage: '/complete/comics/Sorted Job', path: '/incomplete/Old Job' }] } } });
+        const downloads = await DownloadService.getAllActiveDownloads([jobId]);
+        expect(downloads).toEqual([expect.objectContaining({ id: jobId, clientId: 'sab_1', clientType: 'sab', isComplete: true, contentPath: '/complete/comics/Sorted Job', progress: '100.0' })]);
+    });
+
+    it('looks up a tracked job outside the recent 20 history items by exact ID', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [] } } });
+        mocks.axiosGet.mockResolvedValueOnce({ data: { history: { slots: [] } } });
+        mocks.axiosGet.mockResolvedValueOnce({ data: { history: { slots: [{ nzo_id: jobId, name: 'Sorted job', category: 'changed-category', status: 'Completed', storage: '/complete/Sorted Job' }] } } });
+        expect(await DownloadService.getAllActiveDownloads([jobId])).toEqual([expect.objectContaining({ id: jobId, contentPath: '/complete/Sorted Job', isComplete: true })]);
+        expect(mocks.axiosGet.mock.calls[2][1].params).toMatchObject({ mode: 'history', nzo_ids: jobId });
+    });
+
+    it('does not consider 100 percent queue progress or post-processing history ready to import', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [{ nzo_id: 'queued', filename: 'Queue job', cat: 'comics', percentage: '100', status: 'Downloading' }] } } });
+        mocks.axiosGet.mockResolvedValueOnce({ data: { history: { slots: [{ nzo_id: jobId, name: 'Extracting job', category: 'comics', status: 'Extracting', loaded: true, storage: '/complete/Job' }] } } });
+        const downloads = await DownloadService.getAllActiveDownloads();
+        expect(downloads.every(d => d.isComplete === false)).toBe(true);
+    });
+
+    it('also includes client identity on torrent items so requests remain bound to the submitting client', async () => {
+        mocks.findManyClients.mockResolvedValue([{ id: 'qbit_1', name: 'qBit', type: 'qbit', url: 'http://qbit:8080', apiKey: 'token', category: 'comics' }]);
+        mocks.axiosGet.mockResolvedValueOnce({ data: [{ hash: 'torrent_hash', name: 'Batman', category: 'comics', progress: 1, state: 'uploading', size: 1024 }] });
+        expect(await DownloadService.getAllActiveDownloads()).toEqual([expect.objectContaining({ clientId: 'qbit_1', clientType: 'qbit', id: 'torrent_hash' })]);
+    });
+});
 
 
 vi.mock('@/lib/importer', () => ({ Importer: {} }));

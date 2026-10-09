@@ -72,6 +72,9 @@ export async function GET() {
                     // User data + config previously omitted (silent loss on migration/restore).
                     // jobLogs and jobLocks are intentionally excluded (ephemeral diagnostics /
                     // runtime locks that regenerate on the target instance).
+                    // Komga* tables are rebuildable caches (excluded the same way: this is an
+                    // allowlist, so a new table is never picked up by accident). ReadingList.komgaSync
+                    // does round-trip via the readingLists row above.
                     { name: 'hosterAccounts', model: prisma.hosterAccount },
                     { name: 'apiKeys', model: prisma.apiKey },
                     { name: 'opdsKeys', model: prisma.opdsKey },

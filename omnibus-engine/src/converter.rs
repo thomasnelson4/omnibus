@@ -350,6 +350,7 @@ pub async fn process_cbr_sweep(db: Db, issue_id: Option<String>) -> anyhow::Resu
 
     for row in issues {
         let issue_id: String = row.get("id");
+        let series_id: String = row.get("seriesId");
         let file_path: String = row.get("filePath");
         let sem = sem.clone();
 
@@ -359,7 +360,7 @@ pub async fn process_cbr_sweep(db: Db, issue_id: Option<String>) -> anyhow::Resu
             // Route through process_archive so the sweep honors WebP settings (parity with Node's convertCbrToCbz).
             let result = tokio::task::spawn_blocking(move || process_archive(&path, convert_to_webp, webp_quality)).await;
             match result {
-                Ok(Ok(new_path)) => Ok((issue_id, new_path.to_string_lossy().to_string())),
+                Ok(Ok(new_path)) => Ok((issue_id, series_id, file_path, new_path.to_string_lossy().to_string())),
                 Ok(Err(e)) => Err(format!("Failed to convert {}: {}", file_path, e)),
                 Err(e) => Err(format!("Conversion task panicked for {}: {}", file_path, e)),
             }
@@ -369,11 +370,21 @@ pub async fn process_cbr_sweep(db: Db, issue_id: Option<String>) -> anyhow::Resu
     let mut success = 0;
     let mut fail = 0;
     let mut details = String::new();
+    // Collected and emitted once after the sweep, so Komga scans a fully-converted library rather
+    // than one mid-conversion.
+    let mut changed_paths: Vec<String> = Vec::new();
+    let mut changed_series: std::collections::HashSet<String> = Default::default();
 
     // Await the conversions and update the database with the new .cbz file paths
     while let Some(res) = join_set.join_next().await {
         match res {
-            Ok(Ok((issue_id, new_path))) => {
+            Ok(Ok((issue_id, series_id, old_path, new_path))) => {
+                // The conversion deletes the .cbr/.rar and writes a .cbz; both paths are relevant.
+                if old_path != new_path {
+                    changed_paths.push(old_path);
+                }
+                changed_paths.push(new_path.clone());
+                changed_series.insert(series_id);
                 // The freshly-built CBZ finally has a countable page count (the source RAR didn't) —
                 // record it so OPDS-PSE stops advertising the issue as "0 pages".
                 let pages = count_zip_pages(Path::new(&new_path)).unwrap_or(0);
@@ -405,6 +416,10 @@ pub async fn process_cbr_sweep(db: Db, issue_id: Option<String>) -> anyhow::Resu
                 details.push_str(&format!("[FAIL] task join error: {}\n", e));
             },
         }
+    }
+
+    if !changed_paths.is_empty() {
+        crate::library_events::emit("cbr-convert", changed_paths, changed_series.into_iter().collect());
     }
 
     Ok((success, fail, details))
@@ -560,6 +575,7 @@ fn find_images(dir: &Path) -> Result<Vec<PathBuf>> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+            if path.is_symlink() { continue; }
             // Skip macOS resource-fork junk that would otherwise become garbage pages.
             let name_lower = path.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()).unwrap_or_default();
             if name_lower == "__macosx" || name_lower.starts_with("._") {
@@ -1652,6 +1668,13 @@ pub fn ensure_folder_cover(folder: &Path, archive_path: &Path) -> Option<PathBuf
     match std::fs::write(&dest, &bytes) {
         Ok(_) => {
             log::info!("[Cover] Extracted archive cover for {:?}", folder.file_name().unwrap_or_default());
+            // Only the Ok branch actually wrote the file, so this is the only place that may
+            // report a change. `emit` is a non-blocking channel send, safe on a blocking thread.
+            crate::library_events::emit(
+                "cover-extract",
+                vec![dest.to_string_lossy().into_owned()],
+                Vec::new(),
+            );
             Some(dest)
         }
         Err(e) => {
@@ -1861,6 +1884,7 @@ fn collect_comic_files(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(rd) = fs::read_dir(dir) {
         for entry in rd.flatten() {
             let p = entry.path();
+            if p.is_symlink() { continue; }
             if p.is_dir() {
                 collect_comic_files(&p, out);
             } else if is_comic_name(&p.to_string_lossy()) {
@@ -1874,6 +1898,21 @@ fn collect_comic_files(dir: &Path, out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_collectors_do_not_follow_parent_symlink_loops() {
+        let root = std::env::temp_dir().join(format!("omnibus_walk_loop_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/book.cbz"), b"comic").unwrap();
+        std::fs::write(root.join("nested/page.jpg"), b"image").unwrap();
+        std::os::unix::fs::symlink(&root, root.join("nested/parent")).unwrap();
+        let mut comics = Vec::new();
+        collect_comic_files(&root, &mut comics);
+        assert_eq!(comics, vec![root.join("nested/book.cbz")]);
+        assert_eq!(find_images(&root).unwrap(), vec![root.join("nested/page.jpg")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     // ==== Issue #189: page removal (rewrite-minus-entries) ====
 

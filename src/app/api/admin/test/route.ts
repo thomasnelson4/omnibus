@@ -9,6 +9,27 @@ import { Mailer } from '@/lib/mailer';
 import { testAnnasArchiveKey } from '@/lib/annas-test';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
+import { MegaLoginError, testMegaAccount } from '@/lib/hosters/mega-session';
+import { testKomgaConnection, type KomgaTestResult } from '@/lib/komga/connection-test';
+import { parsePathMappings } from '@/lib/komga/path-map';
+
+// Never let a Komga API key reach the browser, even if an upstream message ever echoed it.
+const redactSecret = (text: string, secret: string): string =>
+    secret.length >= 6 ? text.split(secret).join('********') : text;
+
+// One line for the settings card: the test's own summary (which names the version), then a count
+// and the first few warnings (per-library ones are folded in when includeLibraries is false).
+function formatKomgaTestMessage(result: KomgaTestResult): string {
+    if (!result.success) return result.message;
+    let message = result.message || 'Connected to Komga.';
+    if (result.version && !message.includes(result.version)) message += ` (Komga ${result.version})`;
+    const warnings = result.warnings ?? [];
+    if (warnings.length > 0) {
+        const more = warnings.length > 3 ? ` (+${warnings.length - 3} more)` : '';
+        message += ` ${warnings.length} warning${warnings.length === 1 ? '' : 's'}: ${warnings.slice(0, 3).join('; ')}${more}`;
+    }
+    return message;
+}
 import { authFromSettings, metronGet } from '@/lib/metron/client';
 
 export async function POST(request: Request) {
@@ -17,17 +38,42 @@ export async function POST(request: Request) {
   try {
     // --- SECURITY ENFORCEMENT ---
     const setupStatus = await prisma.systemSetting.findUnique({ where: { key: 'setup_complete' } });
+    let adminVerified = false;
     if (setupStatus?.value === 'true') {
         const authOptions = await getAuthOptions();
         const session = await getServerSession(authOptions);
         if (session?.user?.role !== 'ADMIN') {
             return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
         }
+        adminVerified = true;
     }
 
     const body = await request.json();
     type = body.type || 'unknown';
     const { config } = body;
+
+    if (type === 'mega') {
+        if (typeof config?.username !== 'string' || typeof config?.password !== 'string') {
+            return NextResponse.json({ success: false, message: 'Enter both a MEGA email and password.' }, { status: 400 });
+        }
+        try {
+            let password = config.password;
+            if (password === '********') {
+                const saved = typeof config.id === 'string' ? await prisma.hosterAccount.findFirst({
+                    where: { id: config.id, hoster: 'mega' },
+                }) : null;
+                if (!saved?.password) {
+                    return NextResponse.json({ success: false, message: 'Re-enter the MEGA password before testing.' }, { status: 400 });
+                }
+                password = await decryptSecret(saved.password) || '';
+            }
+            await testMegaAccount(config.username, password);
+            return NextResponse.json({ success: true, message: 'MEGA login successful. Downloads will use this account\'s transfer allowance.' });
+        } catch (error) {
+            return NextResponse.json({ success: false, message: error instanceof MegaLoginError
+                ? error.message : 'MEGA login failed. Check the account or re-enter its credentials.' });
+        }
+    }
 
     const headers: any = {
         'User-Agent': 'Omnibus/1.0',
@@ -56,7 +102,11 @@ export async function POST(request: Request) {
                      } 
                  });
             }
-        } catch (e) { }
+        } catch (e) {
+            // Pre-existing behaviour (inherited from main): a malformed custom_headers value is
+            // ignored rather than failing the whole connection test. Logged so it is not silent.
+            Logger.log(`[AdminTest] Ignoring malformed custom_headers: ${getErrorMessage(e)}`, 'debug');
+        }
     }
 
     const getRealValue = async (key: string, providedValue: string) => {
@@ -370,12 +420,43 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true, message: `Connected to Prowlarr (${res.data.length} indexers).` });
     }
 
+    // --- KOMGA TEST ---
+    // Admin-only even before setup completes: Komga is never configured by the setup wizard, and
+    // '********' resolves to the stored Komga ADMIN credential, which an anonymous caller must not
+    // be able to aim at a URL of their choosing. Uses the saved custom headers (like the libraries
+    // route), not the unsaved ones in the page's bag.
+    if (type === 'komga') {
+        if (!adminVerified) {
+            const session = await getServerSession(await getAuthOptions());
+            if (session?.user?.role !== 'ADMIN') {
+                return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
+            }
+        }
+
+        // testKomgaConnection validates the URL and key itself (with actionable messages).
+        const url = typeof config.komga_url === 'string' ? config.komga_url.trim() : '';
+        const providedKey = typeof config.komga_api_key === 'string' ? config.komga_api_key.trim() : '';
+        const key = (await getRealValue('komga_api_key', providedKey)).trim();
+        const pathMappings = parsePathMappings(config.komga_path_mappings);
+
+        let result: KomgaTestResult;
+        try {
+            result = await testKomgaConnection(url, key, { pathMappings, includeLibraries: false });
+        } catch (e) {
+            // testKomgaConnection is documented never to throw; keep the key out of logs and replies regardless.
+            const msg = redactSecret(getErrorMessage(e), key);
+            Logger.log(`[Komga] Connection test failed unexpectedly: ${msg}`, 'error');
+            return NextResponse.json({ success: false, message: `Komga connection test failed: ${msg}`, code: "CONNECTION_ERROR" });
+        }
+        return NextResponse.json({ success: result.success, message: redactSecret(formatKomgaTestMessage(result), key) });
+    }
+
     // --- ANNA'S ARCHIVE (fast_download API key) ---
     if (type === 'annas_archive') {
         // The key lives in HosterAccount (encrypted), not SystemSetting.
         const account = await prisma.hosterAccount.findFirst({ where: { hoster: 'annas_archive', isActive: true } });
         const key = account?.apiKey ? await decryptSecret(account.apiKey) : "";
-        const result = await testAnnasArchiveKey(key, config.annas_archive_base_url);
+        const result = await testAnnasArchiveKey(key, config.annas_archive_base_url, config.annas_archive_mirrors);
         return NextResponse.json({ success: result.success, message: result.message });
     }
 

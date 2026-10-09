@@ -8,7 +8,10 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import { DiscordNotifier } from './discord';
 import { getErrorMessage } from './utils/error';
-import { HosterEngine } from './hosters';
+import { HosterEngine, type HosterResolveResult } from './hosters';
+import { isMegaLink } from './hosters/mega';
+import { isMegaSessionError } from './hosters/mega-session';
+import { enabledHostersFromSetting } from './getcomics';
 import { decryptSecret } from './encryption';
 import { assertSafeFetchUrl, assertSafeRedirect, isTrustedConfiguredOrigin } from './utils/ssrf';
 import { looksLikeHtmlPage } from './utils/content-sniff';
@@ -92,6 +95,7 @@ export async function qbitAuthHeaders(
 
 export const DownloadService = {
   async addDownload(rawClient: any, downloadUrl: string, title: string, seedTimeLimit: number, seedRatio: number = 0, isManga: boolean = false) {
+    let downloadId: string | undefined;
     // Credentials are encrypted at rest; decrypt into a local copy before use.
     const client = { ...rawClient, pass: await decryptSecret(rawClient.pass), apiKey: await decryptSecret(rawClient.apiKey) };
     const cleanUrl = client.url.replace(/\/$/, '');
@@ -189,6 +193,14 @@ export const DownloadService = {
         }
       }
       else if (client.type === 'sab') {
+          const readJobId = (data: any): string => {
+              const id = data?.nzo_ids?.[0];
+              if (data?.status !== true || typeof id !== 'string' || !id.trim()) {
+                  throw new Error(`SABnzbd rejected the NZB: ${data?.error || 'no job ID returned'}`);
+              }
+              return id;
+          };
+          let result;
           if (fileBuffer) {
               const safeName = (title || "download").replace(/[\\/:*?"<>|]/g, "_").slice(0, 200);
               const form = new FormData();
@@ -200,17 +212,18 @@ export const DownloadService = {
               form.append("name", fileBuffer, { filename: `${safeName}.nzb`, contentType: 'application/x-nzb' });
 
               try {
-                  await axios.post(`${cleanUrl}/api`, form, {
+                  result = await axios.post(`${cleanUrl}/api`, form, {
                       ...baseConfig,
                       headers: { ...baseConfig.headers, ...form.getHeaders() }
                   });
               } catch (e) {
                   Logger.log(`[SABnzbd] addfile failed, falling back to addurl...`, 'warn');
-                  await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
+                  result = await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
               }
           } else {
-              await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
+              result = await axios.get(`${cleanUrl}/api`, { params: { mode: 'addurl', name: downloadUrl, nzbname: title, cat: primaryCategory, apikey: client.apiKey, output: 'json' }, ...baseConfig });
           }
+          downloadId = readJobId(result.data);
       }
       else if (client.type === 'nzbget') {
           const auth = Buffer.from(`${client.user}:${client.pass}`).toString('base64');
@@ -228,7 +241,7 @@ export const DownloadService = {
       }
 
       Logger.log(`[${client.type.toUpperCase()}] SUCCESS: Added ${title}`, 'success');
-      return { success: true };
+      return { success: true, downloadId };
     } catch (error: unknown) {
       Logger.log(`[Download Service] Failed: ${getErrorMessage(error)}`, 'error');
       throw error;
@@ -299,6 +312,12 @@ export const DownloadService = {
           throw new Error("Download aborted: Disk Space is Critically Full (< 2GB).");
       }
 
+      // A fallback to a direct download must no longer resolve the previous SAB job.
+      await prisma.request.update({
+          where: { id: requestId },
+          data: { clientDownloadId: null, downloadClientId: null }
+      });
+
       const { Importer } = await import('./importer');
       
       const extMatch = url.split(/[#?]/)[0].split('.').pop();
@@ -310,15 +329,23 @@ export const DownloadService = {
       let partFilePath = `${filePath}.part`; 
 
       let finalDownloadUrl = url;
+      let resolvedHoster: HosterResolveResult | null = null;
 
       try {
+          // Cron and direct-link retries have no hoster argument. A public MEGA link must
+          // still go through the SDK resolver, including the saved account's session.
+          if (!hoster && isMegaLink(url)) hoster = 'mega';
+          if (hoster === 'mega') {
+              const preference = await prisma.systemSetting.findUnique({ where: { key: 'hoster_priority' } });
+              if (!enabledHostersFromSetting(preference?.value).includes('mega')) {
+                  throw new Error('MEGA downloads are disabled in Settings.');
+              }
+          }
           try {
               if (!fs.existsSync(getComicsFolder)) {
                   fs.mkdirSync(getComicsFolder, { recursive: true });
               }
           } catch (mkdirErr: any) {}
-
-          let resolvedHoster: any = null;
 
           // GetComics links (the direct CDN or the Cloudflare-gated main server) are streamed by the
           // engine, which handles the warm-up/solver; the HosterEngine only resolves third-party
@@ -431,46 +458,56 @@ export const DownloadService = {
           // Only Mega reaches here — every other hoster is streamed by the engine above (which returns
           // or throws before this point). The Mega SDK stream stays in Node because its JS-only SDK
           // can't be driven from the Rust engine.
-          const megaFileNode = resolvedHoster?.megaFileNode;
-          if (!megaFileNode) throw new Error("Mega stream requested but no file node was resolved.");
-
-          const megaStream = megaFileNode.download();
-          const writer = fs.createWriteStream(partFilePath);
-          const totalLength = megaFileNode.size || 0;
-
-          let downloadedBytes = 0;
-          let lastUpdate = 0;
-
-          let stallTimer: NodeJS.Timeout | null = null;
-          const resetStallTimer = () => {
-              if (stallTimer) clearTimeout(stallTimer);
-              stallTimer = setTimeout(() => {
-                  Logger.log(`[Internal DL] Data stream stalled for 45 seconds. Killing connection to trigger retry.`, 'error');
-                  megaStream.destroy(new Error("Download stalled"));
-              }, 45000);
-          };
-
-          resetStallTimer();
-
-          const dataStream = megaStream;
-
-          dataStream.on('data', (chunk: Buffer) => {
-              resetStallTimer(); 
-              downloadedBytes += chunk.length;
-              if (totalLength) {
-                  const percent = Math.round((downloadedBytes / totalLength) * 100);
-                  const now = Date.now();
-                  if (percent % 5 === 0 && now - lastUpdate > 2000) {
-                      lastUpdate = now;
-                      prisma.request.update({ where: { id: requestId }, data: { progress: percent } }).catch(() => {});
+          for (let attempt = 0; attempt < 2; attempt++) {
+              const megaFileNode = resolvedHoster?.megaFileNode;
+              if (!megaFileNode) throw new Error("Mega stream requested but no file node was resolved.");
+              const megaStream = megaFileNode.download({ forceHttps: true });
+              // Each attempt starts a fresh decrypted file; pipeline closes the previous writer.
+              const writer = fs.createWriteStream(partFilePath);
+              const totalLength = megaFileNode.size || 0;
+              let downloadedBytes = 0;
+              let lastUpdate = 0;
+              let stallTimer: NodeJS.Timeout | null = null;
+              const resetStallTimer = () => {
+                  if (stallTimer) clearTimeout(stallTimer);
+                  stallTimer = setTimeout(() => megaStream.destroy(new Error('Download stalled')), 45000);
+              };
+              resetStallTimer();
+              megaStream.on('data', (chunk: Buffer) => {
+                  resetStallTimer();
+                  downloadedBytes += chunk.length;
+                  if (totalLength) {
+                      const percent = Math.round((downloadedBytes / totalLength) * 100);
+                      const now = Date.now();
+                      if (percent % 5 === 0 && now - lastUpdate > 2000) {
+                          lastUpdate = now;
+                          prisma.request.update({ where: { id: requestId }, data: { progress: percent } }).catch(() => {});
+                      }
                   }
+              });
+              try {
+                  await pipeline(megaStream, writer);
+                  break;
+              } catch (error) {
+                  if (isMegaSessionError(error) && resolvedHoster?.invalidateMegaSession) {
+                      resolvedHoster.invalidateMegaSession();
+                      if (attempt === 0) {
+                          if (stallTimer) clearTimeout(stallTimer);
+                          resolvedHoster.release?.();
+                          Logger.log('[Mega] Download session expired; resolving with a fresh login.', 'warn');
+                          resolvedHoster = await HosterEngine.resolveLink(url, 'mega');
+                          if (!resolvedHoster.success) throw new Error(resolvedHoster.error || 'MEGA login failed.');
+                          continue;
+                      }
+                  }
+                  const message = error instanceof Error ? error.message : '';
+                  if (/Bandwidth limit|EOVERQUOTA|\(-17\)/i.test(message)) {
+                      throw new Error('MEGA transfer allowance exhausted. Try another hoster or retry after the allowance resets.');
+                  }
+                  throw new Error(isMegaSessionError(error) ? 'MEGA session expired again. Try the download later.' : 'MEGA download failed. Try again later.');
+              } finally {
+                  if (stallTimer) clearTimeout(stallTimer);
               }
-          });
-
-          try {
-              await pipeline(dataStream, writer);
-          } finally {
-              if (stallTimer) clearTimeout(stallTimer); 
           }
 
           const stats = fs.statSync(partFilePath);
@@ -516,10 +553,12 @@ export const DownloadService = {
           });
           
           throw error;
+      } finally {
+          resolvedHoster?.release?.();
       }
   },
 
-  async getAllActiveDownloads() {
+  async getAllActiveDownloads(trackedIds: string[] = []) {
     const clients = await prisma.downloadClient.findMany();
     if (clients.length === 0) return [];
     
@@ -589,18 +628,44 @@ export const DownloadService = {
             if (queueRes.data.queue?.slots) {
                 const validSlots = queueRes.data.queue.slots.filter((s: any) => isAllowedCategory(s.cat));
                 Logger.log(`[Download Service Debug] [SABnzbd] Fetched ${queueRes.data.queue.slots.length} queue items. ${validSlots.length} matched allowed categories.`, 'debug');
-                downloads.push(...validSlots.map((s: any) => ({ id: s.nzo_id, name: s.filename, progress: s.percentage, status: s.status, clientName: client.name, size: s.size })));
+                downloads.push(...validSlots.map((s: any) => ({ id: s.nzo_id, name: s.filename, progress: s.percentage, status: s.status, clientName: client.name, clientId: client.id, clientType: 'sab', isComplete: false, size: s.size })));
             }
+            const appendHistory = (slots: any[]) => {
+                for (const s of slots) {
+                    // Download progress can reach 100 while repair, extraction, moving, or scripts
+                    // are still running. Only a terminal history entry has a usable final path.
+                    const isComplete = s.status === 'Completed' && !s.loaded;
+                    const item = {
+                        id: s.nzo_id, name: s.name, progress: isComplete ? '100.0' : '0.0',
+                        status: s.status, clientName: client.name, clientId: client.id, clientType: 'sab',
+                        contentPath: typeof s.storage === 'string' ? s.storage.trim() : '',
+                        isComplete, size: s.size
+                    };
+                    const existing = downloads.findIndex(d => d.id === item.id);
+                    if (existing >= 0) downloads[existing] = item;
+                    else downloads.push(item);
+                }
+            };
             try {
                 const historyRes = await axios.get(`${cleanUrl}/api`, { params: { mode: 'history', limit: 20, apikey: client.apiKey, output: 'json' }, headers: baseHeaders, timeout: 15000 });
                 if (historyRes.data.history?.slots) {
                     const validHistory = historyRes.data.history.slots.filter((s: any) => isAllowedCategory(s.category));
                     Logger.log(`[Download Service Debug] [SABnzbd] Fetched ${historyRes.data.history.slots.length} history items. ${validHistory.length} matched allowed categories.`, 'debug');
-                    downloads.push(...validHistory.map((s: any) => ({
-                        id: s.nzo_id, name: s.name, progress: s.status === 'Completed' ? "100.0" : "0.0", status: s.status, clientName: client.name, size: s.size
-                    })));
+                    appendHistory(validHistory);
                 }
-            } catch (e) { }
+                // A busy SAB instance can push a job out of the dashboard's recent history page.
+                // Look up tracked jobs by ID rather than guessing their release name on disk.
+                const missingIds = [...new Set(trackedIds.filter(id => id.startsWith('SABnzbd_nzo_') && !downloads.some(d => d.id === id)))];
+                if (missingIds.length) {
+                    const trackedHistory = await axios.get(`${cleanUrl}/api`, {
+                        params: { mode: 'history', nzo_ids: missingIds.join(','), limit: missingIds.length, apikey: client.apiKey, output: 'json' },
+                        headers: baseHeaders, timeout: 15000
+                    });
+                    appendHistory((trackedHistory.data.history?.slots || []).filter((s: any) => missingIds.includes(s.nzo_id)));
+                }
+            } catch (e) {
+                Logger.log(`[Download Service] Could not read SABnzbd history from "${client.name}": ${getErrorMessage(e)}`, 'warn');
+            }
         }
         else if (client.type === 'nzbget') {
             const auth = Buffer.from(`${client.user}:${client.pass}`).toString('base64');
@@ -624,7 +689,7 @@ export const DownloadService = {
           // the importer/cron lookup fail later as a generic "not found" rather than an auth problem.
           Logger.log(`[Download Service] Could not list active downloads from "${rawClient?.name || 'client'}": ${getErrorMessage(err)}`, 'warn');
       }
-      return downloads;
+      return downloads.map(item => ({ ...item, clientId: client.id, clientType: client.type }));
     }));
     return perClient.flatMap(r => r.status === 'fulfilled' ? r.value : []);
   }

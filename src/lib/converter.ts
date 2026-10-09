@@ -3,6 +3,7 @@ import fs from 'fs-extra';
 import path from 'path';
 import AdmZip from 'adm-zip';
 import sharp from 'sharp';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { Logger } from '@/lib/logger';
 import { prisma } from '@/lib/db';
 import crypto from 'crypto';
@@ -59,6 +60,8 @@ export async function convertCbrToCbz(cbrPath: string): Promise<string | null> {
             const data = await engineRes.json();
             if (data?.path) {
                 Logger.log(`[Converter] Engine converted ${path.basename(cbrPath)} -> ${path.basename(data.path)}`, 'success');
+                // The engine writes the .cbz and removes the .cbr; tell Komga before returning.
+                void recordLibraryChange({ paths: [cbrPath, data.path], reason: 'convert', source: 'converter:engine' });
                 return data.path;
             }
         }
@@ -223,7 +226,10 @@ export async function convertCbrToCbz(cbrPath: string): Promise<string | null> {
         if (fs.existsSync(cbrPath)) {
             await fs.remove(cbrPath);
         }
-        
+        // Emit before the DB repoint below: a throw in findFirst/update would return null from the
+        // catch even though the file has already changed on disk.
+        void recordLibraryChange({ paths: [cbrPath, cbzPath], reason: 'convert', source: 'converter:local' });
+
         const existingIssue = await prisma.issue.findFirst({ where: { filePath: cbrPath } });
         if (existingIssue) {
             await prisma.issue.update({

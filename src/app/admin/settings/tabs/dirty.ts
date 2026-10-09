@@ -13,6 +13,7 @@ export const SETTINGS_TABS = [
     { value: 'downloads', label: 'Downloads' },
     { value: 'discovery', label: 'Discovery & Filtering' },
     { value: 'notifications', label: 'Notifications' },
+    { value: 'media-servers', label: 'Media Servers' },
     { value: 'access', label: 'Access & Security' },
     { value: 'system', label: 'System' },
 ] as const;
@@ -35,7 +36,7 @@ const TAB_CONFIG_KEYS: Record<string, string[]> = {
     downloads: [
         'ddl_enabled', 'allow_bulk_packs', 'prioritize_packs', 'prowlarr_accept_yearless',
         'getcomics_interactive_pages', 'getcomics_automated_pages',
-        'annas_archive_interactive_enabled', 'annas_archive_base_url', 'annas_archive_formats',
+        'annas_archive_interactive_enabled', 'annas_archive_base_url', 'annas_archive_mirrors', 'annas_archive_formats',
         'gc_avoid_large_downloads', 'solver_type', 'flaresolverr_url', 'flaresolverr_timeout',
         'download_retry_delay', 'awaiting_retry_days', 'flag_stalled_requests',
         'usenet_delete_after_import',
@@ -52,6 +53,11 @@ const TAB_CONFIG_KEYS: Record<string, string[]> = {
         'telegram_enabled', 'telegram_bot_token', 'telegram_chat_id', 'telegram_events',
         'apprise_enabled', 'apprise_url', 'apprise_events',
         'smtp_enabled', 'smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass', 'smtp_from',
+    ],
+    // komga_instance_id is server-generated and never edited here, so it stays unmapped.
+    'media-servers': [
+        'komga_enabled', 'komga_url', 'komga_api_key', 'komga_path_mappings',
+        'komga_scan_on_change', 'komga_readlists_enabled',
     ],
     access: [
         'oidc_enabled', 'oidc_issuer', 'oidc_client_id', 'oidc_client_secret',

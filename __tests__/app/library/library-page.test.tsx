@@ -15,13 +15,14 @@
 // its 1 s budget had to cover whole-page renders of 24 then 26 cards (measured 2026-09-29: page 2
 // requested at ~1.05 s, Series 26 on screen at ~2.9 s — slow, never stuck).
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
+const sessionUser = vi.hoisted(() => ({ id: 'admin_1', role: 'ADMIN', canRequest: false }));
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
 vi.mock('next-auth/react', () => ({
-    useSession: () => ({ data: { user: { id: 'admin_1', role: 'ADMIN' } }, status: 'authenticated' }),
+    useSession: () => ({ data: { user: sessionUser }, status: 'authenticated' }),
 }));
 vi.mock('next/navigation', () => ({
     useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
@@ -58,6 +59,8 @@ let listCalls: string[] = [];
 describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_000 }, () => {
     beforeEach(() => {
         listCalls = [];
+        sessionUser.role = 'ADMIN';
+        sessionUser.canRequest = false;
         toast.mockClear();
         localStorage.clear();
         vi.stubGlobal('IntersectionObserver', class {
@@ -71,6 +74,8 @@ describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_
         stubFetchRouter([
             ['/api/library/follow', () => ok({ seriesIds: [] })],
             ['/api/reading-lists', () => ok([])],
+            ['/api/issue-details', () => ok({ id: 12345, name: 'New Series', year: '2024', publisher: 'DC' })],
+            ['/api/request', () => ok({ success: true })],
             ['/api/library?', (u) => {
                 const params = new URL(u, 'http://localhost').searchParams;
                 if (params.get('namesOnly')) return ok({ names: [] });
@@ -111,5 +116,36 @@ describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_
         // Series 24 arrived in BOTH windows (the pg tie-order overlap shape); one card, not two.
         expect(screen.getAllByText('Series 24')).toHaveLength(1);
         expect(screen.getAllByText(/^Series \d\d$/)).toHaveLength(26); // 24 + 2 fresh, no dupes
+    });
+
+    it('adds a series by ID from the library toolbar and reloads the library', async () => {
+        const fetchMock = vi.mocked(globalThis.fetch);
+        render(<LibraryPage />);
+        await screen.findByText('Series 26');
+        const callsBefore = listCalls.length;
+        fireEvent.click(screen.getByRole('button', { name: 'Add by ID' }));
+        fireEvent.change(screen.getByLabelText('Volume ID'), { target: { value: '12345' } });
+        fireEvent.click(screen.getByRole('button', { name: 'Look up ID' }));
+        await screen.findByText('New Series');
+        fireEvent.click(screen.getByRole('button', { name: 'Add to Library' }));
+        await waitFor(() => expect(listCalls.length).toBeGreaterThan(callsBefore));
+        expect(listCalls[callsBefore]).toContain('page=1');
+        expect(listCalls[callsBefore]).not.toContain('refresh=true');
+        expect(fetchMock).toHaveBeenCalledWith('/api/request', expect.objectContaining({ method: 'POST' }));
+    });
+
+    it('hides Add by ID from users without request permission', async () => {
+        sessionUser.role = 'USER';
+        render(<LibraryPage />);
+        await screen.findByText('Series 26');
+        expect(screen.queryByRole('button', { name: 'Add by ID' })).toBeNull();
+    });
+
+    it('offers Add by ID to users with request permission', async () => {
+        sessionUser.role = 'USER';
+        sessionUser.canRequest = true;
+        render(<LibraryPage />);
+        await screen.findByText('Series 26');
+        expect(screen.getByRole('button', { name: 'Add by ID' })).toBeTruthy();
     });
 });

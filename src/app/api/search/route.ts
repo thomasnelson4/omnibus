@@ -28,11 +28,11 @@ export async function GET(request: Request) {
   }
 
   // --- SMART SEARCH: Extract Year and Clean Query ---
-  const yearMatch = rawQuery.match(/\b(19\d{2}|20\d{2})\b/);
+  const yearMatch = rawQuery.match(/[([{]\s*((?:19|20)\d{2})(?:\s*[-–]\s*(?:19|20)\d{2})?\s*[)\]}]/);
   const reqYear = yearMatch ? yearMatch[1] : null;
   
   // Updated to strip (), [], and {}
-  const query = rawQuery.replace(/\s*[\(\[\{]?(19\d{2}|20\d{2})[\)\]\}]?\s*/g, ' ').trim() || rawQuery;
+  const query = rawQuery.replace(/[([{]\s*((?:19|20)\d{2})(?:\s*[-–]\s*(?:19|20)\d{2})?\s*[)\]}]/g, ' ').trim() || rawQuery;
 
   try {
     const settings = await prisma.systemSetting.findMany({
@@ -52,7 +52,7 @@ export async function GET(request: Request) {
         try {
             const parsed = JSON.parse(cachedData.value);
             // Cache manual searches for 12 hours
-            if (Date.now() - parsed.timestamp < 12 * 60 * 60 * 1000) { 
+            if (Date.now() - parsed.timestamp < 12 * 60 * 60 * 1000 && parsed.publisherFilter === (config.filter_foreign_publishers || '')) {
                 return NextResponse.json({ results: parsed.results, hasMore: parsed.hasMore });
             }
         } catch (e) {}
@@ -160,8 +160,8 @@ export async function GET(request: Request) {
     if (cacheable) {
         await prisma.systemSetting.upsert({
             where: { key: cacheKey },
-            update: { value: JSON.stringify({ timestamp: Date.now(), results: finalResults, hasMore }) },
-            create: { key: cacheKey, value: JSON.stringify({ timestamp: Date.now(), results: finalResults, hasMore }) }
+            update: { value: JSON.stringify({ timestamp: Date.now(), results: finalResults, hasMore, publisherFilter: config.filter_foreign_publishers || '' }) },
+            create: { key: cacheKey, value: JSON.stringify({ timestamp: Date.now(), results: finalResults, hasMore, publisherFilter: config.filter_foreign_publishers || '' }) }
         });
     }
 

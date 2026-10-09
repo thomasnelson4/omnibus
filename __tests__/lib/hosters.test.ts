@@ -6,16 +6,47 @@ import { loggerLog } from '../helpers/setup-global';
 // 1. Hoist the mocks
 const mocks = vi.hoisted(() => ({
     findFirstHoster: vi.fn(),
-    log: vi.fn()
+    log: vi.fn(),
+    decrypt: vi.fn(async value => value),
+    resolveMega: vi.fn(),
+    findMirrorSettings: vi.fn().mockResolvedValue([]),
 }));
 
 // 2. Mock Axios and Database
 vi.mock('axios');
+vi.mock('@/lib/encryption', () => ({ decryptSecret: mocks.decrypt }));
+vi.mock('@/lib/hosters/mega', () => ({ resolveMega: mocks.resolveMega }));
 vi.mock('@/lib/db', () => ({
-    prisma: { hosterAccount: { findFirst: mocks.findFirstHoster } }
+    prisma: {
+        hosterAccount: { findFirst: mocks.findFirstHoster },
+        systemSetting: { findMany: mocks.findMirrorSettings },
+    }
 }));
 
 describe('Download Pipeline: Hoster Engine', () => {
+
+    it('decrypts the saved MEGA password without mutating the stored account', async () => {
+        const saved = { id: 'mega-1', username: 'reader@example.com', password: 'enc:password', apiKey: 'unused-legacy-key', isActive: true };
+        mocks.findFirstHoster.mockResolvedValueOnce(saved);
+        mocks.decrypt.mockResolvedValueOnce('password');
+        mocks.resolveMega.mockResolvedValueOnce({ success: true, isMegaStream: true });
+        await HosterEngine.resolveLink('https://mega.nz/file/id#key', 'mega');
+        expect(mocks.findFirstHoster).toHaveBeenCalledWith({
+            where: { hoster: 'mega', isActive: true }, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+        });
+        expect(mocks.resolveMega).toHaveBeenCalledWith('https://mega.nz/file/id#key', expect.objectContaining({ password: 'password', apiKey: null }));
+        expect(saved.password).toBe('enc:password');
+    });
+
+    it('contains an unreadable MEGA password without exposing its error details', async () => {
+        mocks.findFirstHoster.mockResolvedValueOnce({ id: 'mega-1', password: 'enc:password' });
+        mocks.decrypt.mockRejectedValueOnce(new Error('private-password'));
+        const result = await HosterEngine.resolveLink('https://mega.nz/file/id#key', 'mega');
+        expect(result.success).toBe(false);
+        expect(result.error).toContain('Re-enter');
+        expect(JSON.stringify([result, loggerLog.mock.calls])).not.toContain('private-password');
+        expect(mocks.resolveMega).not.toHaveBeenCalled();
+    });
 
     it('should resolve Pixeldrain links, attach Premium API headers, and trace debug logs', async () => {
         mocks.findFirstHoster.mockResolvedValueOnce({ apiKey: 'premium_key_123', isActive: true });
@@ -53,6 +84,7 @@ describe('Download Pipeline: Hoster Engine', () => {
         mocks.findFirstHoster.mockResolvedValueOnce({ apiKey: 'anna_key_123', isActive: true });
         
         vi.mocked(axios.get).mockResolvedValueOnce({
+            status: 200,
             data: { download_url: 'https://fast.annas-archive.org/file.cbz' }
         } as any);
 
@@ -60,5 +92,18 @@ describe('Download Pipeline: Hoster Engine', () => {
 
         expect(result.success).toBe(true);
         expect(result.directUrl).toBe('https://fast.annas-archive.org/file.cbz');
+    });
+
+    it('loads saved fallback mirrors when resolving an unavailable Anna\'s Archive link', async () => {
+        mocks.findFirstHoster.mockResolvedValueOnce({ apiKey: 'test-key', isActive: true });
+        mocks.findMirrorSettings.mockResolvedValueOnce([
+            { key: 'annas_archive_base_url', value: 'https://old.example' },
+            { key: 'annas_archive_mirrors', value: 'https://fallback.example' },
+        ]);
+        vi.mocked(axios.get).mockRejectedValueOnce(new Error('ENOTFOUND'))
+            .mockResolvedValueOnce({ status: 200, data: { download_url: 'https://files.example/book.cbz' } } as any);
+        const result = await HosterEngine.resolveLink('https://old.example/md5/0123456789abcdef0123456789abcdef', 'annas_archive');
+        expect(result).toEqual({ success: true, directUrl: 'https://files.example/book.cbz' });
+        expect(axios.get).toHaveBeenNthCalledWith(2, 'https://fallback.example/dyn/api/fast_download.json', expect.any(Object));
     });
 });

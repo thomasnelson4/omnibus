@@ -19,5 +19,15 @@ export async function register() {
         // Initialize BullMQ Worker
         const { initWorker } = await import('./lib/queue');
         initWorker();
+
+        // Komga's own worker on its own queue, started AFTER initWorker() so the main queue is up
+        // first. Both are idempotent and neither may throw into boot.
+        try {
+            const { initKomgaWorker } = await import('./lib/komga/worker');
+            initKomgaWorker();
+        } catch (e) {
+            const { Logger } = await import('./lib/logger');
+            Logger.log(`[Komga] worker could not be started at boot: ${e instanceof Error ? e.message : String(e)}`, 'warn');
+        }
     }
 }

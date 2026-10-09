@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { POST } from '@/app/api/admin/config/route';
 import { loggerLog, auditLog } from '../helpers/setup-global';
+import { encryptSecret } from '@/lib/encryption';
 
 // Settings-save response contract (2026-07-28 field repro on the dev box): once the settings
 // transaction commits, NOTHING after it may stall or fail the response. With Redis down, the old
@@ -16,6 +17,8 @@ const mocks = vi.hoisted(() => ({
     auditLog: vi.fn(),
     syncSchedules: vi.fn(),
     log: vi.fn(),
+    keyTest: vi.fn(),
+    hosterFindFirst: vi.fn(),
 }));
 
 vi.mock('next-auth/next', () => ({ getServerSession: mocks.getServerSession }));
@@ -23,6 +26,7 @@ vi.mock('next-auth/next', () => ({ getServerSession: mocks.getServerSession }));
 vi.mock('@/lib/db', () => ({
     prisma: {
         systemSetting: { findUnique: mocks.settingFindUnique },
+        hosterAccount: { findFirst: mocks.hosterFindFirst },
         $transaction: mocks.transaction,
     }
 }));
@@ -33,7 +37,7 @@ vi.mock('@/lib/encryption', () => ({
     encryptSecret: vi.fn(async (v: string) => v),
     decryptSecret: vi.fn(async (v: string) => v),
 }));
-vi.mock('@/lib/annas-test', () => ({ testAnnasArchiveKey: vi.fn() }));
+vi.mock('@/lib/annas-test', () => ({ testAnnasArchiveKey: mocks.keyTest }));
 
 const mockReq = (body: any) => ({
     json: async () => body,
@@ -87,5 +91,60 @@ describe('Settings save: the response never waits on (or fails from) post-commit
         expect(res.status).toBe(200);
         expect(mocks.settingUpsert).toHaveBeenCalled();
         expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('audit table locked'), 'error');
+    });
+
+    it.each([
+        { username: 'reader@example.com', password: '' },
+        { username: '', password: 'password' },
+        { username: 42, password: 'password' },
+    ])('rejects incomplete or malformed active MEGA credentials before saving (%j)', async fields => {
+        const response = await POST(mockReq({ hosterAccounts: [{ id: 'mega-1', hoster: 'mega', ...fields }] }));
+        expect(response.status).toBe(400);
+        expect(mocks.transaction).not.toHaveBeenCalled();
+    });
+
+    it('encrypts a new MEGA password before persisting it', async () => {
+        const upsert = vi.fn();
+        mocks.transaction.mockImplementationOnce(async fn => fn({ hosterAccount: { findMany: vi.fn().mockResolvedValue([]), upsert } }));
+        vi.mocked(encryptSecret).mockResolvedValueOnce('enc:v2:encrypted-password');
+        const response = await POST(mockReq({ hosterAccounts: [{ id: 'mega-1', hoster: 'mega', username: 'reader@example.com', password: 'password' }] }));
+        expect(response.status).toBe(200);
+        expect(upsert).toHaveBeenCalledWith(expect.objectContaining({ update: expect.objectContaining({ password: 'enc:v2:encrypted-password' }) }));
+    });
+
+    it('preserves masked passwords and allows explicit clearing to anonymous mode', async () => {
+        for (const fields of [{ username: 'reader@example.com', password: '********' }, { username: '', password: '' }]) {
+            const upsert = vi.fn();
+            mocks.transaction.mockImplementationOnce(async fn => fn({ hosterAccount: { findMany: vi.fn().mockResolvedValue([]), upsert } }));
+            const response = await POST(mockReq({ hosterAccounts: [{ id: 'mega-1', hoster: 'mega', ...fields }] }));
+            expect(response.status).toBe(200);
+            const update = upsert.mock.calls[0][0].update;
+            if (fields.password) expect(update).not.toHaveProperty('password');
+            else expect(update.password).toBe('');
+        }
+    });
+
+    it('saves normalized fallback mirrors and passes them to the automation connection test', async () => {
+        mocks.hosterFindFirst.mockResolvedValueOnce({ apiKey: 'test-key' });
+        mocks.keyTest.mockResolvedValueOnce({ success: true });
+        const res = await POST(mockReq({ settings: {
+            annas_archive_base_url: 'https://PRIMARY.example/',
+            annas_archive_mirrors: ' https://one.example/\r\nhttps://two.example,https://one.example',
+            search_source_priority: JSON.stringify([{ source: 'annas_archive', enabled: true }]),
+        } }));
+        expect(res.status).toBe(200);
+        expect(mocks.keyTest).toHaveBeenCalledWith('test-key', 'https://primary.example', 'https://one.example\nhttps://two.example');
+        expect(mocks.settingUpsert).toHaveBeenCalledWith(expect.objectContaining({
+            where: { key: 'annas_archive_mirrors' },
+            update: { value: 'https://one.example\nhttps://two.example' },
+        }));
+    });
+
+    it('rejects invalid mirror configuration before saving or making API calls', async () => {
+        const res = await POST(mockReq({ settings: { annas_archive_mirrors: 'ftp://invalid.example' } }));
+        expect(res.status).toBe(400);
+        expect((await res.json()).error).toContain("Invalid Anna's Archive mirror URL");
+        expect(mocks.transaction).not.toHaveBeenCalled();
+        expect(mocks.keyTest).not.toHaveBeenCalled();
     });
 });

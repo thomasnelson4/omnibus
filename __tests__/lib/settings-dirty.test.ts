@@ -2,7 +2,7 @@
 //
 // Settings reorganization Phase 2: per-tab dirty tracking. computeDirtyTabs compares the current
 // and initial state snapshots (the same object shape the page's unsaved-changes hash uses) and
-// returns which of the 8 tabs own the changed keys/collections — driving the amber dot on each
+// returns which of the 9 tabs own the changed keys/collections — driving the amber dot on each
 // tab trigger. Keys the settings page doesn't own (e.g. the Jobs page's *_schedule keys, which
 // ride along in the config bag) must never light a dot.
 import { describe, it, expect } from 'vitest';
@@ -37,10 +37,34 @@ describe('lib: settings per-tab dirty tracking', () => {
         expect(computeDirtyTabs(withConfig({ manga_publishers: 'viz' }), withConfig({}))).toEqual(['discovery']);
         expect(computeDirtyTabs(withConfig({ engine_cpu_cap: '4' }), withConfig({}))).toEqual(['system']);
         expect(computeDirtyTabs(withConfig({ flaresolverr_url: 'http://x' }), withConfig({}))).toEqual(['downloads']);
+        expect(computeDirtyTabs(withConfig({ annas_archive_mirrors: 'https://mirror.example' }), withConfig({}))).toEqual(['downloads']);
         expect(computeDirtyTabs(withConfig({ oidc_enabled: 'true' }), withConfig({}))).toEqual(['access']);
         expect(computeDirtyTabs(withConfig({ smtp_host: 'smtp.x' }), withConfig({}))).toEqual(['notifications']);
         expect(computeDirtyTabs(withConfig({ folder_naming_pattern: '{Series}' }), withConfig({}))).toEqual(['library']);
         expect(computeDirtyTabs(withConfig({ prowlarr_url: 'http://p' }), withConfig({}))).toEqual(['search']);
+    });
+
+    it('maps every editable Komga key to the Media Servers tab', () => {
+        const before = {
+            komga_enabled: 'false', komga_url: '', komga_api_key: '', komga_path_mappings: '[]',
+            komga_scan_on_change: 'true', komga_readlists_enabled: 'false',
+        };
+        const after: Record<string, string> = {
+            komga_enabled: 'true', komga_url: 'http://komga:25600', komga_api_key: 'k',
+            komga_path_mappings: '[{"omnibus":"/data/comics","komga":"/comics"}]',
+            komga_scan_on_change: 'false', komga_readlists_enabled: 'true',
+        };
+        for (const [key, value] of Object.entries(after)) {
+            expect(computeDirtyTabs(withConfig({ ...before, [key]: value }), withConfig(before))).toEqual(['media-servers']);
+        }
+    });
+
+    it('never lights a dot for the server-generated komga_instance_id', () => {
+        expect(computeDirtyTabs(withConfig({ komga_instance_id: 'b' }), withConfig({ komga_instance_id: 'a' }))).toEqual([]);
+    });
+
+    it('treats an edited-then-reverted path-mapping list as clean', () => {
+        expect(computeDirtyTabs(withConfig({ komga_path_mappings: '[]' }), withConfig({ komga_path_mappings: '[]' }))).toEqual([]);
     });
 
     it('maps collection changes to their owning tab', () => {
@@ -71,9 +95,9 @@ describe('lib: settings per-tab dirty tracking', () => {
     });
 
     it('reports multiple dirty tabs in stable tab order', () => {
-        const cur = withConfig({ engine_cpu_cap: '4', cv_api_key: 'new' });
+        const cur = withConfig({ engine_cpu_cap: '4', cv_api_key: 'new', komga_url: 'http://k', oidc_enabled: 'true' });
         cur.configuredWebhooks = [{ id: 'w1' }];
         const init = withConfig({ cv_api_key: 'old' });
-        expect(computeDirtyTabs(cur, init)).toEqual(['metadata', 'notifications', 'system']);
+        expect(computeDirtyTabs(cur, init)).toEqual(['metadata', 'notifications', 'media-servers', 'access', 'system']);
     });
 });

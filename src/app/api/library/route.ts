@@ -13,6 +13,8 @@ import { parseComicInfo } from '@/lib/metadata-extractor';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
+import { recordLibraryChange } from '@/lib/komga/changes';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 import { LibraryScanner } from '@/lib/library-scanner';
 import { getAccessibleLibraryIds } from '@/lib/library-access';
 
@@ -72,10 +74,12 @@ export async function GET(request: Request) {
             select: { volumeId: true }
         });
         if (Array.isArray(reqs)) pendingRequests = reqs;
-    } catch (e) {}
-    
+    } catch (e) {
+        // Pre-existing behaviour (from main): a malformed pending-requests blob is ignored.
+        Logger.log(`[Library] Could not read pending volume requests: ${getErrorMessage(e)}`, 'debug');
+    }
+
     const pendingVolIdsList = pendingRequests.map(r => r.volumeId);
-    const pendingVolIds = new Set<string>(pendingVolIdsList);
 
     const where: any = { AND: [] };
 
@@ -290,7 +294,10 @@ export async function GET(request: Request) {
         try {
             const pubs = await prisma.series.findMany({ select: { publisher: true }, distinct: ['publisher'] });
             if (Array.isArray(pubs)) publishersRaw = pubs;
-        } catch(e) {}
+        } catch(e) {
+            // Pre-existing behaviour (from main): fall back to the cached/raw value on failure.
+            Logger.log(`[Library] Could not load the publisher list: ${getErrorMessage(e)}`, 'debug');
+        }
     }
 
     const formatted = dbSeries.map(s => {
@@ -407,6 +414,8 @@ export async function POST(request: Request) {
             await prisma.readingListItem.deleteMany({
                 where: { listId, issueId: { in: issueIds } }
             });
+            // Removing series from a list removes books from the pushed read list too.
+            triggerReadListPushSoon(listId);
             return NextResponse.json({ success: true });
         }
 
@@ -480,6 +489,10 @@ export async function DELETE(request: Request) {
                     await fs.remove(series.folderPath);
                     deletedPaths.push(series.folderPath);
                 }
+            }
+            // Paths only: the rows are deleted below, so the series ids would not resolve.
+            if (deletedPaths.length) {
+                void recordLibraryChange({ paths: deletedPaths, reason: 'series-delete', source: 'api/library:DELETE' });
             }
         }
 

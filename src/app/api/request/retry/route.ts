@@ -132,7 +132,7 @@ export async function POST(request: NextRequest) {
         }
 
         // 2. Standard direct link retry (for non-GetComics links)
-        if (req.downloadLink && req.downloadLink.startsWith('http') && !req.downloadLink.includes('getcomics.org')) {
+        if (!req.clientDownloadId && req.downloadLink && req.downloadLink.startsWith('http') && !req.downloadLink.includes('getcomics.org')) {
             await prisma.request.update({
                 where: { id },
                 data: { status: 'DOWNLOADING', retryCount: 0, progress: 0, activeDownloadName: safeTitle, failedLinks: "[]" }

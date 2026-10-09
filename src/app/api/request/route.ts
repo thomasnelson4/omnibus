@@ -674,20 +674,21 @@ export async function DELETE(request: NextRequest) {
 
     // --- NEW: ABORT ACTIVE DOWNLOAD CLIENT JOBS ---
     // If the download was handed off to qBittorrent/SABnzbd/etc., hunt it down and delete it
-    if (reqRecord.status === 'DOWNLOADING' && reqRecord.downloadLink && !reqRecord.downloadLink.startsWith('http')) {
+    const clientJobId = reqRecord.clientDownloadId || (reqRecord.downloadLink && !reqRecord.downloadLink.startsWith('http') ? reqRecord.downloadLink : null);
+    if (reqRecord.status === 'DOWNLOADING' && clientJobId) {
         try {
             const { DownloadService } = await import('@/lib/download-clients');
-            const activeDownloads = await DownloadService.getAllActiveDownloads();
+            const activeDownloads = await DownloadService.getAllActiveDownloads([clientJobId]);
             
             // Match via Hash (or fallback to Name)
-            const activeJob = activeDownloads.find((d: any) => 
-                d.id.toLowerCase() === reqRecord.downloadLink?.toLowerCase() || 
-                d.name === reqRecord.activeDownloadName
-            );
+            const sameClient = (d: any) => !reqRecord.downloadClientId || d.clientId === reqRecord.downloadClientId;
+            const activeJob = activeDownloads.find((d: any) => sameClient(d) && d.id.toLowerCase() === clientJobId.toLowerCase())
+                || (!reqRecord.clientDownloadId && !clientJobId.startsWith('SABnzbd_nzo_')
+                    ? activeDownloads.find((d: any) => sameClient(d) && d.name === reqRecord.activeDownloadName) : undefined);
             
             if (activeJob) {
                 const clientConfig = await prisma.downloadClient.findFirst({
-                    where: { name: activeJob.clientName }
+                    where: activeJob.clientId ? { id: activeJob.clientId } : { name: activeJob.clientName }
                 });
                 
                 if (clientConfig) {

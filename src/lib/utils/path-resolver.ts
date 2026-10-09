@@ -4,6 +4,26 @@ import path from 'path';
 import { Logger } from '../logger';
 import { getErrorMessage } from './error';
 
+function mapPath(remotePath: string, remoteRoot: string, localRoot: string): string | null {
+  const input = remotePath.replace(/\\/g, '/');
+  const remote = remoteRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+  const local = localRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+  // Match a directory boundary, not a sibling such as /downloads-other.
+  if (input !== remote && !input.startsWith(remote + '/')) return null;
+  return path.normalize(local + input.slice(remote.length));
+}
+
+/** Translate a client-reported destination using its own mapping, then the global mappings. */
+export async function resolveClientPath(remotePath: string, client: {
+  remotePath?: string | null; localPath?: string | null;
+}): Promise<string> {
+  if (client.remotePath && client.localPath) {
+    const mapped = mapPath(remotePath, client.remotePath, client.localPath);
+    if (mapped !== null) return mapped;
+  }
+  return resolveRemotePath(remotePath);
+}
+
 /**
  * Automatically translates a path from a Download Client to a Local Path
  * based on the "Remote Path Mapping" settings in the database.
@@ -48,8 +68,8 @@ export async function resolveRemotePath(remotePath: string): Promise<string> {
       Logger.log(`[Path Resolver Debug] Evaluating Rule: Remote "${normalizedRemote}" -> Local "${normalizedLocal}" against input "${normalizedInput}"`, 'debug');
 
       // 4. Perform "Search and Replace"
-      if (normalizedInput.startsWith(normalizedRemote)) {
-        const resolved = normalizedInput.replace(normalizedRemote, normalizedLocal);
+      const resolved = mapPath(normalizedInput, normalizedRemote, normalizedLocal);
+      if (resolved !== null) {
         
         // 5. Final Pass: Use path.normalize to match the Host OS (\ for Windows, / for Linux)
         const finalPath = path.normalize(resolved);

@@ -327,7 +327,7 @@ export function initWorker() {
                                 Logger.log(`[BullMQ] No auto-download client for ${name}. Holding GetComics link for manual download.`, 'warn');
                                 await prisma.request.update({
                                     where: { id: requestId },
-                                    data: { status: 'MANUAL_DDL', downloadLink: resultData.manual_ddl.url, activeDownloadName: resultData.manual_ddl.name || name }
+                                    data: { status: 'MANUAL_DDL', downloadLink: resultData.manual_ddl.url, clientDownloadId: null, downloadClientId: null, activeDownloadName: resultData.manual_ddl.name || name }
                                 });
                                 break;
                             }
@@ -400,7 +400,7 @@ export function initWorker() {
                             });
                             if (duplicateDownload) {
                                 Logger.log(`[BullMQ] Batch pack already downloading/downloaded (${candidates[0].url}). Queuing ${name} for batch extraction.`, 'info');
-                                await prisma.request.update({ where: { id: requestId }, data: { status: 'DOWNLOADING', activeDownloadName: safeTitle, downloadLink: candidates[0].url } });
+                                await prisma.request.update({ where: { id: requestId }, data: { status: 'DOWNLOADING', activeDownloadName: safeTitle, downloadLink: candidates[0].url, clientDownloadId: null, downloadClientId: null } });
                                 break;
                             }
 
@@ -411,7 +411,7 @@ export function initWorker() {
                                 for (const cand of candidates) {
                                     await prisma.request.update({
                                         where: { id: requestId },
-                                        data: { status: 'DOWNLOADING', progress: 0, activeDownloadName: safeTitle, downloadLink: cand.url }
+                                        data: { status: 'DOWNLOADING', progress: 0, activeDownloadName: safeTitle, downloadLink: cand.url, clientDownloadId: null, downloadClientId: null }
                                     });
                                     let ok = false;
                                     try {
@@ -433,7 +433,7 @@ export function initWorker() {
                                 // holds the latter as MANUAL_DDL; this keeps the log accurate + is a backstop).
                                 const manualHold = candidates.find(c => /getcomics\.org\/dls\//i.test(c.url) || /\/md5\/[a-f0-9]{32}/i.test(c.url));
                                 if (manualHold) {
-                                    await prisma.request.update({ where: { id: requestId }, data: { status: 'MANUAL_DDL', downloadLink: manualHold.url, activeDownloadName: safeTitle } });
+                                    await prisma.request.update({ where: { id: requestId }, data: { status: 'MANUAL_DDL', downloadLink: manualHold.url, clientDownloadId: null, downloadClientId: null, activeDownloadName: safeTitle } });
                                     Logger.log(`[BullMQ] All hosters failed for ${name}; holding link for manual download.`, 'warn');
                                 } else {
                                     // Without this write the request stayed DOWNLOADING forever — invisible to
@@ -469,7 +469,7 @@ export function initWorker() {
                                 Logger.log(`[BullMQ] Release already sent to the download client by another request (${bestMatch.title}). Parking ${name} against it instead of re-downloading.`, 'info');
                                 await prisma.request.update({
                                     where: { id: requestId },
-                                    data: { status: 'DOWNLOADING', activeDownloadName: bestMatch.title, downloadLink: trackingHash, indexer: bestMatch.indexer }
+                                    data: { status: 'DOWNLOADING', activeDownloadName: bestMatch.title, downloadLink: trackingHash, clientDownloadId: duplicateExternal.clientDownloadId, downloadClientId: duplicateExternal.downloadClientId, indexer: bestMatch.indexer }
                                 });
                                 break;
                             }
@@ -477,11 +477,11 @@ export function initWorker() {
                             Logger.log(`[BullMQ] Routing ${bestMatch.protocol.toUpperCase()} release to external client: ${clientConfig.name}`, 'info');
 
                             // File manga under its own category/label in the client (manga → second configured category).
-                            await DownloadService.addDownload(clientConfig, bestMatch.downloadUrl, bestMatch.title, 0, 0, isManga || false);
+                            const submission = await DownloadService.addDownload(clientConfig, bestMatch.downloadUrl, bestMatch.title, 0, 0, isManga || false);
 
                             await prisma.request.update({
                                 where: { id: requestId },
-                                data: { status: 'DOWNLOADING', activeDownloadName: bestMatch.title, downloadLink: trackingHash, indexer: bestMatch.indexer }
+                                data: { status: 'DOWNLOADING', activeDownloadName: bestMatch.title, downloadLink: trackingHash, clientDownloadId: submission?.downloadId || null, downloadClientId: clientConfig.id, indexer: bestMatch.indexer }
                             });
                         }
 
@@ -528,7 +528,9 @@ export function initWorker() {
                             where: { 
                                 OR: [
                                     { key: { startsWith: 'cv_details_cache_' } },
-                                    { key: { startsWith: 'meta_details_' } }
+                                    { key: { startsWith: 'meta_details_' } },
+                                    { key: { startsWith: 'search_v3_' } },
+                                    { key: { startsWith: 'smart_match_v1_' } }
                                 ]
                             }
                         });
@@ -536,7 +538,9 @@ export function initWorker() {
                         for (const cache of oldCacheSettings) {
                             try {
                                 const parsed = JSON.parse(cache.value);
-                                if (Date.now() - parsed.timestamp > 24 * 60 * 60 * 1000) {
+                                const expired = cache.key.startsWith('smart_match_v1_') ? !parsed.expiresAt || parsed.expiresAt <= Date.now()
+                                    : Date.now() - parsed.timestamp > (cache.key.startsWith('search_v3_') ? 12 : 24) * 60 * 60 * 1000;
+                                if (expired) {
                                     await prisma.systemSetting.delete({ where: { key: cache.key } });
                                     dbDeletedCount++;
                                 }
@@ -1025,9 +1029,10 @@ export function initWorker() {
                             updatedAt: { lt: awaitingCutoff },
                             OR: [{ snoozedUntil: null }, { snoozedUntil: { lt: nowTs } }]
                         },
-                        select: { id: true, volumeId: true, activeDownloadName: true, status: true, retryCount: true, downloadLink: true }
+                        select: { id: true, volumeId: true, activeDownloadName: true, status: true, retryCount: true, downloadLink: true, clientDownloadId: true }
                     })).filter(r =>
                         r.status !== 'STALLED'
+                        || !!r.clientDownloadId
                         || (r.retryCount || 0) >= 3
                         || !(r.downloadLink || '').startsWith('http')
                     );

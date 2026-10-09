@@ -7,6 +7,7 @@ import { SystemNotifier } from '@/lib/notifications';
 import { Logger } from '@/lib/logger';
 import { AuditLogger } from '@/lib/audit-logger';
 import { setUserLibraryAccess, grantAllLibraries, getDefaultLibraryIds } from '@/lib/library-access';
+import { enqueueKomgaReadListDeleteNow } from '@/lib/komga/readlist-trigger';
 import { TIER_ALL_LIBRARIES, type TierName } from '@/lib/permission-tiers';
 
 export async function GET(req: NextRequest) {
@@ -122,13 +123,26 @@ export async function DELETE(req: NextRequest) {
         return NextResponse.json({ error: "You cannot delete your own account." }, { status: 400 });
     }
 
+// Komga: deleting a user CASCADES to their reading lists (ReadingList.userId onDelete: Cascade),
+    // which cascades to KomgaReadListLink. Read the links first and hand each Komga id to the delete
+    // job — the job re-checks the ownership marker, so a list that was never pushed costs nothing.
+    const ownedLinks = await prisma.komgaReadListLink.findMany({
+      where: { readingList: { userId: id } },
+      select: { readingListId: true, komgaReadListId: true },
+    });
     await prisma.request.deleteMany({
-        where: { userId: id }
+      where: { userId: id }
     });
 
     await prisma.user.delete({
       where: { id }
     });
+
+    // AFTER the cascade, from the ids captured above. The job re-checks the ownership marker, and
+    // stands down if the list was taken over by a replacement in the meantime.
+    for (const link of ownedLinks) {
+      if (link.komgaReadListId) enqueueKomgaReadListDeleteNow(link.komgaReadListId, link.readingListId);
+    }
 
     await AuditLogger.log('DELETE_USER', { userId: id }, token.id as string);
 

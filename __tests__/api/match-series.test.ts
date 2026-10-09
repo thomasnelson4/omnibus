@@ -27,7 +27,16 @@ const mocks = vi.hoisted(() => ({
     deleteSeries: vi.fn(),
     transaction: vi.fn(),
     safeRelocateFolder: vi.fn(),
-    moveFileSafe: vi.fn()
+    moveFileSafe: vi.fn(),
+    assertAutomatic: vi.fn(),
+    revalidateAutomatic: vi.fn(),
+}));
+
+// The server-owned Smart Match decision guard. Manual (reviewed) payloads must never consult it;
+// automatic payloads are verified at entry and re-checked right before each write.
+vi.mock('@/lib/smart-match/service', () => ({
+    assertAutomaticMatch: mocks.assertAutomatic,
+    revalidateAutomaticMatch: mocks.revalidateAutomatic,
 }));
 
 // 2. Mock Server Dependencies
@@ -193,6 +202,88 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(mocks.createSeries).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ metadataSource: 'METRON', name: 'Batman (Metron)', year: 2020 })
         }));
+    });
+
+    it.each([
+        { label: 'all moved siblings', files: ['/unmatched/X/001.cbz', '/unmatched/X/002.cbz'], conflicts: [], expected: ['issue_0', 'issue_1'] },
+        { label: 'a neighboring prefix folder', files: ['/unmatched/X/001.cbz', '/unmatched/X (2016)/002.cbz'], conflicts: [], expected: ['issue_0'] },
+        { label: 'a conflict file left at source', files: ['/unmatched/X/001.cbz', '/unmatched/X/002.cbz'], conflicts: ['/unmatched/X/002.cbz'], expected: ['issue_0'] },
+        { label: 'backslash paths', files: ['\\unmatched\\X\\001.cbz'], conflicts: [], expected: ['issue_0'] },
+    ])('repoints only physically moved files: $label', async ({ files, conflicts, expected }) => {
+        mocks.findManySettings.mockResolvedValue([{ key: 'folder_naming_pattern', value: '{Series} ({Year})' }]);
+        mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'X', year: 2016, publisher: 'Marvel', coverUrl: null });
+        mocks.findManyIssues.mockResolvedValue(files.map((filePath, i) => ({ id: `issue_${i}`, filePath })));
+        vi.mocked(fs.existsSync).mockImplementation((p) => {
+            const normalized = String(p).replace(/\\/g, '/');
+            if (normalized.startsWith('/unmatched/X/')) return conflicts.includes(normalized);
+            return true;
+        });
+        const res = await POST(createReq({ oldFolderPath: '/unmatched/X', metadataId: '987', metadataSource: 'METRON' }));
+        expect(res.status).toBe(200);
+        expect(mocks.updateIssue.mock.calls.map(([args]) => args.where.id)).toEqual(expected);
+        for (const [args] of mocks.updateIssue.mock.calls) expect(args.data.filePath).toMatch(/^\/comics\/X \(2016\)\//);
+        expect(mocks.transaction).toHaveBeenCalledWith(expect.any(Array));
+    });
+
+    describe('automatic suggestions are revalidated at every mutation boundary', () => {
+        const token = { itemId: 'series_1', provider: 'COMICVINE', fingerprint: 'f'.repeat(64) };
+        const automatic = {
+            oldFolderPath: '/unmatched/Batman', metadataId: '4050-1234', metadataSource: 'COMICVINE',
+            automaticMatch: { itemId: 'series_1', fingerprint: token.fingerprint, provider: 'COMICVINE' },
+        };
+        const cvFetchSucceeds = () => {
+            mocks.findUniqueSetting.mockResolvedValueOnce({ value: 'cv_api_key' });
+            vi.mocked(axios.get).mockResolvedValueOnce({ data: { results: { name: 'Batman (CV)', start_year: '2016' } } } as any);
+        };
+
+        it('a reviewed manual match never consults the decision service', async () => {
+            cvFetchSucceeds();
+            const res = await POST(createReq({ oldFolderPath: '/unmatched/Batman', metadataId: '4050-1234', manualReview: true }));
+            expect(res.status).toBe(200);
+            expect(mocks.assertAutomatic).not.toHaveBeenCalled();
+            expect(mocks.revalidateAutomatic).not.toHaveBeenCalled();
+        });
+
+        it('a stale or unsafe token is refused before any provider fetch, write or move', async () => {
+            mocks.assertAutomatic.mockRejectedValueOnce(new Error('Suggestion is stale, ambiguous or unsafe; refresh or review the match manually'));
+            const res = await POST(createReq(automatic));
+            expect(res.status).toBe(409);
+            expect((await res.json()).error).toContain('stale');
+            expect(axios.get).not.toHaveBeenCalled();
+            expect(mocks.createSeries).not.toHaveBeenCalled();
+            expect(mocks.updateSeries).not.toHaveBeenCalled();
+            expect(mocks.safeRelocateFolder).not.toHaveBeenCalled();
+        });
+
+        it('evidence that changes during the metadata fetch yields 409 with no Series write and no file move', async () => {
+            mocks.assertAutomatic.mockResolvedValueOnce(token);
+            mocks.revalidateAutomatic.mockRejectedValueOnce(new Error('Match evidence changed during validation'));
+            cvFetchSucceeds();
+            const res = await POST(createReq(automatic));
+            expect(res.status).toBe(409);
+            expect((await res.json()).error).toContain('changed');
+            // The provider lookup did run (that is the window being closed)…
+            expect(axios.get).toHaveBeenCalledWith(expect.stringContaining('comicvine'), expect.any(Object));
+            expect(mocks.revalidateAutomatic).toHaveBeenCalledWith(token, expect.objectContaining({ oldFolderPath: '/unmatched/Batman' }));
+            // …but nothing was written or moved.
+            expect(mocks.createSeries).not.toHaveBeenCalled();
+            expect(mocks.updateSeries).not.toHaveBeenCalled();
+            expect(mocks.deleteSeries).not.toHaveBeenCalled();
+            expect(mocks.transaction).not.toHaveBeenCalled();
+            expect(mocks.safeRelocateFolder).not.toHaveBeenCalled();
+            expect(mocks.moveFileSafe).not.toHaveBeenCalled();
+        });
+
+        it('unchanged evidence passes the entry check and the pre-write re-check, then writes once', async () => {
+            mocks.assertAutomatic.mockResolvedValueOnce(token);
+            mocks.revalidateAutomatic.mockResolvedValueOnce(undefined);
+            cvFetchSucceeds();
+            const res = await POST(createReq(automatic));
+            expect(res.status).toBe(200);
+            expect(mocks.assertAutomatic).toHaveBeenCalledTimes(1);
+            expect(mocks.revalidateAutomatic).toHaveBeenCalledTimes(1);
+            expect(mocks.createSeries).toHaveBeenCalledTimes(1);
+        });
     });
 
     it('should reject access if the oldFolderPath is outside of authorized libraries', async () => {

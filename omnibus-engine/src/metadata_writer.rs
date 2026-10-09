@@ -1,10 +1,10 @@
 use crate::db::Db;
 use sqlx::Row;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use regex::Regex;
 use serde::Deserialize;
 use tokio::task::JoinSet;
@@ -63,7 +63,7 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
                CAST(i."communityRating" AS TEXT) as issue_community_rating_text,
                CAST(i."blackAndWhite" AS INTEGER) as issue_black_and_white_int,
                CAST(i."isAnnual" AS INTEGER) as issue_is_annual,
-               i."releaseDate", i.universe as issue_universe,
+               i."releaseDate", i.universe as issue_universe, CAST(i."hasCustomMetadata" AS INTEGER) as issue_locked,
                i.genres, i."storyArcs", i."metadataId" as issue_meta_id, i."metadataSource" as issue_meta_source,
                s.id as series_id, s.name as series_name, s.publisher, s.year, s."folderPath",
                s.universe as series_universe, s."seriesGroup" as series_group, CAST(s."isManga" AS INTEGER) AS "isManga", s."metadataId" as series_meta_id, s."metadataSource" as series_meta_source,
@@ -173,11 +173,11 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
         join_set.spawn(async move {
             let _permit = sem.acquire_owned().await.ok();
             tokio::task::spawn_blocking(move || {
-                let ok = inject_xml_into_zip(&task.file_path, &task.xml_content);
-                (ok, task.series_id)
+                let outcome = inject_xml_into_zip(&task.file_path, &task.xml_content);
+                (outcome, task.series_id, task.file_path)
             })
             .await
-            .unwrap_or((false, String::new()))
+            .unwrap_or((None, String::new(), String::new()))
         });
     }
 
@@ -185,10 +185,22 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
     let mut fail_count = 0;
     let mut series_json_count = 0;
     let mut seen_series: HashSet<String> = HashSet::new();
+    // Collected across the join loop and emitted ONCE at the end, so Komga never scans a library
+    // this job is still rewriting.
+    let mut changed_paths: Vec<String> = Vec::new();
+    let mut changed_series: HashSet<String> = HashSet::new();
 
     while let Some(res) = join_set.join_next().await {
-        if let Ok((ok, series_id)) = res {
-            if ok { success_count += 1; } else { fail_count += 1; }
+        if let Ok((outcome, series_id, file_path)) = res {
+            match outcome {
+                Some(EmbedOutcome::Written) => {
+                    success_count += 1;
+                    changed_series.insert(series_id.clone());
+                    changed_paths.push(file_path);
+                }
+                Some(EmbedOutcome::Unchanged) => success_count += 1,
+                None => fail_count += 1,
+            }
 
             // Write series.json once per series (gated by the export flag).
             if seen_series.insert(series_id.clone())
@@ -196,6 +208,10 @@ pub async fn process_embed_job(db: Db, payload: EmbedRequest) -> anyhow::Result<
                     series_json_count += 1;
                 }
         }
+    }
+
+    if !changed_paths.is_empty() {
+        crate::library_events::emit("metadata-embed", changed_paths, changed_series.into_iter().collect());
     }
 
     Ok((success_count, fail_count, series_json_count))
@@ -676,8 +692,10 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
         attached_volumes.push(entry);
     }
 
-    // Mylar series.json schema v1.0.2. Unknown values are null, never "": Komga ignores nulls
-    // but chokes on blanks. https://github.com/mylar3/mylar3/wiki/series.json-schema-(version-1.0.2)
+    // Mylar schema v1.0.2. Komga requires a non-null booktype: keep the compatible Print fallback,
+    // but explicitly mark it so our scanner never mistakes an export default for evidence.
+    let book_type = book_type.filter(|s| !s.trim().is_empty());
+    let book_type_guessed = book_type.is_none();
     let mut series_json = serde_json::json!({
         "version": "1.0.2",
         "metadata": {
@@ -690,7 +708,7 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
             "description_text": Some(description_text).filter(|s| !s.is_empty()),
             "description_formatted": Some(description_formatted).filter(|s| !s.is_empty()),
             "volume": serde_json::Value::Null,
-            "booktype": book_type.filter(|s| !s.is_empty()).unwrap_or_else(|| "Print".to_string()),
+            "booktype": book_type.unwrap_or_else(|| "Print".to_string()),
             "age_rating": age_rating,
             "collects": serde_json::Value::Null,
             "comic_image": comic_image,
@@ -703,6 +721,9 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
     // to what it was before Phase 1.
     if !attached_volumes.is_empty() {
         series_json["omnibus"] = serde_json::json!({ "attached_volumes": attached_volumes });
+    }
+    if book_type_guessed {
+        series_json["omnibus"]["booktype_guessed"] = serde_json::json!(true);
     }
 
     log::debug!("[Metadata Writer Debug] Exporting Mylar-spec series.json to: {:?}", json_path);
@@ -777,19 +798,155 @@ fn read_comicinfo_from_zip(path: &Path) -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
-/// Rewrites the ZIP to include the new ComicInfo.xml, preserving the source compression of every entry.
-fn inject_xml_into_zip(file_path: &str, xml_content: &str) -> bool {
+/// Top-level children of the <ComicInfo> root as (tag name, raw element text, has content).
+/// The raw text is kept verbatim so nested blocks such as <Pages> survive byte-for-byte.
+fn top_level_elements(xml: &str) -> Vec<(String, String, bool)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut name = String::new();
+    let mut root_seen = false;
+    loop {
+        let before = reader.buffer_position() as usize;
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                if depth == 0 {
+                    if root_seen || e.name().as_ref() != "ComicInfo" { return Vec::new(); }
+                    root_seen = true;
+                }
+                if depth == 1 {
+                    start = before;
+                    let qn = e.name();
+                    let n: &str = qn.as_ref();
+                    name = n.to_string();
+                }
+                depth += 1;
+            }
+            Ok(Event::Empty(e)) => {
+                if depth == 1 {
+                    let after = reader.buffer_position() as usize;
+                    let qn = e.name();
+                    let n: &str = qn.as_ref();
+                    out.push((n.to_string(), xml[before..after].to_string(), false));
+                }
+            }
+            Ok(Event::End(_)) => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
+                    let end = reader.buffer_position() as usize;
+                    let raw = &xml[start..end];
+                    let open_end = raw.find('>').map(|i| i + 1).unwrap_or(0);
+                    let close_start = raw.rfind("</").unwrap_or(raw.len());
+                    let has_content = open_end <= close_start && !raw[open_end..close_start].trim().is_empty();
+                    out.push((name.clone(), raw.to_string(), has_content));
+                }
+            }
+            Ok(Event::Eof) => {
+                if depth != 0 { return Vec::new(); }
+                break;
+            }
+            Err(_) => return Vec::new(),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The DB owns modeled tags (including manual edits and sync's file-priority decisions).
+/// Carry over only unmodeled tags, verbatim, so Count/PageCount/Pages and custom tags survive.
+/// Never merge Year/Month/Day independently or freeze previous provider-generated values.
+pub(crate) fn merge_comicinfo(generated: &str, existing: &str) -> String {
+    let gen_elems = top_level_elements(generated);
+    let old_elems = top_level_elements(existing);
+    if gen_elems.is_empty() || old_elems.is_empty() {
+        return generated.to_string();
+    }
+    let (root_open, root_close) = match (generated.find("<ComicInfo"), generated.rfind("</ComicInfo>")) {
+        (Some(o), Some(c)) => match generated[o..].find('>') {
+            Some(gt) => (o + gt + 1, c),
+            None => return generated.to_string(),
+        },
+        _ => return generated.to_string(),
+    };
+    let mut body: Vec<String> = Vec::with_capacity(gen_elems.len() + 4);
+    for (_, raw, _) in &gen_elems {
+        body.push(raw.clone());
+    }
+    for (name, raw, _) in &old_elems {
+        if !gen_elems.iter().any(|(n, _, _)| n == name) {
+            body.push(raw.clone());
+        }
+    }
+    let mut out = String::with_capacity(generated.len() + 512);
+    out.push_str(&generated[..root_open]);
+    for b in &body {
+        out.push_str("\n  ");
+        out.push_str(b);
+    }
+    out.push('\n');
+    out.push_str(&generated[root_close..]);
+    out
+}
+
+type ArchiveLocks = Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>;
+
+fn archive_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<ArchiveLocks> = OnceLock::new();
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) { return lock; }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+/// Serialize writers targeting the same archive, including the read/merge phase: two jobs must
+/// never truncate or rename each other's .cbz.tmp file. Unrelated archives still run in parallel.
+/// Rewrites the ZIP to include the new ComicInfo.xml, preserving source compression.
+/// What an embed did. `Unchanged` matters: a re-embed of an identical ComicInfo.xml writes
+/// nothing, and reporting it as `Written` would make Komga rescan a library that did not change.
+/// It still counts as success for the job's return value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbedOutcome {
+    Written,
+    Unchanged,
+}
+
+fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> Option<EmbedOutcome> {
     let path = Path::new(file_path);
-    if !path.exists() { return false; }
+    let lock = archive_write_lock(path);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if !path.exists() {
+        // FIX (comicinfo-embed-logging): this used to be a silent `return false` -- a stale DB
+        // filePath (e.g. from a folder relocate that didn't update every Issue row) hit this branch
+        // for every affected file with zero trace anywhere, making the failure invisible short of
+        // RUST_LOG=debug plus manual DB/disk cross-checking. Always worth a log line: it's cheap and
+        // this path should be rare in normal operation.
+        log::warn!("[Writer] Embed skipped -- file does not exist at recorded path: {}", file_path);
+        return None;
+    }
 
     // Skip the full repack when the archive already holds byte-identical ComicInfo.xml. A metadata
     // sync re-embeds unchanged data every run; rewriting every page entry just to write the same XML
     // is pure disk churn that scales with total library size. On any read error we fall through and
     // rewrite (safe default). build_comic_info_xml is deterministic, so unchanged data → identical XML.
-    if let Ok(Some(existing)) = read_comicinfo_from_zip(path) {
+    let existing_xml = read_comicinfo_from_zip(path).ok().flatten();
+    let merged;
+    let xml_content: &str = match existing_xml.as_deref() {
+        Some(existing) => {
+            merged = merge_comicinfo(generated_xml, existing);
+            &merged
+        }
+        None => generated_xml,
+    };
+    if let Some(existing) = existing_xml.as_deref() {
         if existing == xml_content {
             log::debug!("[Embed Debug] ComicInfo.xml unchanged for {} — skipping repack.", file_path);
-            return true;
+            return Some(EmbedOutcome::Unchanged);
         }
     }
 
@@ -821,11 +978,23 @@ fn inject_xml_into_zip(file_path: &str, xml_content: &str) -> bool {
     })();
 
     match result {
-        Ok(_) => std::fs::rename(&tmp_path, path).is_ok(),
+        Ok(_) => {
+            // FIX (comicinfo-embed-logging): the rename result was silently discarded via .is_ok() --
+            // a failure here (e.g. cross-device rename, permissions) left the .tmp file orphaned on
+            // disk with no trace in any log.
+            match std::fs::rename(&tmp_path, path) {
+                Ok(_) => Some(EmbedOutcome::Written),
+                Err(e) => {
+                    log::error!("[Writer] Failed to rename {} into place over {}: {}", tmp_path.display(), file_path, e);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    None
+                }
+            }
+        }
         Err(e) => {
-            log::error!("Failed to inject XML into {}: {}", file_path, e);
+            log::error!("[Writer] Failed to inject XML into {}: {}", file_path, e);
             let _ = std::fs::remove_file(&tmp_path);
-            false
+            None
         }
     }
 }
@@ -833,6 +1002,39 @@ fn inject_xml_into_zip(file_path: &str, xml_content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_embeds_preserve_archive_entries_and_unknown_metadata() {
+        let root = std::env::temp_dir().join(format!("omnibus_embed_lock_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("book.cbz");
+        let mut writer = ZipWriter::new(File::create(&path).unwrap());
+        writer.start_file("01.jpg", FileOptions::default()).unwrap();
+        writer.write_all(b"original page bytes").unwrap();
+        writer.start_file("ComicInfo.xml", FileOptions::default()).unwrap();
+        writer.write_all(b"<ComicInfo><Count>6</Count></ComicInfo>").unwrap();
+        writer.finish().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4).map(|i| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                inject_xml_into_zip(path.to_str().unwrap(),
+                    &format!("<ComicInfo><Series>Updated {i}</Series></ComicInfo>"))
+            })
+        }).collect();
+        for thread in threads { assert!(thread.join().unwrap().is_some()); }
+        let xml = read_comicinfo_from_zip(&path).unwrap().unwrap();
+        assert!(xml.contains("<Count>6</Count>"));
+        let mut archive = ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let mut page = String::new();
+        archive.by_name("01.jpg").unwrap().read_to_string(&mut page).unwrap();
+        assert_eq!(page, "original page bytes");
+        assert!(!path.with_extension("cbz.tmp").exists());
+        drop(archive);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn inject_xml_skips_repack_when_unchanged() {
@@ -857,11 +1059,18 @@ mod tests {
         let before = std::fs::read(&path).unwrap();
 
         // Same XML → skipped: the file bytes are untouched (no repack).
-        assert!(inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>OLD</ComicInfo>"));
+        assert_eq!(
+            inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>OLD</ComicInfo>"),
+            Some(EmbedOutcome::Unchanged),
+            "re-embedding identical XML must not report a written file"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before, "unchanged XML must not rewrite the archive");
 
         // Different XML → repacked: the embedded ComicInfo.xml now reflects the new content.
-        assert!(inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"));
+        assert_eq!(
+            inject_xml_into_zip(path.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"),
+            Some(EmbedOutcome::Written)
+        );
         assert_eq!(
             read_comicinfo_from_zip(&path).unwrap().as_deref(),
             Some("<ComicInfo>NEW</ComicInfo>")
@@ -904,7 +1113,7 @@ mod tests {
                 gtin TEXT, notes TEXT, "scanInformation" TEXT, review TEXT, "mainCharacterOrTeam" TEXT,
                 "alternateSeries" TEXT, "alternateNumber" TEXT, "alternateCount" INTEGER, "storyArcNumber" TEXT)"#,
             r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT,
-                "isAnnual" INTEGER DEFAULT 0,
+                "isAnnual" INTEGER DEFAULT 0, "hasCustomMetadata" INTEGER DEFAULT 0,
                 name TEXT, description TEXT, "releaseDate" TEXT, universe TEXT, genres TEXT, "storyArcs" TEXT,
                 writers TEXT, artists TEXT, characters TEXT, "coverArtists" TEXT, colorists TEXT,
                 letterers TEXT, teams TEXT, locations TEXT, inker TEXT, editor TEXT, translator TEXT,
@@ -1011,6 +1220,28 @@ mod tests {
         let xml3 = read_comicinfo_from_zip(&cbz).unwrap().unwrap();
         assert!(xml3.contains("<BlackAndWhite>No</BlackAndWhite>"), "issue's explicit No must beat series Yes:\n{xml3}");
 
+        // Preserve real archive-only metadata in both priority modes, while series editor
+        // changes still reach files that already have an Imprint tag.
+        let extras = "<Count>6</Count><PageCount>17</PageCount><Pages><Page Image=\"0\" Type=\"FrontCover\" /></Pages><CustomTag />";
+        let with_extras = xml3.replace("</ComicInfo>", &format!("{extras}</ComicInfo>"));
+        assert!(inject_xml_into_zip(cbz.to_str().unwrap(), &with_extras).is_some());
+        for priority in ["true", "false"] {
+            sqlx::query(r#"INSERT INTO "SystemSetting" (key,value) VALUES ('file_metadata_priority',$1)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value"#)
+                .bind(priority).execute(&db.pool).await.unwrap();
+            sqlx::query(r#"UPDATE "Series" SET imprint=$1 WHERE id='s199'"#)
+                .bind(format!("Manual imprint {priority}")).execute(&db.pool).await.unwrap();
+            let (ok, failed, _) = process_embed_job(db.clone(),
+                EmbedRequest { series_id: Some("s199".into()), issue_ids: None }).await.unwrap();
+            assert_eq!((ok, failed), (1, 0));
+            let embedded = read_comicinfo_from_zip(&cbz).unwrap().unwrap();
+            assert!(embedded.contains(&format!("<Imprint>Manual imprint {priority}</Imprint>")));
+            for tag in ["<Count>6</Count>", "<PageCount>17</PageCount>",
+                "<Pages><Page Image=\"0\" Type=\"FrontCover\" /></Pages>", "<CustomTag />"] {
+                assert!(embedded.contains(tag), "lost {tag} in priority mode {priority}");
+            }
+        }
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1053,7 +1284,7 @@ mod tests {
                 gtin TEXT, notes TEXT, "scanInformation" TEXT, review TEXT, "mainCharacterOrTeam" TEXT,
                 "alternateSeries" TEXT, "alternateNumber" TEXT, "alternateCount" INTEGER, "storyArcNumber" TEXT)"#,
             r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, "filePath" TEXT, number TEXT,
-                "isAnnual" INTEGER DEFAULT 0, "attachedVolumeId" TEXT, "coversIssues" TEXT, name TEXT, description TEXT,
+                "isAnnual" INTEGER DEFAULT 0, "hasCustomMetadata" INTEGER DEFAULT 0, "attachedVolumeId" TEXT, "coversIssues" TEXT, name TEXT, description TEXT,
                 "releaseDate" TEXT, universe TEXT, genres TEXT, "storyArcs" TEXT,
                 writers TEXT, artists TEXT, characters TEXT, "coverArtists" TEXT, colorists TEXT,
                 letterers TEXT, teams TEXT, locations TEXT, inker TEXT, editor TEXT, translator TEXT,
@@ -1157,6 +1388,9 @@ mod tests {
         let parsed_l: serde_json::Value = serde_json::from_str(&raw_l).expect("valid json");
         let local = parsed_l["omnibus"]["attached_volumes"].as_array().unwrap().iter().find(|a| a["source"] == "LOCAL").expect("the local edition");
         assert_eq!(local["books"][0]["issue_id"], "local:1");
+
+        assert_eq!(parsed_l["metadata"]["booktype"], "Print", "Komga-compatible fallback");
+        assert_eq!(parsed_l["omnibus"]["booktype_guessed"], true, "scanner must ignore the fallback");
         assert_eq!(local["books"][0]["covers"], "1-11");
 
         let _ = std::fs::remove_dir_all(&base);
@@ -1184,5 +1418,50 @@ mod tests {
         assert_eq!(format_month_year("2020"), "2020"); // no month -> year only
         assert_eq!(format_month_year("2020-00-01"), "2020"); // invalid month index
         assert_eq!(format_month_year("2020-13"), "2020");
+    }
+    const GEN: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ComicInfo xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">\n  <Series>Nick Fury</Series>\n  <Number>1</Number>\n  <Summary>provider text</Summary>\n  <Year>2017</Year>\n  <Month>04</Month>\n  <Day>19</Day>\n  <Editor>A, B, C</Editor>\n  <Genre>Superhero</Genre>\n  <Web>https://comicvine.gamespot.com/issue/4000-1/</Web>\n</ComicInfo>";
+    const OLD: &str = "<?xml version=\"1.0\"?>\n<ComicInfo>\n  <Series>Old Name</Series>\n  <Number>1</Number>\n  <Summary>file text</Summary>\n  <Count>6</Count>\n  <PageCount>17</PageCount>\n  <Year>2017</Year>\n  <Month>6</Month>\n  <Day>30</Day>\n  <Editor>A, B</Editor>\n  <Genre />\n  <Web>https://comicvine.gamespot.com/x/4000-1/</Web>\n  <Pages>\n    <Page Image=\"0\" ImageWidth=\"1988\" Type=\"FrontCover\" />\n    <Page Image=\"1\" />\n  </Pages>\n</ComicInfo>";
+
+    #[test]
+    fn merge_keeps_db_edits_and_carries_over_unknown_tags_in_file_priority_mode() {
+        let m = merge_comicinfo(GEN, OLD);
+        let tags = top_level_elements(&m);
+        let get = |n: &str| tags.iter().find(|(name, _, _)| name == n).map(|(_, r, _)| r.clone());
+        assert_eq!(get("Series").unwrap(), "<Series>Nick Fury</Series>", "Omnibus-owned identity comes from the DB");
+        assert_eq!(get("Web").unwrap(), "<Web>https://comicvine.gamespot.com/issue/4000-1/</Web>");
+        assert_eq!(get("Summary").unwrap(), "<Summary>provider text</Summary>");
+        assert_eq!(get("Month").unwrap(), "<Month>04</Month>");
+        assert_eq!(get("Day").unwrap(), "<Day>19</Day>");
+        assert_eq!(get("Editor").unwrap(), "<Editor>A, B, C</Editor>");
+        assert_eq!(get("Genre").unwrap(), "<Genre>Superhero</Genre>", "a blank file tag is filled from the DB");
+        assert_eq!(get("Count").unwrap(), "<Count>6</Count>");
+        assert_eq!(get("PageCount").unwrap(), "<PageCount>17</PageCount>");
+        assert!(get("Pages").unwrap().contains(r#"<Page Image="1" />"#), "Pages block survives verbatim");
+        assert_eq!(merge_comicinfo(GEN, &m), m, "merging is idempotent (unchanged files are not repacked)");
+    }
+
+    #[test]
+    fn merge_date_tags_remain_a_unit_and_unknown_tags_survive() {
+        let m = merge_comicinfo(GEN, OLD);
+        let tags = top_level_elements(&m);
+        let get = |n: &str| tags.iter().find(|(name, _, _)| name == n).map(|(_, r, _)| r.clone());
+        assert_eq!(get("Summary").unwrap(), "<Summary>provider text</Summary>");
+        assert_eq!(get("Day").unwrap(), "<Day>19</Day>");
+        assert_eq!(get("Count").unwrap(), "<Count>6</Count>");
+        assert!(get("Pages").is_some());
+        let partial_date = "<ComicInfo><Year>2099</Year><Month>12</Month><CustomTag /></ComicInfo>";
+        let result = merge_comicinfo(GEN, partial_date);
+        assert!(result.contains("<Year>2017</Year>"));
+        assert!(result.contains("<Month>04</Month>"));
+        assert!(result.contains("<Day>19</Day>"));
+        assert!(result.contains("<CustomTag />"));
+    }
+
+    #[test]
+    fn merge_falls_back_to_generated_on_unparseable_existing() {
+        assert_eq!(merge_comicinfo(GEN, "not xml at all"), GEN);
+        assert_eq!(merge_comicinfo(GEN, "<ComicInfo></ComicInfo>"), GEN);
+        assert_eq!(merge_comicinfo(GEN, "<ComicInfo><Count>6</Count><Pages>"), GEN);
+        assert_eq!(merge_comicinfo(GEN, "<Other><Count>6</Count></Other>"), GEN);
     }
 }

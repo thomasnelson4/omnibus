@@ -8,6 +8,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { collectMissingArcSeries, MissingArcSeries } from '@/lib/utils/arc-missing-series';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 import { getMetronAuth, metronGet, MetronAuth } from '@/lib/metron/client';
 
 // Metron requests go through the shared client (src/lib/metron/client.ts): pacing from Metron's
@@ -180,6 +181,7 @@ export async function POST(request: Request) {
         if (issuesToCreate.length > 0) {
             Logger.log(`[Auto-Build] Saving ${issuesToCreate.length} mapped issues to the reading list...`, 'info');
             await prisma.readingListItem.createMany({ data: issuesToCreate });
+            triggerReadListPushSoon(newList.id);
         }
 
         // Opt-in (fork review #5): resolve which arc series the library lacks ENTIRELY, so the

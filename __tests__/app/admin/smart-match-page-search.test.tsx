@@ -6,8 +6,8 @@
 // rows, pick → volume resolution → Issue Mapping auto-fill (exact issue id from the file's
 // number), Load more pagination, and the fallback ID path routing through the same resolver.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, fireEvent } from '@testing-library/react';
-import { ok, stubFetchRouter } from '../../helpers/fetch';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { err, ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
@@ -54,11 +54,69 @@ const VOLUME_DETAILS = {
 let searchCalls: string[] = [];
 let detailCalls: string[] = [];
 
+// A server decision as /api/admin/smart-match returns it (src/lib/smart-match/service.ts): the
+// page renders its parsed signals, candidates and reasons, and may accept only what it marks safe.
+const DECISION = {
+    status: 'high', confidence: 'high', safeToAccept: true, autoAccept: false, fingerprint: 'f'.repeat(64),
+    algorithmVersion: 'evidence-1', expiresAt: Date.now() + 60 * 60 * 1000, requests: 1, queries: ['METRON:conan & dragonero:1'],
+    selected: { ...SEARCH_RESULT, id: '16180' }, reasons: [], files: [],
+    parsed: { title: 'Conan & Dragonero', domain: 'regular', alternateTitles: [], releaseTags: [], warnings: [], issue: { value: '1', source: 'filename trailing number', confidence: 'medium' } },
+    candidates: [{
+        candidate: { ...SEARCH_RESULT, id: '16180' }, similarity: 1, score: 0.96, validated: true, exact: false,
+        positive: ['Issue #1 exists (regular)', 'Publisher agrees'], contradictions: [], reasons: [],
+    }],
+};
+
 const openSearchMatchDialog = async () => {
     render(<SmartMatchPage />);
     await screen.findByText('Conan & Dragonero 001');
     fireEvent.click(screen.getByRole('button', { name: /Search Match/ }));
     await screen.findByPlaceholderText('e.g. The Amazing Spider-Man');
+};
+
+type BulkPayload = { oldFolderPath: string; [key: string]: unknown };
+type UnmatchedItem = typeof RAW_ITEM & { isIgnored?: boolean };
+
+const rawItems = (count: number): UnmatchedItem[] => Array.from({ length: count }, (_, idx) => ({
+    id: `raw_${idx + 1}`, name: `Conan & Dragonero ${String(idx + 1).padStart(3, '0')}`,
+    folderPath: `/unmatched/Conan & Dragonero ${idx + 1}.cbz`, isRawFile: true,
+}));
+
+const stubBulkFetch = (
+    items: UnmatchedItem[],
+    apply = (batch: BulkPayload[], _call: number) => ok({ results: batch.map(() => ({ ok: true })) }),
+    prefillFor: (path: string) => unknown = () => null,
+) => {
+    const batches: BulkPayload[][] = [];
+    stubFetchRouter([
+        ['/api/admin/unmatched', () => ok(items)],
+        ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
+        ['/api/admin/match-prefill', u => {
+            const prefill = prefillFor(new URL(u, 'http://localhost').searchParams.get('path') || '');
+            return ok({ hasContent: !!prefill, prefill });
+        }],
+        ['/api/search', u => { searchCalls.push(u); return ok({ results: [SEARCH_RESULT] }); }],
+        ['/api/issue-details/covers', () => ok({ covers: {} })],
+        ['/api/issue-details', u => { detailCalls.push(u); return ok(VOLUME_DETAILS); }],
+        ['/api/library/match-series/bulk', (_u, init) => {
+            const batch = JSON.parse(init.body).items;
+            batches.push(batch);
+            return apply(batch, batches.length);
+        }],
+    ]);
+    return batches;
+};
+
+const openBulkAssignment = async (items: UnmatchedItem[]) => {
+    render(<SmartMatchPage />);
+    await screen.findByText(items[0].name);
+    for (const item of items) fireEvent.click(screen.getByRole('checkbox', { name: `Select ${item.name}` }));
+    fireEvent.click(screen.getByRole('button', { name: 'Assign to Series' }));
+    const dialog = screen.getByRole('dialog', { name: 'Assign to Series' });
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Search$/ }));
+    fireEvent.click(await within(dialog).findByText(SEARCH_RESULT.name));
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: /Assign Selected/ }).hasAttribute('disabled')).toBe(false));
+    return dialog;
 };
 
 describe('Smart Matcher — Search Match dialog', () => {
@@ -67,6 +125,7 @@ describe('Smart Matcher — Search Match dialog', () => {
         detailCalls = [];
         toast.mockClear();
         localStorage.clear();
+        sessionStorage.clear();
         stubFetchRouter([
             ['/api/admin/unmatched', () => ok([RAW_ITEM])],
             ['/api/admin/config', () => ok({
@@ -201,19 +260,236 @@ describe('Smart Matcher — Search Match dialog', () => {
 
         await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'No results' })));
     });
+
+    it('auto-scan asks the server decision service, explains the decision, and retries a failed item on the next scan', async () => {
+        const bodies: Record<string, unknown>[] = [];
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM])],
+            ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
+            ['/api/admin/smart-match', (_u, init) => {
+                bodies.push(JSON.parse(init.body));
+                return bodies.length === 1 ? err(422, { error: 'Could not read matching evidence for this item' }) : ok(DECISION);
+            }],
+        ]);
+        render(<SmartMatchPage />);
+        await screen.findByText(RAW_ITEM.name);
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan complete', description: expect.stringContaining('0 entries') })));
+        expect(screen.getByRole('button', { name: 'Accept' }).hasAttribute('disabled')).toBe(true);
+
+        toast.mockClear();
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan complete', description: expect.stringContaining('1 entries') })));
+        // The decision came from the server for THIS item under the page's provider, with no cache bypass…
+        expect(bodies).toEqual([
+            { itemId: RAW_ITEM.id, provider: 'METRON', refresh: false },
+            { itemId: RAW_ITEM.id, provider: 'METRON', refresh: false },
+        ]);
+        // …and its explanation is on the row: parsed signals, confidence and per-candidate evidence.
+        expect(screen.getByText(/high · high confidence/)).toBeTruthy();
+        expect(screen.getByText(/Parsed: Conan & Dragonero · regular #1/)).toBeTruthy();
+        expect(screen.getByText(/Issue #1 exists \(regular\); Publisher agrees/)).toBeTruthy();
+        // A convincing, unexpired server decision is acceptable.
+        expect(screen.getByRole('button', { name: 'Accept' }).hasAttribute('disabled')).toBe(false);
+    });
+
+    it('an ambiguous decision shows its candidates, cannot be accepted, and Retry / Refresh bypasses the server caches', async () => {
+        const bodies: Record<string, unknown>[] = [];
+        const ambiguous = {
+            ...DECISION, status: 'ambiguous', confidence: 'medium', safeToAccept: false, reasons: ['No clear lead over the runner-up'],
+            candidates: [DECISION.candidates[0], { ...DECISION.candidates[0], candidate: { ...SEARCH_RESULT, id: '999', year: 2011 }, score: 0.94 }],
+        };
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM])],
+            ['/api/admin/config', () => ok({ settings: [{ key: 'primary_metadata_source', value: 'METRON' }] })],
+            ['/api/admin/smart-match', (_u, init) => { bodies.push(JSON.parse(init.body)); return ok(ambiguous); }],
+        ]);
+        render(<SmartMatchPage />);
+        await screen.findByText(RAW_ITEM.name);
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Scan complete' })));
+
+        expect(screen.getByText(/ambiguous · medium confidence/)).toBeTruthy();
+        expect(screen.getByText(/No clear lead over the runner-up/)).toBeTruthy();
+        expect(screen.getByText(/Conan & Dragonero \(2011\) · METRON · 94%/)).toBeTruthy();
+        // A best candidate is not a convincing match: nothing can be accepted blindly.
+        expect(screen.getByRole('button', { name: 'Accept' }).hasAttribute('disabled')).toBe(true);
+
+        fireEvent.click(screen.getByRole('button', { name: /Retry \/ Refresh/ }));
+        await waitFor(() => expect(bodies).toHaveLength(2));
+        expect(bodies[1]).toEqual({ itemId: RAW_ITEM.id, provider: 'METRON', refresh: true });
+    });
+
+    it('assigns selected files with one search and distinct, editable issue mappings', async () => {
+        const items = rawItems(3);
+        const batches = stubBulkFetch(items);
+        const dialog = await openBulkAssignment(items.slice(0, 2));
+        expect(within(dialog).getByLabelText(`Issue ID for ${items[0].name}`).getAttribute('value')).toBe('171893');
+        expect(within(dialog).getByLabelText(`Issue ID for ${items[1].name}`).getAttribute('value')).toBe('171894');
+        fireEvent.change(within(dialog).getByLabelText(`Issue number for ${items[0].name}`), { target: { value: '7' } });
+        fireEvent.change(within(dialog).getByLabelText(`Issue ID for ${items[0].name}`), { target: { value: 'corrected-id' } });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+
+        await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+        expect(batches).toHaveLength(1);
+        expect(batches[0]).toEqual([
+            expect.objectContaining({ oldFolderPath: items[0].folderPath, metadataId: 16180, metadataSource: 'METRON', name: SEARCH_RESULT.name, exactIssueNumber: '7', exactIssueId: 'corrected-id' }),
+            expect.objectContaining({ oldFolderPath: items[1].folderPath, metadataId: 16180, metadataSource: 'METRON', name: SEARCH_RESULT.name, exactIssueNumber: '2', exactIssueId: '171894' }),
+        ]);
+        expect(searchCalls).toHaveLength(1);
+        expect(detailCalls).toHaveLength(1);
+        expect(screen.queryByText(items[0].name)).toBeNull();
+        expect(screen.queryByText(items[1].name)).toBeNull();
+        expect(screen.getByText(items[2].name)).toBeTruthy();
+        expect(screen.getByRole('button', { name: 'Select Entries' })).toBeTruthy();
+    });
+
+    it('assigns large selections in chunks without repeating the search or volume lookup', async () => {
+        const items = rawItems(12);
+        const batches = stubBulkFetch(items);
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (12)' }));
+
+        await screen.findByText('All Caught Up!');
+        expect(batches.map(batch => batch.length)).toEqual([5, 5, 2]);
+        expect(batches.flat().map(item => item.oldFolderPath)).toEqual(items.map(item => item.folderPath));
+        expect(batches.flat().every(item => item.metadataId === 16180 && item.metadataSource === 'METRON')).toBe(true);
+        expect(searchCalls).toHaveLength(1);
+        expect(detailCalls).toHaveLength(1);
+    });
+
+    it('keeps failed entries selected and retries only those with the chosen series', async () => {
+        const items = rawItems(2);
+        const batches = stubBulkFetch(items, (batch, call) => ok({ results: call === 1
+            ? [{ ok: true }, { ok: false, error: 'Folder collision' }]
+            : batch.map(() => ({ ok: true })),
+        }));
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+
+        const retry = await within(dialog).findByRole('button', { name: 'Assign Selected (1)' });
+        await waitFor(() => expect(retry.hasAttribute('disabled')).toBe(false));
+        expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Assignment finished with errors', description: expect.stringContaining('Folder collision') }));
+        expect(within(dialog).queryByLabelText(`Issue ID for ${items[0].name}`)).toBeNull();
+        expect(within(dialog).getByLabelText(`Issue ID for ${items[1].name}`).getAttribute('value')).toBe('171894');
+        fireEvent.click(retry);
+
+        await screen.findByText('All Caught Up!');
+        expect(batches.map(batch => batch.map(item => item.oldFolderPath))).toEqual([
+            items.map(item => item.folderPath), [items[1].folderPath],
+        ]);
+        expect(searchCalls).toHaveLength(1);
+    });
+
+    it.each(['HTTP error', 'network error', 'missing results'])('retains the selection after a bulk %s', async failure => {
+        const items = rawItems(2);
+        const batches = stubBulkFetch(items, (batch, call) => {
+            if (call > 1) return ok({ results: batch.map(() => ({ ok: true })) });
+            if (failure === 'HTTP error') return err(500, { error: 'Provider unavailable' });
+            if (failure === 'network error') return Promise.reject(new Error('Network error'));
+            return ok({ results: [] });
+        });
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Assignment finished with errors' })));
+        const retry = within(dialog).getByRole('button', { name: 'Assign Selected (2)' });
+        expect(retry.hasAttribute('disabled')).toBe(false);
+        fireEvent.click(retry);
+        await screen.findByText('All Caught Up!');
+        expect(batches.map(batch => batch.length)).toEqual([2, 2]);
+    });
+
+    it('selects and deselects all available entries while excluding ignored series', async () => {
+        const items = [...rawItems(2), { id: 'ignored', name: 'Ignored series', folderPath: '/library/ignored', isRawFile: false, isIgnored: true }];
+        const batches = stubBulkFetch(items);
+        render(<SmartMatchPage />);
+        await screen.findByText(items[0].name);
+        fireEvent.click(screen.getByRole('button', { name: 'Show ignored (1)' }));
+        expect(screen.getByRole('checkbox', { name: 'Select Ignored series' }).hasAttribute('disabled')).toBe(true);
+        fireEvent.click(screen.getByRole('button', { name: 'Select Entries' }));
+        expect(screen.getByRole('button', { name: 'Assign to Series' }).hasAttribute('disabled')).toBe(true);
+        fireEvent.click(screen.getByRole('button', { name: 'Select All' }));
+        expect(screen.getByRole('status').textContent).toBe('2 Selected');
+        fireEvent.click(screen.getByRole('button', { name: 'Deselect All' }));
+        expect(screen.getByRole('status').textContent).toBe('0 Selected');
+        fireEvent.click(screen.getByRole('checkbox', { name: `Select ${items[0].name}` }));
+        fireEvent.click(screen.getByRole('button', { name: 'Cancel Selection' }));
+        expect(screen.getByRole('checkbox', { name: `Select ${items[0].name}` }).getAttribute('aria-checked')).toBe('false');
+        expect(batches).toHaveLength(0);
+    });
+
+    it('confirms combining folders before assigning them to one series', async () => {
+        const folders = rawItems(2).map(item => ({ ...item, folderPath: `/library/${item.id}`, isRawFile: false }));
+        const batches = stubBulkFetch(folders);
+        const dialog = await openBulkAssignment(folders);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        expect(batches).toHaveLength(0);
+        const confirmation = screen.getByRole('dialog', { name: 'Merge these folders into one series?' });
+        fireEvent.click(within(confirmation).getByRole('button', { name: 'Cancel' }));
+        expect(batches).toHaveLength(0);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Assign and Merge' }));
+        await screen.findByText('All Caught Up!');
+        expect(batches[0].map(item => item.oldFolderPath)).toEqual(folders.map(item => item.folderPath));
+    });
+
+    it('preserves file metadata when shared naming is supplied', async () => {
+        const items = rawItems(2);
+        const batches = stubBulkFetch(items, undefined, path => ({
+            fields: { description: { value: `Curated ${path}`, source: 'comicinfo' }, writer: { value: 'Local Writer', source: 'comicinfo' } },
+            issue: { title: `Title ${path}` },
+        }));
+        const dialog = await openBulkAssignment(items);
+        fireEvent.change(within(dialog).getByPlaceholderText('e.g. X-Men'), { target: { value: 'Crossover' } });
+        fireEvent.change(within(dialog).getByPlaceholderText('e.g. Earth-616'), { target: { value: 'Shared Universe' } });
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        await screen.findByText('All Caught Up!');
+        expect(batches[0]).toEqual(items.map(item => expect.objectContaining({
+            oldFolderPath: item.folderPath, name: SEARCH_RESULT.name, description: `Curated ${item.folderPath}`, writer: 'Local Writer',
+            issueTitle: `Title ${item.folderPath}`, dataMode: 'keep', seriesGroup: 'Crossover', universe: 'Shared Universe', lockMetadata: true,
+        })));
+    });
+
+    it('locks assignment controls until the bulk request finishes', async () => {
+        const items = rawItems(2);
+        let finish!: (value: Awaited<ReturnType<typeof ok>>) => void;
+        const pending = new Promise<Awaited<ReturnType<typeof ok>>>(resolve => { finish = resolve; });
+        const batches = stubBulkFetch(items, () => pending);
+        const dialog = await openBulkAssignment(items);
+        fireEvent.click(within(dialog).getByRole('button', { name: 'Assign Selected (2)' }));
+        await waitFor(() => expect(batches).toHaveLength(1));
+        expect(within(dialog).getByRole('button', { name: /Assigning 0\/2/ }).hasAttribute('disabled')).toBe(true);
+        expect(within(dialog).getByRole('button', { name: 'Cancel' }).hasAttribute('disabled')).toBe(true);
+        expect(within(dialog).getByPlaceholderText('e.g. The Amazing Spider-Man').closest('fieldset')?.disabled).toBe(true);
+        fireEvent.keyDown(dialog, { key: 'Escape' });
+        expect(screen.getByRole('dialog', { name: 'Assign to Series' })).toBeTruthy();
+        finish(await ok({ results: [{ ok: true }, { ok: true }] }));
+        await screen.findByText('All Caught Up!');
+    });
 });
 
-// Metron beta 4 (#216 follow-up): the Auto-Scan searches once per unmatched series and shows one
-// suggestion, but each search paid for up to ten Metron cover requests. It now searches without
-// covers and asks for the cover of the one suggestion it shows.
-describe('Smart Matcher — Auto-Scan covers', () => {
-    let scanSearches: string[] = [];
+// Metron beta 4 (#216 follow-up) originally pinned the client-side scan: one covers=none search per
+// series plus a single cover fetch for the shown suggestion. The evidence-first decision service
+// (cf2ae35) moved the search server-side: Auto-Scan now POSTs /api/admin/smart-match once per
+// unmatched series and the picked candidate's cover arrives baked into the decision, so the page
+// makes NO client-side /api/search or /api/search/cover calls during a scan. This pins that contract.
+describe('Smart Matcher — Auto-Scan decision flow', () => {
+    let scanPosts: Array<Record<string, unknown>> = [];
+    let searchCalls: string[] = [];
     let coverCalls: string[] = [];
-    const PROXIED = `/api/library/cover?path=${encodeURIComponent('https://static.metron.cloud/16180.jpg')}`;
+    const CANDIDATE_IMAGE = 'https://static.metron.cloud/16180.jpg';
+
+    const DECISION = {
+        status: 'high', confidence: 'high', safeToAccept: true, autoAccept: false,
+        selected: { id: '16180', metadataSource: 'METRON', name: 'Conan & Dragonero', year: 2026,
+            publisher: 'Sergio Bonelli Editore', count: 5, image: CANDIDATE_IMAGE },
+        candidates: [], reasons: ['exact id match from the filename'],
+        parsed: { title: 'Conan & Dragonero 001', alternateTitles: [], domain: 'issue', releaseTags: [], warnings: [] },
+        files: [], queries: ['conan dragonero'],
+    };
 
     beforeEach(() => {
-        scanSearches = [];
-        coverCalls = [];
+        scanPosts = []; searchCalls = []; coverCalls = [];
         toast.mockClear();
         localStorage.clear();
         stubFetchRouter([
@@ -225,23 +501,25 @@ describe('Smart Matcher — Auto-Scan covers', () => {
                 ],
             })],
             ['/api/admin/sweep', () => ok({})],
-            ['/api/search/cover', (u) => { coverCalls.push(u); return ok({ image: PROXIED }); }],
-            ['/api/search', (u) => { scanSearches.push(u); return ok({ results: [SEARCH_RESULT, { ...SEARCH_RESULT, id: 77, name: 'Dragonero' }], hasMore: false }); }],
+            ['/api/admin/smart-match', (_u, init) => { scanPosts.push(JSON.parse(init?.body || '{}')); return ok(DECISION); }],
+            ['/api/search/cover', (u) => { coverCalls.push(u); return ok({ image: '/api/library/cover?path=x' }); }],
+            ['/api/search', (u) => { searchCalls.push(u); return ok({ results: [], hasMore: false }); }],
         ]);
     });
     afterEach(() => vi.unstubAllGlobals());
 
-    it('searches without covers, then fetches only the picked suggestion\'s cover', async () => {
+    it('auto-scan posts the decision service once per series and renders the returned candidate', async () => {
         render(<SmartMatchPage />);
         await screen.findByText('Conan & Dragonero 001');
 
         fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
 
-        await waitFor(() => expect(coverCalls).toHaveLength(1));
-        expect(scanSearches).toHaveLength(1);
-        expect(scanSearches[0]).toContain('covers=none');
-        expect(coverCalls[0]).toContain('provider=METRON');
-        expect(coverCalls[0]).toContain('id=16180');
-        await waitFor(() => expect(screen.getByAltText('Suggestion').getAttribute('src')).toBe(PROXIED));
+        await waitFor(() => expect(scanPosts).toHaveLength(1));
+        expect(scanPosts[0]).toMatchObject({ itemId: RAW_ITEM.id, provider: 'METRON' });
+        await screen.findByAltText('Suggestion');
+        expect(screen.getByAltText('Suggestion').getAttribute('src')).toBe(CANDIDATE_IMAGE);
+        // The cover storm is gone for good: no client-side search or cover fetches during a scan.
+        expect(searchCalls).toHaveLength(0);
+        expect(coverCalls).toHaveLength(0);
     });
 });

@@ -48,56 +48,7 @@ export async function scrapeDeepLinkViaEngine(
 }
 
 // --- Shared hoster-priority helpers (kept in lock-step with the Rust engine's getcomics.rs) ---
-
-/** Default hoster order. Both GetComics variants sit at the TOP — `getcomics_direct` (comicfiles CDN)
- *  then `getcomics_main` (getcomics.org/dls/ main server). The /dls/ direct download works for most
- *  issues (only the subset behind a live Cloudflare challenge falls through to the manual-hold), and it
- *  outranks the far-less-reliable third-party mirrors. Matches the original `getcomics`-first ordering. */
-// Anna's Archive is its own search source (search_source_priority), not a GetComics mirror, so it's no
-// longer part of the hoster-mirror priority list. Its download key still lives in a HosterAccount.
-export const DEFAULT_HOSTER_ORDER = ['getcomics_direct', 'getcomics_main', 'mediafire', 'mega', 'pixeldrain', 'rootz', 'vikingfile', 'terabox'];
-
-// Listed but OFF by default — Cloudflare/JS/app-gated, not resolvable by scraping (still toggleable).
-export const DEFAULT_DISABLED_HOSTERS = ['rootz', 'vikingfile', 'terabox'];
-
-export type HosterPref = { hoster: string, enabled: boolean };
-
-/** Default hoster prefs: the standard order with the known-unreliable hosters disabled out of the box. */
-export function defaultHosterPrefs(): HosterPref[] {
-    return DEFAULT_HOSTER_ORDER.map(h => ({ hoster: h, enabled: !DEFAULT_DISABLED_HOSTERS.includes(h) }));
-}
-
-/** Migrate a legacy single `getcomics` entry into `getcomics_direct` (kept in place + enabled flag) +
- *  `getcomics_main` (inserted right after it, same enabled flag, so both stay high-priority — the
- *  legacy `getcomics` was first). Idempotent; mirrors Rust migrate_legacy_getcomics. */
-export function migrateHosterPrefs(prefs: HosterPref[]): HosterPref[] {
-    const out = prefs.map(p => ({ ...p }));
-    const i = out.findIndex(p => p.hoster === 'getcomics');
-    if (i !== -1) {
-        const enabled = out[i].enabled;
-        out[i] = { hoster: 'getcomics_direct', enabled };
-        if (!out.some(p => p.hoster === 'getcomics_main')) out.splice(i + 1, 0, { hoster: 'getcomics_main', enabled });
-    }
-    return out;
-}
-
-/** Parse a raw `hoster_priority` setting value into an ordered, migrated pref list. Unset → defaults;
- *  empty array → none; string array → all enabled; object array → each entry's `enabled` (default true). */
-export function parseHosterPrefs(value?: string | null): HosterPref[] {
-    const defaults = defaultHosterPrefs;
-    if (!value) return defaults();
-    try {
-        const parsed = JSON.parse(value);
-        if (!Array.isArray(parsed)) return defaults();
-        if (parsed.length === 0) return [];
-        const prefs: HosterPref[] = typeof parsed[0] === 'string'
-            ? parsed.map((h: string) => ({ hoster: h, enabled: true }))
-            : parsed.map((p: any) => ({ hoster: p.hoster, enabled: p.enabled !== false }));
-        return migrateHosterPrefs(prefs);
-    } catch { return defaults(); }
-}
-
-/** Enabled hoster names in priority order, migrating the legacy `getcomics` key. Mirrors Rust enabled_hosters. */
-export function enabledHostersFromSetting(value?: string | null): string[] {
-    return parseHosterPrefs(value).filter(p => p.enabled).map(p => p.hoster);
-}
+// The hoster-priority helpers live in a LEAF module (no imports) so client components can share the
+// exact same default order as the server without pulling this module's engine/undici dependency chain
+// into the browser bundle. Re-exported here so `import { ... } from '@/lib/getcomics'` keeps working.
+export * from './hoster-prefs';

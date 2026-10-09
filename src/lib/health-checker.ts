@@ -7,6 +7,7 @@ import { CACHE_DIR, WATCHED_DIR, UNMATCHED_DIR } from '@/lib/utils/paths';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 import { findDuplicateGroups } from '@/lib/duplicate-detector';
 import { SystemNotifier } from '@/lib/notifications';
+import { KOMGA_VERIFY_GIVEUP_PREFIX, KOMGA_VALVE_ERROR_PREFIX } from '@/lib/komga/constants';
 import packageJson from '../../package.json';
 import { readRateStatus } from '@/lib/metron/client';
 import { describeMetronHealth, metronCalls24h, type MetronSnapshot } from '@/lib/metron/health';
@@ -464,6 +465,115 @@ export async function runSystemHealthCheck() {
         }
     } catch (e) {
         Logger.log(`[Health Check Debug] Duplicate file scan failed: ${getErrorMessage(e)}`, 'debug');
+    }
+
+    // 12. Komga (DB ONLY — no live HTTP call). The health check runs on a schedule and must stay
+    // fast and side-effect-free, so nothing here talks to Komga: every input was already written by
+    // the Phase 2-4 pipeline (KomgaSyncState, the KomgaLibrary cache and the verification JobLog).
+    // A stale or empty read therefore says "the pipeline has not recorded that recently", which is
+    // the fact worth showing — not "Komga is down".
+    if ((config.komga_enabled ?? '') === 'true') {
+        Logger.log(`[Health Check Debug] Reading the Komga sync state from the database...`, 'debug');
+        try {
+            const dayAgo = new Date(Date.now() - (24 * 60 * 60 * 1000));
+            const [syncStates, unmappedCount, verifyGiveUps] = await Promise.all([
+                prisma.komgaSyncState.findMany({
+                    select: { omnibusLibraryId: true, consecutiveFailures: true, lastError: true, lastReconciledAt: true },
+                }),
+                prisma.komgaLibrary.count({ where: { omnibusLibraryId: null } }),
+                prisma.jobLog.count({
+                    where: { jobType: 'KOMGA_SCAN', message: { startsWith: KOMGA_VERIFY_GIVEUP_PREFIX }, createdAt: { gte: dayAgo } },
+                }),
+            ]);
+
+            const nameOf = (id: string) => libraries.find(l => l.id === id)?.name || id;
+
+            // 12a. Libraries that cannot sync right now. `consecutiveFailures` is the retry counter
+            // the pipeline keeps; a stuck non-zero value is what parks a library behind its back-off.
+            const failing = syncStates.filter(s => s.consecutiveFailures > 0 || (s.lastError ?? '') !== '');
+            if (failing.length > 0) {
+                const worst = failing.reduce((a, b) => (b.consecutiveFailures > a.consecutiveFailures ? b : a));
+                Logger.log(`[Health Check Debug] Komga: ${failing.length} librar(y/ies) with a recorded failure.`, 'debug');
+                results.push({
+                    id: 'komga_failures',
+                    name: 'Komga Sync Failures',
+                    status: 'warning',
+                    message: `${failing.length} Komga-synced librar${failing.length === 1 ? 'y is' : 'ies are'} failing: ${nameOf(worst.omnibusLibraryId)} (${worst.consecutiveFailures} consecutive failure${worst.consecutiveFailures === 1 ? '' : 's'}). Last error: ${(worst.lastError || 'unknown').slice(0, 300)}. Fixing the URL, API key or path mapping resets the back-off; a nightly reconcile also recovers a library that stopped for another reason.`,
+                    actionLink: '/admin/settings',
+                    details: failing.map(s => `${nameOf(s.omnibusLibraryId)}${s.consecutiveFailures > 0 ? ` — ${s.consecutiveFailures} consecutive failure(s)` : ''}${s.lastError ? `: ${s.lastError.slice(0, 300)}` : ''}`),
+                });
+            } else {
+                results.push({ id: 'komga_failures', name: 'Komga Sync Failures', status: 'ok', message: 'No recorded Komga scan failures' });
+            }
+
+            // 12b. Komga libraries that serve no Omnibus library. Their files are never scanned and
+            // nothing in them can be matched, so reading lists built from them stay empty.
+            if (unmappedCount > 0) {
+                results.push({
+                    id: 'komga_unmapped',
+                    name: 'Komga Library Mapping',
+                    status: 'warning',
+                    message: `${unmappedCount} Komga librar${unmappedCount === 1 ? 'y is' : 'ies are'} not inside any Omnibus library. Omnibus never scans ${unmappedCount === 1 ? 'it' : 'them'}, and issues filed only under ${unmappedCount === 1 ? 'that path' : 'those paths'} cannot be pushed to Komga. Check the path mappings, or move the Omnibus library so one path contains the other.`,
+                    actionLink: '/admin/settings',
+                });
+            } else {
+                results.push({ id: 'komga_unmapped', name: 'Komga Library Mapping', status: 'ok', message: 'Every Komga library maps to an Omnibus library' });
+            }
+
+            // 12c. A tripped reconcile safety valve. The valve aborts ALL identity-map writes on a
+            // listing it does not trust, and deliberately leaves lastReconciledAt alone — so this
+            // row is both the reason the map is frozen and the evidence of why.
+            const valves = syncStates.filter(s => (s.lastError ?? '').startsWith(KOMGA_VALVE_ERROR_PREFIX));
+            if (valves.length > 0) {
+                Logger.log(`[Health Check Debug] Komga: the reconcile safety valve tripped for ${valves.length} librar(y/ies).`, 'debug');
+                results.push({
+                    id: 'komga_safety_valve',
+                    name: 'Komga Reconcile Safety Valve',
+                    status: 'warning',
+                    message: `The reconcile refused to rewrite the ID map for ${valves.length} librar${valves.length === 1 ? 'y' : 'ies'} — it distrusts the Komga listing (usually "Komga listed 0 books" while links exist, or a pass that wanted to unlink far more than the safety budget allows). Nothing is lost: links are never deleted by a tripped valve. Fix the cause (Komga mid-scan, an unmounted share, a wrong path mapping) and rebuild the ID map from Admin → Jobs.`,
+                    actionLink: '/admin/settings',
+                    details: valves.map(s => `${nameOf(s.omnibusLibraryId)}: ${(s.lastError || '').slice(KOMGA_VALVE_ERROR_PREFIX.length).replace(/^\s*:\s*/, '')}`),
+                });
+            } else {
+                results.push({ id: 'komga_safety_valve', name: 'Komga Reconcile Safety Valve', status: 'ok', message: 'No safety-valve trips recorded' });
+            }
+
+            // 12d. Map freshness. The daily reconcile moves lastReconciledAt only when it produced a
+            // trustworthy picture, so a stale timestamp means the map really is out of date — which
+            // is exactly what a stopped worker, a disabled integration or a permanent error looks like.
+            const reconciledAts = syncStates.map(s => s.lastReconciledAt?.getTime() ?? 0).filter(t => t > 0);
+            const newestReconciled = reconciledAts.length > 0 ? Math.max(...reconciledAts) : 0;
+            const ageHours = newestReconciled === 0 ? Infinity : (Date.now() - newestReconciled) / (60 * 60 * 1000);
+            if (ageHours > 48) {
+                const when = newestReconciled === 0 ? 'It has never completed' : `The last one completed ${Math.round(ageHours)} hours ago`;
+                results.push({
+                    id: 'komga_reconcile_stale',
+                    name: 'Komga ID Map Freshness',
+                    status: 'warning',
+                    message: `The ID map has not been reconciled in over 48 hours — ${when.toLowerCase()}. Until it is, a file changed outside Omnibus (a manual move, another tool) stays invisible to Komga, and book ids that churned since then are not re-matched. Rebuild the ID map from Admin → Jobs.`,
+                    actionLink: '/admin/settings',
+                });
+            } else {
+                results.push({ id: 'komga_reconcile_stale', name: 'Komga ID Map Freshness', status: 'ok', message: `Reconciled ${Math.round(ageHours)} hour(s) ago` });
+            }
+
+            // 12e. Paths Komga never picked up, after the pipeline ran out of verification retries.
+            // Each one is a file Omnibus believes it synced and Komga cannot find.
+            if (verifyGiveUps > 0) {
+                results.push({
+                    id: 'komga_verify_giveups',
+                    name: 'Komga Missing Files',
+                    status: 'warning',
+                    message: `${verifyGiveUps} scan verification${verifyGiveUps === 1 ? '' : 's'} gave up in the last 24 hours: Komga's listing did not contain the file(s) Omnibus expected, even after a deep rescan. Common causes are a file type Komga cannot read (.cb7), a directory exclusion in the Komga library, or a write that did not change the folder's modified time. Run a full sync and reconcile from Admin → Jobs.`,
+                    actionLink: '/admin/settings',
+                });
+            } else {
+                results.push({ id: 'komga_verify_giveups', name: 'Komga Missing Files', status: 'ok', message: 'No verification give-ups in the last 24 hours' });
+            }
+        } catch (e) {
+            // A health check must never fail because an OPTIONAL integration's tables are missing.
+            Logger.log(`[Health Check Debug] Komga state read failed: ${getErrorMessage(e)}`, 'debug');
+        }
     }
 
     let overallStatus: 'HEALTHY' | 'WARNING' | 'DEGRADED' = 'HEALTHY';

@@ -8,6 +8,7 @@ import { parseComicVineCredits } from '@/lib/utils';
 import { getErrorMessage } from './utils/error';
 import { MetronProvider } from './metadata/providers/metron';
 import { omnibusQueue } from './queue';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { markSystemFlag, countApiUsage } from './utils/system-flags';
 import { metronOptionalBudgetExhausted } from '@/lib/metron/client';
 import { metronCreditCandidatesWhere, metronDetailCreditsEnabled } from '@/lib/metron/credit-candidates';
@@ -16,6 +17,7 @@ import { isSameIssue } from '@/lib/utils/issue-parser';
 import { resolveSyncedName, detailNameWrite } from '@/lib/utils/synced-name';
 import { findLocalCoverBasename, providerCoverBlocked } from '@/lib/utils/cover-plan';
 import { CV_VOLUME_CREDIT_FIELDS, parseVolumeCredits, persistSeriesCredits } from '@/lib/utils/volume-credits';
+import { guessBookTypeFromCvVolume, isCvRateLimited, isRealGenre, resolveSyncedReleaseDate } from './utils/metadata-policy';
 
 // Providers rarely report when a series ends, so Omnibus guesses: no new issue
 // within the admin-configured window (months) = Ended. Returns null when the
@@ -88,6 +90,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
                     const coverFileName = `cover${ext}`;
                     await fs.writeFile(path.join(folderPath, coverFileName), Buffer.from(imgRes.data));
+                    void recordLibraryChange({ paths: [path.join(folderPath, coverFileName)], seriesIds: [series.id], reason: 'series-cover', source: 'metadata-fetcher:metron' });
                     metronFinalCover = `/api/library/cover?path=${encodeURIComponent(path.join(folderPath, coverFileName))}`;
                     
                 } catch (e: unknown) {
@@ -165,7 +168,8 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                     // shared resolver lets them fill blanks but never clobber a real story title
                     // (detail-fetched or ComicInfo-read), and honors lock + file priority.
                     name: resolveSyncedName(targetRecord?.name, issue.name, issueNumStr, isLocked, fillOnly),
-                    releaseDate: isLocked ? targetRecord!.releaseDate : issue.releaseDate,
+                    releaseDate: resolveSyncedReleaseDate(targetRecord?.releaseDate, issue.releaseDate,
+                        isLocked, fillOnly && !healId, !!targetRecord?.filePath?.trim()),
                     description: issue.description,
                     coverUrl: issue.coverUrl,
                     // Metron's issue_list carries no per-issue credits — the old unconditional
@@ -297,7 +301,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                     removeOnFail: true
                 });
                 Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
-            } catch(e) {}
+            } catch(e) {
+                Logger.log(`[Metadata] Could not queue XML injection for ${series.name}: ${getErrorMessage(e)}`, 'warn');
+            }
 
             Logger.log(`[Metadata] Successfully synced ${syncedCount} Metron issues.`, 'success');
             return { success: true, count: syncedCount };
@@ -325,7 +331,10 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
             timeout: 15000
         });
     } catch (e: any) {
-        if (e.response?.status === 429) await markSystemFlag('cv_rate_limit_time');
+        if (isCvRateLimited(e.response?.status)) {
+            await markSystemFlag('cv_rate_limit_time');
+            throw new Error(`FATAL_RATE_LIMIT: ComicVine rate limited (${e.response.status})`);
+        }
         throw e;
     }
 
@@ -334,7 +343,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
     const imageUrl = volData.image?.medium_url || volData.image?.super_url;
 
-    const { genres: volGenres } = parseComicVineCredits(undefined, undefined, volData.concepts || undefined);
+    const volGenres = parseComicVineCredits(undefined, undefined, volData.concepts || undefined).genres.filter(isRealGenre);
     
     let cvFallbackCover = imageUrl || series.coverUrl;
 
@@ -369,6 +378,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
             const coverFileName = `cover${ext}`;
             await fs.writeFile(path.join(folderPath, coverFileName), Buffer.from(imgRes.data));
+            void recordLibraryChange({ paths: [path.join(folderPath, coverFileName)], seriesIds: [series.id], reason: 'series-cover', source: 'metadata-fetcher:comicvine' });
             cvFinalCover = `/api/library/cover?path=${encodeURIComponent(path.join(folderPath, coverFileName))}`;
             
         } catch (e: unknown) {
@@ -376,13 +386,7 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
         }
     }
 
-    // ComicVine has no format field, so book type is a conservative guess: explicit
-    // format hints in the volume name, or a finished single-issue volume = one-shot
-    let guessedBookType: string | null = null;
-    const volName = volData.name || '';
-    if (/graphic novel|\bOGN\b/i.test(volName)) guessedBookType = 'GN';
-    else if (/\bTPB\b|trade paperback|\bHC\b|hardcover/i.test(volName)) guessedBookType = 'TPB';
-    else if (volData.count_of_issues === 1 && volData.end_year) guessedBookType = 'OneShot';
+    const guessedBookType = guessBookTypeFromCvVolume(volData);
 
     await prisma.series.update({
         where: { id: series.id },
@@ -422,7 +426,6 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
     let totalResults = 1;
     let loopCount = 0;
     let syncedCount = 0;
-    let issuesCallsMade = 0;
 
     Logger.log(`[Metadata Fetcher Debug] Fetching issues for volume "${series.name}" (ID: ${metadataId}, Offset: ${offset}, Limit: 100)`, 'debug');
     let latestDateMs = 0;
@@ -444,9 +447,11 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 headers: { 'User-Agent': 'Omnibus/1.0' },
                 timeout: 15000
             });
-            issuesCallsMade++;
         } catch (e: any) {
-            if (e.response?.status === 429) await markSystemFlag('cv_rate_limit_time');
+            if (isCvRateLimited(e.response?.status)) {
+                await markSystemFlag('cv_rate_limit_time');
+                throw new Error(`FATAL_RATE_LIMIT: ComicVine rate limited (${e.response.status})`);
+            }
             throw e;
         }
 
@@ -501,7 +506,8 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                 // Shared resolver (#199 round 3): keeps lock + file-priority semantics and stops a
                 // null/generic provider name from wiping a real story title (engine parity).
                 name: resolveSyncedName(targetRecord?.name, cvIssue.name, issueNumStr, isLocked, fillOnly),
-                releaseDate: isLocked ? targetRecord!.releaseDate : (cvIssue.store_date || cvIssue.cover_date || null),
+                releaseDate: resolveSyncedReleaseDate(targetRecord?.releaseDate, cvIssue.store_date || cvIssue.cover_date || null,
+                    isLocked, fillOnly && !healId, !!targetRecord?.filePath?.trim()),
                 description: cvIssue.description || cvIssue.deck || null,
                 coverUrl: cvIssue.image?.medium_url || cvIssue.image?.small_url || null,
                 matchState: 'MATCHED'
@@ -586,7 +592,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
                     removeOnFail: true
                 });
                 Logger.log(`[Metadata] Queued XML injection for ${series.name}`, 'info');
-            } catch(e) {}
+            } catch(e) {
+                Logger.log(`[Metadata] Could not queue XML injection for ${series.name}: ${getErrorMessage(e)}`, 'warn');
+            }
 
     Logger.log(`[Metadata] Successfully synced ${syncedCount} ComicVine issues.`, 'success');
     return { success: true, count: syncedCount };

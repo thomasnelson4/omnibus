@@ -11,6 +11,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger'; 
 import { MetronProvider } from '@/lib/metadata/providers/metron';
 import { AuditLogger } from '@/lib/audit-logger';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getServerSession } from 'next-auth/next';
 import { omnibusQueue } from '@/lib/queue';
@@ -26,6 +27,7 @@ import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { findLocalCoverBasename } from '@/lib/utils/cover-plan';
 import { parseComicVineCredits } from '@/lib/utils';
 import { folderOwner, suggestFreeFolderName, attachAsCollected } from '@/lib/match-collision';
+import { assertAutomaticMatch, revalidateAutomaticMatch, type AutomaticMatchToken } from '@/lib/smart-match/service';
 import { replaceNamingToken } from '@/lib/utils/naming';
 
 // #199 round 4 Beta B: only non-empty credit groups become columns (never write a literal '[]' —
@@ -82,6 +84,15 @@ export async function POST(request: Request) {
     const session = await getServerSession(await getAuthOptions());
     if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
     const req = (await request.json()) as any;
+    // An automatic (auto-scan) suggestion is only as good as the server decision behind it: the
+    // browser's confidence flag authorizes nothing. Verified here, then re-checked (local evidence +
+    // settings only, no provider work) immediately before each write, because the provider/detail/
+    // collision reads in between can take seconds. Explicit reviewed manual matches are untouched.
+    let automaticToken: AutomaticMatchToken | null = null;
+    if (req.automaticMatch) {
+        try { automaticToken = await assertAutomaticMatch(req); }
+        catch (error: unknown) { return NextResponse.json({ error: getErrorMessage(error) }, { status: 409 }); }
+    }
     const { oldFolderPath, cvId, metadataId, metadataSource, name, year, publisher, exactIssueId, exactIssueNumber,
             universe, seriesGroup, imprint, description, lockMetadata, writeToFile, coverImageBase64, issueCoverImageBase64, issueCoverEmbed,
             dataMode, issueTitle } = req;
@@ -255,6 +266,10 @@ export async function POST(request: Request) {
     }
     const owner = await folderOwner(newFolderPath, excludeIds);
     if (owner && resolution?.mode === 'attach') {
+        if (automaticToken) {
+            try { await revalidateAutomaticMatch(automaticToken, req); }
+            catch (error: unknown) { return NextResponse.json({ error: getErrorMessage(error) }, { status: 409 }); }
+        }
         const attached = await attachAsCollected({
             owner,
             source: oldFolderPath,
@@ -306,6 +321,12 @@ export async function POST(request: Request) {
                 suggestedFolderName, volumeName: realName, volumeYear: realYear || null,
             },
         }, { status: 409 });
+    }
+
+    // Last read-only moment before the ordinary path mutates (publisher dir, Series row, moves).
+    if (automaticToken) {
+        try { await revalidateAutomaticMatch(automaticToken, req); }
+        catch (error: unknown) { return NextResponse.json({ error: getErrorMessage(error) }, { status: 409 }); }
     }
 
     const pubDir = path.dirname(newFolderPath);
@@ -400,6 +421,19 @@ export async function POST(request: Request) {
     let looseFileConflict = false;
 
     let activeFolderPath = oldFolderPath;
+    // Accumulated across the whole handler. The relocate (below) and the Series repoint sit OUTSIDE
+    // the swallowing try/catch, so a single end-of-handler emit would be skipped whenever the
+    // repoint throws. Flushing at each mutation point plus once at the end covers both.
+    const changedPaths: string[] = [];
+    const flushChanges = () => {
+        if (!changedPaths.length) return;
+        void recordLibraryChange({
+            paths: changedPaths.splice(0),
+            seriesIds: existingRecord?.id ? [existingRecord.id] : undefined,
+            reason: 'match',
+            source: 'api/library/match-series',
+        });
+    };
     if (isFile) {
         if (!fs.existsSync(newFolderPath)) {
             await ensureLibraryDir(newFolderPath);
@@ -415,6 +449,8 @@ export async function POST(request: Request) {
             // Cross-device-safe: /unmatched and the library are separate mounts in most Docker setups,
             // where a raw rename dies with EXDEV (discussion #169).
             await moveFileSafe(oldFolderPath, targetFilePath);
+            changedPaths.push(oldFolderPath, targetFilePath);
+            flushChanges();
         }
     } else if (path.normalize(oldFolderPath).toLowerCase() !== path.normalize(newFolderPath).toLowerCase()) {
         // Non-destructive folder relocate/merge: a pre-existing target is merged into, never deleted, and
@@ -426,6 +462,33 @@ export async function POST(request: Request) {
         const { conflicts: folderConflicts } = await safeRelocateFolder(oldFolderPath, newFolderPath, srcRoot);
         conflicts += folderConflicts;
         activeFolderPath = newFolderPath;
+
+        // Repoint every moved issue, not just a clicked loose file. Require a directory boundary
+        // so /X never catches /X (2016), and leave conflict files at their actual source path.
+        if (existingRecord?.id) {
+            const staleIssues = await prisma.issue.findMany({
+                where: { seriesId: existingRecord.id, filePath: { not: null } }
+            });
+            const normalize = (p: string) => path.posix.normalize(p.replace(/\\/g, '/'));
+            const oldPrefix = normalize(oldFolderPath).replace(/\/$/, '') + '/';
+            const newPrefix = normalize(newFolderPath).replace(/\/$/, '') + '/';
+            const updates = [];
+            for (const issue of staleIssues) {
+                if (!issue.filePath) continue;
+                const oldFilePath = normalize(issue.filePath);
+                if (!oldFilePath.startsWith(oldPrefix)) continue;
+                const newFilePath = newPrefix + oldFilePath.slice(oldPrefix.length);
+                if (fs.existsSync(issue.filePath) || !fs.existsSync(newFilePath)) continue;
+                updates.push(prisma.issue.update({
+                    where: { id: issue.id },
+                    data: { filePath: newFilePath }
+                }));
+            }
+            if (updates.length > 0) {
+                await prisma.$transaction(updates);
+                Logger.log(`[Match Series] Repointed filePath for ${updates.length} issue(s) after folder relocate.`, 'info');
+            }
+        }
     }
 
     try {
@@ -434,7 +497,6 @@ export async function POST(request: Request) {
         for (const file of files) {
             const rawExt = path.extname(file);
             if (COMIC_EXTENSIONS.includes(rawExt.toLowerCase())) {
-                const oldName = path.basename(file, rawExt);
                 let finalExt = rawExt.toLowerCase();
                 let issueNumStr = "";
                 let targetIssueMetaId = null;
@@ -450,7 +512,10 @@ export async function POST(request: Request) {
                             finalExt = '.cbz';
                             Logger.log(`[Match Series Debug] Fake CBR detected for ${file}. Correcting to .cbz`, 'debug');
                         }
-                    } catch (e) {}
+                    } catch (e) {
+                        // Pre-existing behaviour (from main): an unreadable file just keeps its extension.
+                        Logger.log(`[Match Series Debug] Could not read the magic bytes of ${file}: ${getErrorMessage(e)}`, 'debug');
+                    }
                 }
 
                 // 1. Identify if this is the EXACT file we clicked in the UI
@@ -517,6 +582,7 @@ export async function POST(request: Request) {
                     
                     const oldFilePath = path.join(activeFolderPath, file);
                     const newFilePath = path.join(activeFolderPath, newFileName);
+                    changedPaths.push(oldFilePath, newFilePath);
 
                     // 1. Handle OS Rename — never overwrite a different existing file (case-only differences
                     //    are treated as already-correct). On a real collision, leave the duplicate in place,
@@ -525,7 +591,10 @@ export async function POST(request: Request) {
                         if (fs.existsSync(newFilePath)) {
                             Logger.log(`[Match Series] Conflict: "${newFileName}" already exists in the target folder; not overwriting.`, 'warn');
                             conflicts++;
-                            if (isFile) { try { await moveFileSafe(oldFilePath, oldFolderPath); } catch (e) {} }
+                            if (isFile) {
+                                try { await moveFileSafe(oldFilePath, oldFolderPath); }
+                                catch (e) { Logger.log(`[Match Series] Could not restore ${oldFilePath} to the unmatched folder: ${getErrorMessage(e)}`, 'warn'); }
+                            }
                             continue;
                         }
                         Logger.log(`[Match Series Debug] Executing OS File Rename: ${file} -> ${newFileName}`, 'debug');
@@ -677,14 +746,25 @@ export async function POST(request: Request) {
             try {
                 const b64 = coverImageBase64.replace(/^data:image\/\w+;base64,/, '');
                 await fs.promises.writeFile(path.join(activeFolderPath, 'cover.jpg'), Buffer.from(b64, 'base64'));
-            } catch(e) {}
+                changedPaths.push(path.join(activeFolderPath, 'cover.jpg'));
+            } catch(e) {
+                Logger.log(`[Match Series] Could not write the custom series cover for ${realName}: ${getErrorMessage(e)}`, 'warn');
+            }
         } else if (imageUrl && !keepExistingCustomCover && !archiveKeepsLocalCover) {
             try {
                 const imgRes = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 3000, headers: { 'User-Agent': 'Omnibus/1.0' } });
                 await fs.promises.writeFile(path.join(activeFolderPath, 'cover.jpg'), Buffer.from(imgRes.data));
-            } catch(e) {}
+                changedPaths.push(path.join(activeFolderPath, 'cover.jpg'));
+            } catch(e) {
+                Logger.log(`[Match Series] Could not download the series cover for ${realName}: ${getErrorMessage(e)}`, 'warn');
+            }
         }
-    } catch (err) {}
+    } catch (err) {
+        // Pre-existing behaviour (from main): the DB repoint for this match is best-effort. Now
+        // logged, and any files already moved are still reported to Komga below.
+        Logger.log(`[Match Series] Match for ${oldFolderPath} did not complete: ${getErrorMessage(err)}`, 'warn');
+        flushChanges();
+    }
 
     try {
         const pendingRequests = await prisma.request.findMany({
@@ -740,15 +820,9 @@ export async function POST(request: Request) {
             }
         }
 
-        // When the admin supplied custom metadata, embed it (SeriesGroup/Universe/Description) into the
-        // files' ComicInfo.xml — unless they turned the per-edit toggle off, in which case fall back to
-        // the global default. Mirrors library/update's EMBED-on-write resolution.
-        if (lockMetadata && existingRecord?.id) {
-            const doWrite = writeToFile !== undefined ? writeToFile : (config.metadata_write_comicinfo !== 'false');
-            if (doWrite) {
-                await omnibusQueue.add('EMBED_METADATA', { type: 'EMBED_METADATA', seriesId: existingRecord.id }, { jobId: `EMBED_META_MATCH_${existingRecord.id}_${Date.now()}` });
-            }
-        }
+        // METADATA_SYNC embeds after fetching, so don't enqueue a concurrent writer using the
+        // same archive temp path. If fetching fails or a running sync suppresses this job,
+        // custom edits remain in the DB and reach files on the next successful embed.
     } catch (e: any) {
         Logger.log(`[Match Series] Failed to queue jobs: ${e.message}`, 'warn');
     }

@@ -14,6 +14,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 import { moveFileSafe, cleanupEmptyDirs, ensureLibraryDir } from '@/lib/utils/safe-fs';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { sanitizeFilename } from '@/lib/utils/sanitize';
 import { describeIssueFromFilename, normalizeFractionNumbers, isSameIssue } from '@/lib/utils/issue-parser';
 import { filePatternForIssue } from '@/lib/utils/file-pattern';
@@ -182,6 +183,9 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
     const safeImprint = sanitizeFilename(owner.imprint || '');
     const ownerFolder = owner.folderPath.replace(/\\/g, '/').replace(/\/+$/, '');
     let ensured = false;
+    // Accumulated across the loop; emitted in a finally so a DB throw mid-loop still reports the
+    // files that already moved.
+    const changedPaths: string[] = [];
 
     for (const item of items) {
         const base = path.basename(item.filePath);
@@ -217,6 +221,7 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
 
         if (!ensured) { await ensureLibraryDir(ownerFolder); ensured = true; }
         await moveFileSafe(item.filePath, target);
+        changedPaths.push(item.filePath, target);
         result.moved++;
 
         if (item.row) {
@@ -273,6 +278,12 @@ export async function attachAsCollected(input: AttachAsCollectedInput): Promise<
     const root = libraryRoots.find(r => normalizeFolder(sourceDir).startsWith(normalizeFolder(r))) || path.dirname(sourceDir);
     if (!isFile) {
         try { await cleanupEmptyDirs(sourceDir, root); } catch (e) { Logger.log(`[Match Collision] Couldn't tidy ${sourceDir}: ${getErrorMessage(e)}`, 'debug'); }
+    }
+
+    // Emitted last: every path here already moved, so a throw in the loop above still leaves this
+    // reachable for the files that succeeded.
+    if (changedPaths.length) {
+        void recordLibraryChange({ paths: changedPaths, seriesIds: [owner.id], reason: 'attach-collected', source: 'match-collision:attachAsCollected' });
     }
 
     return result;

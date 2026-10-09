@@ -10,6 +10,7 @@ import { omnibusQueue } from '@/lib/queue';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { AuditLogger } from '@/lib/audit-logger';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { sanitizeFilename as sanitize } from '@/lib/utils/sanitize';
 import { safeRelocateFolder } from '@/lib/utils/safe-fs';
 import { comicInfoDefaultsUpdateFragment } from '@/lib/utils/comicinfo-fields';
@@ -109,6 +110,9 @@ export async function POST(request: Request) {
                 Logger.log(`[Library Update] Folder relocate left ${conflicts} conflicting file(s) un-moved in ${activePath}.`, 'warn');
             }
             activePath = newPath;
+            // Old and new: a relocate crosses folders, and for a non-default library it can cross
+            // libraries. Emitted here because the else branch below is a DB-only change.
+            void recordLibraryChange({ paths: [activePath, newPath], reason: 'series-relocate', source: 'api/library/update' });
         } else {
             activePath = newPath;
         }
@@ -227,7 +231,10 @@ export async function POST(request: Request) {
                     jobId: `EMBED_META_${existingRecord.id}_${Date.now()}`
                 });
                 Logger.log(`[Metadata] Queued XML injection for manually edited series: ${cleanName}`, 'info');
-            } catch (e) {}
+            } catch (e) {
+                // Pre-existing behaviour (from main): a failed enqueue must not fail the edit.
+                Logger.log(`[Metadata] Could not queue XML injection for ${cleanName}: ${getErrorMessage(e)}`, 'warn');
+            }
         }
 
     } else if (parsedCvId) {

@@ -1,0 +1,17 @@
+event:BookAdded
+data:{"bookId":"0RT16PY3ZXKCT","seriesId":"0RT16PY3ZXKCH","libraryId":"0RT16D9ZFXHD0"}
+
+event:BookAdded
+data:{"bookId":"0RT16PY3ZXKCV","seriesId":"0RT16PY3ZXKCH","libraryId":"0RT16D9ZFXHD0"}
+
+:heartbeat
+
+event:TaskQueueStatus
+data:{"count":437,"countByType":{"RefreshBookMetadata":396,"RefreshSeriesMetadata":39,"ScanLibrary":2}}
+
+event:BookChanged
+data:{"bookId":"0RT16PXPVXHFD","seriesId":"0RT16PXPVXHF5","libraryId":"0RT16D9ZFXHD0"}
+
+event:BookChanged
+data:{"bookId":"0RT16PXPVXHF8","seriesId":"0RT16PXPVXHF5","libraryId":"0RT16D9ZFXHD0"}
+

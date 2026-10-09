@@ -36,6 +36,7 @@ import { CoverageField } from "@/components/coverage-field"
 import { CollectedReadButton, CollectedProgressBadge } from "@/components/collected-read-button"
 import { CoveredIssuesSection } from "@/components/covered-issues-section"
 import { requestNameFor } from "@/lib/utils/request-name"
+import { InteractiveSearchModal } from "@/components/interactive-search-modal"
 import { hasMetronCredentials } from "@/lib/metron/credentials"
 import { RefreshMetadataButton } from "@/components/refresh-metadata-button"
 
@@ -113,6 +114,7 @@ function SeriesContent() {
   const [isScanningDirectory, setIsScanningDirectory] = useState(false);
 
   const [matchModalOpen, setMatchModalOpen] = useState(false);
+  const [interactiveSearchOpen, setInteractiveSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -1332,6 +1334,12 @@ function SeriesContent() {
                       </Button>
                   )}
                   
+                  {canRequest && (
+                      <Button variant="outline" className="w-full border-border hover:bg-muted text-foreground font-bold" onClick={() => setInteractiveSearchOpen(true)}>
+                          <Search className="w-4 h-4 mr-2" /> Interactive Search
+                      </Button>
+                  )}
+
                   <Button variant={seriesInfo.isFavorite ? "default" : "outline"} className={cn("w-full font-bold transition-all", seriesInfo.isFavorite ? 'bg-primary hover:bg-primary/90 text-primary-foreground border-0' : 'border-border hover:bg-muted')} onClick={toggleFavorite} disabled={!seriesInfo.id}>
                       <Heart className={cn("w-4 h-4 mr-2", seriesInfo.isFavorite && "fill-current")} /> Favorite
                   </Button>
@@ -2446,6 +2454,23 @@ function SeriesContent() {
               </DialogFooter>
           </DialogContent>
       </Dialog>
+
+      {canRequest && interactiveSearchOpen && (
+          <InteractiveSearchModal
+              isOpen={interactiveSearchOpen}
+              onClose={() => setInteractiveSearchOpen(false)}
+              initialQuery={seriesInfo.name}
+              comicData={{
+                  cvId: seriesInfo.metadataId || seriesInfo.cvId || 0,
+                  year: seriesInfo.year || '',
+                  publisher: seriesInfo.publisher || 'Unknown',
+                  image: seriesInfo.cover || '',
+                  type: 'volume',
+                  metadataSource: seriesInfo.metadataSource,
+                  isManga: seriesInfo.isManga,
+              }}
+          />
+      )}
 
       <MetadataEditorModal
           open={metaModalOpen}

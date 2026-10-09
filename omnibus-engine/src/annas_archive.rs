@@ -36,18 +36,30 @@ const KNOWN_MIRRORS: [&str; 4] = [
     "https://annas-archive.org",
 ];
 
-/// Ordered, de-duplicated base URLs to try: the configured base first, then the known mirrors. Pure.
-fn mirror_candidates(configured: &str) -> Vec<String> {
-    let c = configured.trim().trim_end_matches('/').to_string();
-    let mut out: Vec<String> = vec![c];
-    for m in KNOWN_MIRRORS {
-        if !out.iter().any(|x| x == m) { out.push(m.to_string()); }
+/// Keep URL normalization and candidate ordering aligned with Node's annas-mirrors.ts.
+fn normalize_mirror(raw: &str) -> Option<String> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() ||
+        url.password().is_some() || url.query().is_some() || url.fragment().is_some() ||
+        !url.path().chars().all(|c| c == '/') {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+/// Try the configured primary, then user fallbacks in order, then the built-in mirrors. Pure.
+fn mirror_candidates(configured: &str, fallbacks: &str) -> Vec<String> {
+    let primary = if configured.trim().is_empty() { DEFAULT_BASE_URL } else { configured };
+    let mut out = Vec::new();
+    for raw in std::iter::once(primary).chain(fallbacks.split([',', '\n', '\r'])).chain(KNOWN_MIRRORS) {
+        if let Some(mirror) = normalize_mirror(raw) {
+            if !out.contains(&mirror) { out.push(mirror); }
+        }
     }
     out
 }
 
-/// The configured Anna's Archive base URL (default annas-archive.org), trailing slash trimmed. AA
-/// rotates mirror domains (.org/.se/.li) under takedown pressure, so it's admin-overridable.
+/// The configured primary Anna's Archive mirror, preserving existing single-URL configurations.
 async fn base_url(db: &sqlx::AnyPool) -> String {
     sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'annas_archive_base_url'"#)
         .fetch_optional(db).await.ok().flatten()
@@ -128,10 +140,20 @@ fn parse_size(text: &str) -> Option<i64> {
     Some((num * mult) as i64)
 }
 
-/// Cloudflare/DDoS-Guard-aware fetch, mirroring `getcomics::fetch_html` but tagged for Anna's Archive
-/// and reusing the shared `getcomics::solver_config`. On a 403/503 it routes through the configured
-/// solver; if that fails (or none is set) it returns the raw (likely-challenge) body so the caller
-/// degrades to an empty result list rather than erroring.
+/// Reject outages and recognizable challenge pages so the caller can try another mirror. An actual
+/// search page with zero matches is valid and must not trigger another search on every mirror.
+fn validate_search_html(status: u16, html: String) -> anyhow::Result<String> {
+    if !(200..300).contains(&status) { anyhow::bail!("HTTP {}", status); }
+    let lower = html.to_lowercase();
+    if ["cf-chl-", "id=\"challenge-form\"", "id='challenge-form'", "<title>just a moment", "<title>ddos-guard", "/_guard/html.js"]
+        .iter().any(|marker| lower.contains(marker)) {
+        anyhow::bail!("Mirror returned a challenge page");
+    }
+    Ok(html)
+}
+
+/// Cloudflare/DDoS-Guard-aware fetch, reusing the shared solver configuration. Failed solves and
+/// HTTP failures propagate to mirror failover instead of being parsed as an empty result list.
 async fn fetch_html(client: &Client, db: &sqlx::AnyPool, url: &str, flaresolverr: Option<&str>) -> anyhow::Result<String> {
     let res = client.get(url).send().await?;
     let status = res.status();
@@ -144,8 +166,10 @@ async fn fetch_html(client: &Client, db: &sqlx::AnyPool, url: &str, flaresolverr
             match crate::getcomics::solver_request_get(client, db, flare_url, url, &sc).await {
                 Ok(data) => {
                     if let Some(html) = data["solution"]["response"].as_str() {
-                        log::info!("[Anna's Archive] {} bypass successful for {}", sc.kind, url);
-                        return Ok(html.to_string());
+                        if let Ok(html) = validate_search_html(200, html.to_string()) {
+                            log::info!("[Anna's Archive] {} bypass successful for {}", sc.kind, url);
+                            return Ok(html);
+                        }
                     }
                     log::warn!("[Anna's Archive] {} returned no usable HTML for {}", sc.kind, url);
                 }
@@ -155,7 +179,7 @@ async fn fetch_html(client: &Client, db: &sqlx::AnyPool, url: &str, flaresolverr
             log::warn!("[Anna's Archive] HTTP {} for {} and no Cloudflare solver configured.", status.as_u16(), url);
         }
     }
-    Ok(res.text().await?)
+    validate_search_html(status.as_u16(), res.text().await?)
 }
 
 /// Searches Anna's Archive across the given queries and returns unified DDL results (de-duped by md5
@@ -170,6 +194,8 @@ pub async fn search(
     is_manga: bool,
 ) -> anyhow::Result<Vec<ProwlarrResult>> {
     let base = base_url(db).await;
+    let fallbacks = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'annas_archive_mirrors'"#)
+        .fetch_optional(db).await?.unwrap_or_default();
     let allowed_formats = formats(db).await;
     let blocklist = content_blocklist(db).await;
 
@@ -181,11 +207,9 @@ pub async fn search(
 
     let flare_url: Option<String> = sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = 'flaresolverr_url'"#).fetch_optional(db).await?;
     let client = crate::browser_http_client();
-    // Mirror failover: lock onto a reachable host on the first successful fetch; if the configured base
-    // is dead (AA rotates domains), fall over to a known mirror and use it for the rest of this call.
-    let candidates = mirror_candidates(&base);
-    let mut active_base = base.clone();
-    let mut base_locked = false;
+    let candidates = mirror_candidates(&base, &fallbacks);
+    // Reuse the working mirror across pages, but retry the others if it goes down mid-search.
+    let mut active_base = candidates[0].clone();
 
     let a_sel = Selector::parse("a").unwrap();
     let h3_sel = Selector::parse("h3").unwrap();
@@ -198,38 +222,27 @@ pub async fn search(
         log::info!("[Anna's Archive] Searching for: \"{}\"", q);
 
         for page in 1..=max_pages {
-            limiter.enforce("annas_archive", if is_interactive { 2500 } else { 4000 }).await;
-
-            let html = if base_locked {
-                let url = build_search_url(&active_base, q, &allowed_formats, !is_manga, page);
+            let ordered: Vec<&String> = std::iter::once(&active_base)
+                .chain(candidates.iter().filter(|c| *c != &active_base)).collect();
+            let mut got = None;
+            for cand in ordered {
+                limiter.enforce("annas_archive", if is_interactive { 2500 } else { 4000 }).await;
+                let url = build_search_url(cand, q, &allowed_formats, !is_manga, page);
                 log::debug!("[Anna's Archive Debug] Searching page {}/{}: {}", page, max_pages, url);
                 match fetch_html(&client, db, &url, flare_url.as_deref()).await {
-                    Ok(h) => h,
-                    Err(e) => { log::warn!("[Anna's Archive] Fetch failed for \"{}\": {}", q, e); break; }
+                    Ok(html) => { got = Some((cand.clone(), html)); break; }
+                    Err(e) => log::warn!("[Anna's Archive] Mirror {} unavailable: {}; trying the next mirror.", cand, e),
                 }
-            } else {
-                // First fetch: try the configured base, then fail over to known mirrors on connect errors.
-                let mut got: Option<String> = None;
-                for cand in &candidates {
-                    let url = build_search_url(cand, q, &allowed_formats, !is_manga, page);
-                    log::debug!("[Anna's Archive Debug] Searching page {}/{}: {}", page, max_pages, url);
-                    match fetch_html(&client, db, &url, flare_url.as_deref()).await {
-                        Ok(h) => {
-                            if cand != &active_base {
-                                log::warn!("[Anna's Archive] Configured mirror {} unreachable; switched to {}. Update the Base URL in Settings.", active_base, cand);
-                                active_base = cand.clone();
-                            }
-                            base_locked = true;
-                            got = Some(h);
-                            break;
-                        }
-                        Err(e) => log::warn!("[Anna's Archive] Mirror {} unreachable: {}", cand, e),
+            }
+            let html = match got {
+                Some((mirror, html)) => {
+                    if mirror != active_base {
+                        log::info!("[Anna's Archive] Switched from {} to {}.", active_base, mirror);
+                        active_base = mirror;
                     }
+                    html
                 }
-                match got {
-                    Some(h) => h,
-                    None => { log::warn!("[Anna's Archive] All known mirrors unreachable for \"{}\".", q); break; }
-                }
+                None => { log::warn!("[Anna's Archive] All mirrors unavailable for \"{}\".", q); break; }
             };
 
             // Extract (md5, title, full-text) first so the non-Send scraper types drop before any await.
@@ -254,7 +267,7 @@ pub async fn search(
                 }).collect()
             };
 
-            if cards.is_empty() { break; } // end of results / a blocked challenge page
+            if cards.is_empty() { break; } // end of results
 
             for (md5, title, full_text) in cards {
                 if !seen.insert(md5.clone()) { continue; }
@@ -312,6 +325,47 @@ pub async fn search(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_once(status: u16, body: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before sending request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = format!("HTTP/1.1 {} Test\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, body.len(), body);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (base, task)
+    }
+
+    #[tokio::test]
+    async fn search_uses_custom_fallback_after_http_outage_or_challenge() {
+        sqlx::any::install_default_drivers();
+        for (status, body) in [(503, "unavailable"), (200, "<title>Just a moment...</title>")] {
+            let (primary, primary_task) = serve_once(status, body.into()).await;
+            let md5 = "0123456789abcdef0123456789abcdef";
+            let (fallback, fallback_task) = serve_once(200, format!("<!-- <a href='/md5/{}'><h3>Batman 001</h3><div>English, CBZ, 12.3MB</div></a> -->", md5)).await;
+            let db = sqlx::any::AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+            sqlx::query(r#"CREATE TABLE "SystemSetting" (key TEXT PRIMARY KEY, value TEXT NOT NULL)"#).execute(&db).await.unwrap();
+            for (key, value) in [("annas_archive_base_url", primary.as_str()), ("annas_archive_mirrors", fallback.as_str())] {
+                sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES (?, ?)"#).bind(key).bind(value).execute(&db).await.unwrap();
+            }
+            let results = search(&db, &crate::rate_limiter::RateLimiter::new(), &["Batman".into()], true, false).await.unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].download_url, format!("{}/md5/{}", fallback, md5));
+            assert_eq!(results[0].title, "Batman 001 [cbz]");
+            assert_eq!(results[0].size, 12_300_000);
+            primary_task.await.unwrap();
+            fallback_task.await.unwrap();
+        }
+    }
 
     #[test]
     fn extracts_md5_lowercased() {
@@ -357,13 +411,39 @@ mod tests {
 
     #[test]
     fn mirror_candidates_dedup_configured_first() {
-        let c = mirror_candidates("https://annas-archive.gl");
+        let c = mirror_candidates("https://annas-archive.gl", "");
         assert_eq!(c[0], "https://annas-archive.gl");
         assert_eq!(c.iter().filter(|x| x.as_str() == "https://annas-archive.gl").count(), 1);
         assert!(c.contains(&"https://annas-archive.se".to_string()));
         // A non-standard configured mirror still goes first, with the known mirrors appended after.
-        let c2 = mirror_candidates("https://annas-archive.pk/");
+        let c2 = mirror_candidates("https://annas-archive.pk/", "");
         assert_eq!(c2[0], "https://annas-archive.pk");
         assert!(c2.contains(&"https://annas-archive.gl".to_string()));
+    }
+
+    #[test]
+    fn configured_fallbacks_precede_builtins_and_deduplicate() {
+        let c = mirror_candidates("https://PRIMARY.example/", " https://one.example/\r\nhttps://two.example,https://one.example\nhttps://annas-archive.gl");
+        assert_eq!(&c[..4], &["https://primary.example", "https://one.example", "https://two.example", "https://annas-archive.gl"]);
+        assert_eq!(c.iter().filter(|x| *x == "https://one.example").count(), 1);
+        assert_eq!(mirror_candidates("", "https://fallback.example")[0], DEFAULT_BASE_URL);
+    }
+
+    #[test]
+    fn invalid_mirrors_are_not_requested() {
+        let c = mirror_candidates("not a url", "ftp://bad.example\nhttps://user:pass@bad.example\nhttps://bad.example/md5/1\nhttps://bad.example?key=x\nhttps://good.example");
+        assert_eq!(c[0], "https://good.example");
+        assert!(!c.iter().any(|m| m.contains("bad.example")));
+    }
+
+    #[test]
+    fn rejects_outages_and_challenges_but_accepts_empty_search_pages() {
+        assert!(validate_search_html(503, "unavailable".into()).is_err());
+        assert!(validate_search_html(429, "rate limited".into()).is_err());
+        assert!(validate_search_html(404, "not found".into()).is_err());
+        assert!(validate_search_html(200, "<title>Just a moment...</title>".into()).is_err());
+        assert!(validate_search_html(200, "<script src='/cdn-cgi/challenge-platform/cf-chl-test'></script>".into()).is_err());
+        assert!(validate_search_html(200, "<title>DDoS-Guard</title>".into()).is_err());
+        assert!(validate_search_html(200, "<main>No results found</main>".into()).is_ok());
     }
 }

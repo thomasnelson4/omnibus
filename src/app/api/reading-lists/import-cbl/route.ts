@@ -6,7 +6,9 @@ import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { XMLParser } from 'fast-xml-parser';
+import { providerIdentityForImport } from '@/lib/utils/reading-list-match';
 import { assertSafeFetchUrl } from '@/lib/utils/ssrf';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 
 export const dynamic = 'force-dynamic';
 
@@ -68,11 +70,33 @@ export async function POST(request: Request) {
         if (!Array.isArray(rawBooks)) rawBooks = [rawBooks];
 
         const allSeries = await prisma.series.findMany({ select: { id: true, name: true, coverUrl: true, folderPath: true } });
-        const allIssues = await prisma.issue.findMany({ select: { id: true, seriesId: true, number: true } });
+        const allIssues = await prisma.issue.findMany({
+            select: { id: true, seriesId: true, number: true, metadataSource: true, metadataId: true }
+        });
 
         const normalize = (str: string) => str ? str.toLowerCase().replace(/[^a-z0-9]/g, '') : "";
 
-        const itemsToLink: { issueId: string | null, title: string }[] = [];
+        // The provider id a CBL entry carries, if any. Real-world CBL files (Kavita's export, the
+        // mylar-league tooling) carry per-book <Database Name="cv|metron" Series="<VOLUME id>"
+        // Issue="<issue id>"/> — sometimes wrapped in a <Databases/> parent, sometimes attributes,
+        // sometimes child elements, so look for both shapes and normalise to an array.
+        // Only the Issue id is read: `Series` there is a VOLUME id (4050-…), which must never be
+        // stored where an issue id is expected.
+        const bookDatabases = (book: any): any[] => {
+            const direct = book?.Database ?? book?.database;
+            const wrapped = book?.Databases?.Database ?? book?.databases?.database;
+            return [...(Array.isArray(direct) ? direct : direct ? [direct] : []),
+                    ...(Array.isArray(wrapped) ? wrapped : wrapped ? [wrapped] : [])];
+        };
+        const fileIdentity = (book: any) => {
+            for (const db of bookDatabases(book)) {
+                const identity = providerIdentityForImport(db?.Name ?? db?.name, db?.Issue ?? db?.issue);
+                if (identity) return identity;
+            }
+            return null;
+        };
+
+        const itemsToLink: { issueId: string | null, title: string, identity: { metadataSource: string, cvIssueId: number } | null }[] = [];
         let missingCount = 0;
         let listCoverUrl: string | null = null; 
 
@@ -97,6 +121,7 @@ export async function POST(request: Request) {
                 : [];
             const matchedSeries = exactSeries[0] || (prefixSeries.length === 1 ? prefixSeries[0] : null);
             let matchedIssueId = null;
+            let identity: { metadataSource: string, cvIssueId: number } | null = null;
 
             if (matchedSeries) {
                 if (!listCoverUrl) {
@@ -114,6 +139,9 @@ export async function POST(request: Request) {
 
                 if (matchedIssue) {
                     matchedIssueId = matchedIssue.id;
+                    // The matched Issue already knows its own provider identity — prefer that over
+                    // anything the file claims, since it is what the library was actually matched on.
+                    identity = providerIdentityForImport(matchedIssue.metadataSource, matchedIssue.metadataId);
                     Logger.log(`[CBL Import Debug] SUCCESS -> Linked to local issue [ID: ${matchedIssueId}]`, 'debug');
                 } else {
                     missingCount++;
@@ -124,9 +152,15 @@ export async function POST(request: Request) {
                 Logger.log(`[CBL Import Debug] FAILED -> No local series matched "${seriesName}".`, 'debug');
             }
 
+            // Fall back to the id in the file for entries the library can't link — that is exactly
+            // the row the "Fix match"/auto-link pass can resolve later, and the Komga LINK pass
+            // joins on. An absent or unusable id leaves the row unchanged (cvIssueId null).
+            if (!identity) identity = fileIdentity(book);
+
             itemsToLink.push({
                 issueId: matchedIssueId,
-                title: `${seriesName} #${issueNum}`
+                title: `${seriesName} #${issueNum}`,
+                identity
             });
         }
 
@@ -147,14 +181,18 @@ export async function POST(request: Request) {
         });
 
         let orderCount = 0;
+        // Spread the identity in only when there is one: a file with no provider ids anywhere must
+        // produce byte-for-byte the rows it produced before this fix.
         const itemsData = itemsToLink.map(item => ({
             listId: newList.id,
-            issueId: item.issueId, 
+            issueId: item.issueId,
             title: item.title,
-            order: orderCount++
+            order: orderCount++,
+            ...(item.identity ? { ...item.identity } : {})
         }));
 
         await prisma.readingListItem.createMany({ data: itemsData });
+        triggerReadListPushSoon(newList.id);
 
         return NextResponse.json({ 
             success: true, 

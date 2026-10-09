@@ -5,6 +5,8 @@ import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
+import { providerIdentityForImport } from '@/lib/utils/reading-list-match';
+import { triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 
 export const dynamic = 'force-dynamic';
 
@@ -38,17 +40,27 @@ export async function POST(request: Request) {
         
         const seriesIdx = headers.findIndex(h => h === 'series' || h === 'title');
         const issueIdx = headers.findIndex(h => h === 'issue' || h === 'number' || h === 'issue number');
+
+        // Provider-id columns, recognised with the same case-insensitive header style as the two
+        // above. Both are OPTIONAL: a CSV without them is the normal case, not an error, and the
+        // row imports exactly as it did before. Bare "issue id" is deliberately NOT claimed — it is
+        // ambiguous between namespaces, and guessing COMICVINE would mis-store a Metron id.
+        const findCol = (names: string[]) => headers.findIndex(h => names.includes(h));
+        const cvIdx = findCol(['comicvine id', 'comicvine issue id', 'comicvine', 'cv id', 'cv issue id', 'cvissueid']);
+        const metronIdx = findCol(['metron id', 'metron issue id', 'metron']);
         
         if (seriesIdx === -1) {
             return NextResponse.json({ error: "Could not find a 'Series' or 'Title' column in the CSV." }, { status: 400 });
         }
 
         const allSeries = await prisma.series.findMany({ select: { id: true, name: true, coverUrl: true, folderPath: true } });
-        const allIssues = await prisma.issue.findMany({ select: { id: true, seriesId: true, number: true } });
+        const allIssues = await prisma.issue.findMany({
+            select: { id: true, seriesId: true, number: true, metadataSource: true, metadataId: true }
+        });
 
         const normalize = (str: string) => str.toLowerCase().replace(/[^a-z0-9]/g, '');
 
-        const itemsToLink: { issueId: string | null, title: string }[] = [];
+        const itemsToLink: { issueId: string | null, title: string, identity: { metadataSource: string, cvIssueId: number } | null }[] = [];
         let missingCount = 0;
         let listCoverUrl: string | null = null; 
 
@@ -76,6 +88,10 @@ export async function POST(request: Request) {
                 : [];
             const matchedSeries = exactSeries[0] || (prefixSeries.length === 1 ? prefixSeries[0] : null);
             let matchedIssueId = null;
+            let identity: { metadataSource: string, cvIssueId: number } | null = null;
+            // Whatever the file declares for this row, if anything.
+            const rowIdentity = providerIdentityForImport('comicvine', cvIdx !== -1 ? cols[cvIdx] : '')
+                ?? providerIdentityForImport('metron', metronIdx !== -1 ? cols[metronIdx] : '');
 
             if (matchedSeries) {
                 if (!listCoverUrl) {
@@ -93,6 +109,9 @@ export async function POST(request: Request) {
 
                 if (matchedIssue) {
                     matchedIssueId = matchedIssue.id;
+                    // Prefer the identity of the Issue we actually linked to — the library is the
+                    // authority on what it matched, not the file that asked for it.
+                    identity = providerIdentityForImport(matchedIssue.metadataSource, matchedIssue.metadataId);
                     Logger.log(`[CSV Import Debug] SUCCESS -> Linked to local issue [ID: ${matchedIssueId}]`, 'debug');
                 } else {
                     missingCount++;
@@ -103,9 +122,14 @@ export async function POST(request: Request) {
                 Logger.log(`[CSV Import Debug] FAILED -> No local series matched "${seriesName}".`, 'debug');
             }
 
+            // Fall back to the file's column for rows the library can't link — that is the id the
+            // auto-link / "Fix match" pass can resolve later, and what the Komga LINK pass joins on.
+            if (!identity) identity = rowIdentity;
+
             itemsToLink.push({
                 issueId: matchedIssueId,
-                title: `${seriesName} #${issueNum}`
+                title: `${seriesName} #${issueNum}`,
+                identity
             });
         }
 
@@ -126,14 +150,18 @@ export async function POST(request: Request) {
         });
 
         let orderCount = 0;
+        // Spread the identity in only when there is one: a CSV with no provider-id column must
+        // produce byte-for-byte the rows it produced before this fix.
         const itemsData = itemsToLink.map(item => ({
             listId: newList.id,
-            issueId: item.issueId, 
+            issueId: item.issueId,
             title: item.title,
-            order: orderCount++
+            order: orderCount++,
+            ...(item.identity ? { ...item.identity } : {})
         }));
 
         await prisma.readingListItem.createMany({ data: itemsData });
+        triggerReadListPushSoon(newList.id);
 
         return NextResponse.json({ 
             success: true, 

@@ -6,6 +6,7 @@ import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { processAutomationQueue } from '@/lib/automation';
 import { getErrorMessage } from '@/lib/utils/error';
+import { enqueueKomgaReadListDeleteNow, triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 
 export const dynamic = 'force-dynamic';
 
@@ -119,17 +120,29 @@ export async function POST(request: Request) {
                 const canMakeGlobal = (session?.user as any)?.role === 'ADMIN' || (session?.user as any)?.canCreateGlobalLists === true;
                 const effectiveGlobal = isGlobal === true && canMakeGlobal;
 
-                // Delete old list if re-syncing
+                // Komga: a re-import REPLACES the list (see import-mal). Read the link BEFORE the deleteMany
+                // cascades it away, hand the Komga id to the delete job, and carry `komgaSync` onto
+                // the replacement so it adopts the old remote list through the takeover rule.
+                const replacedLinks = await prisma.komgaReadListLink.findMany({
+                    where: { readingList: { name: listName, userId: effectiveGlobal ? null : userId } },
+                    select: { readingListId: true, komgaReadListId: true },
+                });
                 await prisma.readingList.deleteMany({
                     where: { name: listName, userId: effectiveGlobal ? null : userId }
                 });
+                // After the deleteMany, because the ids were captured above and the cascade has
+                // already taken the rows: enqueueing needs only the id, not another lookup.
+                for (const old of replacedLinks) {
+                    if (old.komgaReadListId) enqueueKomgaReadListDeleteNow(old.komgaReadListId, old.readingListId);
+                }
 
                 const newList = await prisma.readingList.create({
                     data: {
                         name: listName,
                         description: `Imported from AniList user: ${username}`,
                         isGlobal: effectiveGlobal,
-                        userId: userId
+                        userId: userId,
+                        komgaSync: replacedLinks.length > 0 ? true : undefined,
                     }
                 });
 
@@ -154,6 +167,7 @@ export async function POST(request: Request) {
                 }));
 
                 await prisma.readingListItem.createMany({ data: itemsData });
+                triggerReadListPushSoon(newList.id);
 
                 listsCreated++;
                 totalMatchedSeries += matchedSeriesIds.size;

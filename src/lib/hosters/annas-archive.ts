@@ -1,8 +1,8 @@
 // src/lib/hosters/annas-archive.ts
-import axios from 'axios';
 import { Logger } from '../logger';
+import { requestAnnasArchiveApi, type AnnasMirrorConfig } from '../annas-api';
 
-export async function resolveAnnasArchive(url: string, account?: any) {
+export async function resolveAnnasArchive(url: string, account?: any, mirrors: AnnasMirrorConfig = {}) {
     try {
         Logger.log(`[Anna's Archive Debug] Evaluating URL: ${url}`, 'debug');
 
@@ -21,26 +21,13 @@ export async function resolveAnnasArchive(url: string, account?: any) {
             Logger.log(`[Anna's Archive] Using premium API key for fast download of ${md5}`, 'info');
             Logger.log(`[Anna's Archive Debug] Calling fast_download API endpoint...`, 'debug');
             
-            // Anna's Archive's fast-download JSON API (members only). The endpoint is
-            // /dyn/api/fast_download.json — the older /api/fast_download path no longer resolves.
-            // Follow whatever mirror the /md5/ link used (its origin); AA rotates domains frequently
-            // (.org/.se/.li are dead; .gl is current as of mid-2026).
-            let apiOrigin = 'https://annas-archive.gl';
-            try { apiOrigin = new URL(url).origin; } catch { /* malformed URL — keep the default mirror */ }
-            const apiRes = await axios.get(`${apiOrigin}/dyn/api/fast_download.json`, {
-                headers: { 'User-Agent': 'Omnibus/1.0' },
-                params: {
-                    key: account.apiKey,
-                    md5: md5
-                },
-                timeout: 15000
+            const { data } = await requestAnnasArchiveApi(account.apiKey, md5, {
+                ...mirrors,
+                preferredUrl: url,
             });
-
-            Logger.log(`[Anna's Archive Debug] API responded with status: ${apiRes.status}`, 'debug');
 
             // Success → { download_url, account_fast_download_info: { downloads_left, downloads_per_day } }
             // Failure → { error: "..." } (invalid key, exhausted daily quota, etc.).
-            const data = apiRes.data || {};
             if (data.download_url) {
                 const left = data.account_fast_download_info?.downloads_left;
                 if (typeof left === 'number') {

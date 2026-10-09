@@ -4,8 +4,9 @@ import path from 'path';
 import { prisma } from '@/lib/db';
 import { DownloadService } from './download-clients';
 import { Logger } from './logger';
-import { resolveRemotePath } from './utils/path-resolver'; 
-import axios from 'axios';
+import { getErrorMessage } from './utils/error';
+import { recordLibraryChange } from '@/lib/komga/changes';
+import { resolveRemotePath, resolveClientPath } from './utils/path-resolver';
 import { SystemNotifier } from './notifications';
 import { syncSeriesMetadata } from './metadata-fetcher';
 import { arrivalStamp } from './file-added';
@@ -122,7 +123,7 @@ export const Importer = {
     let sourcePath = "";
     let isFromClient = false;
     const downloadRoot = config.download_path || './downloads';
-    const trackingHash = req.downloadLink && !req.downloadLink.startsWith('http') ? req.downloadLink : null;
+    const trackingHash = req.clientDownloadId || (req.downloadLink && !req.downloadLink.startsWith('http') ? req.downloadLink : null);
 
     // Issue #198: usenet downloads are COPIED into the library (the torrent seed-preservation
     // path), stranding the original in the client's category folder. When the toggle is on and
@@ -143,28 +144,48 @@ export const Importer = {
 
     if (!sourcePath && trackingHash) {
       try {
-          const allActive = await DownloadService.getAllActiveDownloads();
-          const downloadItem = allActive.find((t: any) => t.id === trackingHash || t.name === req.activeDownloadName);
+          const allActive = await DownloadService.getAllActiveDownloads([trackingHash]);
+          const fromClient = (t: any) => !req.downloadClientId || t.clientId === req.downloadClientId;
+          const hasSabJobId = trackingHash.startsWith('SABnzbd_nzo_');
+          const downloadItem = allActive.find((t: any) => fromClient(t) && t.id === trackingHash)
+              || (!hasSabJobId && !req.clientDownloadId ? allActive.find((t: any) => fromClient(t) && t.name === req.activeDownloadName) : undefined);
           if (downloadItem) {
+              if (downloadItem.clientType === 'sab' && !downloadItem.isComplete) {
+                  Logger.log(`[Importer] SABnzbd job ${trackingHash} is still ${downloadItem.status}; waiting for post-processing to complete.`, 'info');
+                  return false;
+              }
               isFromClient = true;
               
               // Fetch the specific client to check if it has a custom Local Path override
               const clientConfig = await prisma.downloadClient.findFirst({
-                  where: { name: downloadItem.clientName }
+                  where: downloadItem.clientId ? { id: downloadItem.clientId } : { name: downloadItem.clientName }
               });
               
               const clientRoot = clientConfig?.localPath || downloadRoot;
-              const rawPath = path.join(clientRoot, downloadItem.name);
-              sourcePath = await resolveRemotePath(rawPath);
+              if (downloadItem.clientType === 'sab' && !downloadItem.contentPath) {
+                  Logger.log(`[Importer] SABnzbd job ${trackingHash} has no final storage path; leaving its source untouched.`, 'warn');
+                  return false;
+              }
+              // SAB's history.storage is the final job directory (after category routing/sorting).
+              // Keep this directory as sourcePath for cleanup; actualSourceFile below is only the
+              // individual archive copied into the library.
+              sourcePath = downloadItem.contentPath
+                  ? await resolveClientPath(downloadItem.contentPath, clientConfig || {})
+                  : await resolveRemotePath(path.join(clientRoot, downloadItem.name));
               sourceClientType = clientConfig?.type || null;
               sourceClientRoot = clientRoot;
 
-              Logger.log(`[Importer Debug] Using client root path: ${clientRoot} for ${downloadItem.name}`, 'debug');
+              Logger.log(`[Importer Debug] Using client download path: ${sourcePath} for ${downloadItem.name}`, 'debug');
           } else {
+              if (hasSabJobId || req.clientDownloadId) {
+                  Logger.log(`[Importer] Tracked client job ${trackingHash} was not found; waiting for its API-reported destination.`, 'warn');
+                  return false;
+              }
               Logger.log("[Importer] Download not found in active client list. Falling back to folder search.", "warn");
           }
       } catch (e: any) {
           Logger.log(`[Importer] Failed to fetch client info: ${e.message}`, "error");
+          if (req.clientDownloadId || trackingHash.startsWith('SABnzbd_nzo_')) return false;
       }
     }
     
@@ -373,7 +394,7 @@ export const Importer = {
                 }
             }
             if (!isFromClient && !trackingHash) {
-                try { await fs.remove(sourcePath); } catch(e) {}
+                try { await fs.remove(sourcePath); } catch(e) { Logger.log(`[Importer] Could not remove the source file ${sourcePath}: ${getErrorMessage(e)}`, 'debug'); }
             }
         } else if (isBatchArchive) {
             // Engine-first: streams each nested archive straight to disk (collision naming +
@@ -382,7 +403,7 @@ export const Importer = {
             if (engineExtract?.files) {
                 moveSuccessCount = engineExtract.files.length;
                 if (!isFromClient && !trackingHash) {
-                    try { await fs.remove(sourcePath); } catch(e) {}
+                    try { await fs.remove(sourcePath); } catch(e) { Logger.log(`[Importer] Could not remove the source file ${sourcePath}: ${getErrorMessage(e)}`, 'debug'); }
                 }
             } else if (isRarContainer) {
                 // No local fallback exists for RAR (AdmZip can't read it). Say what actually went
@@ -437,7 +458,9 @@ export const Importer = {
             await omnibusQueue.add('WATCHED_FOLDER_SYNC', { type: 'WATCHED_FOLDER_SYNC' }, {
                 jobId: `WATCHED_SYNC_BATCH_${Date.now()}`
             });
-        } catch(e) {}
+        } catch(e) {
+            Logger.log(`[Importer] Could not queue the watched-sync batch: ${getErrorMessage(e)}`, 'warn');
+        }
 
         Logger.log(`[Importer] Successfully routed ${moveSuccessCount} files to Watched folder. Batch import complete.`, 'success');
         
@@ -456,7 +479,7 @@ export const Importer = {
                 const ignoredSetting = await prisma.systemSetting.findUnique({ where: { key: 'ignored_downloads' } });
                 let ignored: string[] = [];
                 if (ignoredSetting?.value) {
-                    try { ignored = JSON.parse(ignoredSetting.value); } catch(e) {}
+                    try { ignored = JSON.parse(ignoredSetting.value); } catch(e) { Logger.log(`[Importer] Could not parse ignored_downloads; treating it as empty: ${getErrorMessage(e)}`, 'warn'); }
                 }
                 if (!ignored.includes(trackingHash)) {
                     ignored.push(trackingHash);
@@ -466,7 +489,9 @@ export const Importer = {
                         create: { key: 'ignored_downloads', value: JSON.stringify(ignored) }
                     });
                 }
-            } catch (ignoreErr) { }
+            } catch (ignoreErr) {
+                Logger.log(`[Importer] Could not record the ignored download: ${getErrorMessage(ignoreErr)}`, 'debug');
+            }
         }
 
         // Issue #198: the whole batch is safely in the watched folder — delete the original job
@@ -679,7 +704,16 @@ export const Importer = {
                 Logger.log(`[Importer] Standardizing folder to: ${idealDestFolder}`, "info");
                 await fs.ensureDir(path.dirname(idealDestFolder));
                 await fs.move(series.folderPath, idealDestFolder, { overwrite: false });
-                
+                // Emit before the series.update: the catch below swallows DB errors, so an emit
+                // placed after the update could be skipped while the move is already on disk.
+                // series.folderPath is still the OLD folder here; the object is never re-read.
+                void recordLibraryChange({
+                    paths: [series.folderPath, idealDestFolder],
+                    seriesIds: [series.id],
+                    reason: 'folder-standardize',
+                    source: 'importer:standardize',
+                });
+
                 await prisma.series.update({
                     where: { id: series.id },
                     data: { folderPath: idealDestFolder, libraryId: targetLibrary.id }
@@ -757,6 +791,9 @@ export const Importer = {
 
     let fileName = `${sanitize(newFileName)}${ext}`;
     let finalPath = path.join(destFolder, fileName);
+    // Set once the file has physically landed in the library, so the catch below can still report
+    // it if a later step (Prisma, notifier, usenet cleanup) throws.
+    let landedInLibrary = false;
     
     Logger.log(`[Importer Debug] Evaluated File Pattern: Issue="${formattedNum}", IssueYear="${issueYearFromMeta}" -> Result: ${fileName}`, 'debug');
     Logger.log(`[Importer Debug] Target move operation: [${actualSourceFile}] -> [${finalPath}]`, 'debug');
@@ -797,6 +834,10 @@ export const Importer = {
       }
 
       if (!moveSuccess) throw new Error("Failed to move file after multiple attempts due to network locks.");
+
+      // The file is now in the library. If anything below throws (Prisma, notifier, usenet cleanup)
+      // the catch handles it, but the file has landed and Komga must still hear about it.
+      landedInLibrary = true;
 
       // Issue #198: verify the copy NOW, while finalPath still mirrors the source byte-for-byte
       // (conversion replaces it with a different-sized .cbz later). The actual delete waits until
@@ -956,7 +997,9 @@ export const Importer = {
                      ...(shouldAdoptImprint ? { imprint: imprintName } : {})
                  }
              });
-         } catch (e) { }
+         } catch (e) {
+             Logger.log(`[Importer] Could not enqueue a post-import step: ${getErrorMessage(e)}`, 'warn');
+         }
 
          // Immediate local cover — don't wait for the delayed metadata sync (or depend on the server
          // being able to proxy a remote provider URL) to have a real cover in the grids. A custom
@@ -969,7 +1012,9 @@ export const Importer = {
                          where: { id: series.id },
                          data: { coverUrl: `/api/library/cover?path=${encodeURIComponent(coverFile)}` }
                      });
-                 } catch (e) { }
+                 } catch (e) {
+                     Logger.log(`[Importer] Could not record the local cover for the imported series: ${getErrorMessage(e)}`, 'debug');
+                 }
              }
          }
       }
@@ -1018,7 +1063,7 @@ export const Importer = {
               const ignoredSetting = await prisma.systemSetting.findUnique({ where: { key: 'ignored_downloads' } });
               let ignored: string[] = [];
               if (ignoredSetting?.value) {
-                  try { ignored = JSON.parse(ignoredSetting.value); } catch(e) {}
+                  try { ignored = JSON.parse(ignoredSetting.value); } catch(e) { Logger.log(`[Importer] Could not parse ignored_downloads; treating it as empty: ${getErrorMessage(e)}`, 'warn'); }
               }
               if (!ignored.includes(trackingHash)) {
                   ignored.push(trackingHash);
@@ -1028,7 +1073,9 @@ export const Importer = {
                       create: { key: 'ignored_downloads', value: JSON.stringify(ignored) }
                   });
               }
-          } catch (ignoreErr) { }
+          } catch (ignoreErr) {
+              Logger.log(`[Importer] Could not record the ignored download: ${getErrorMessage(ignoreErr)}`, 'debug');
+          }
       }
 
       let shouldNotify = true;
@@ -1089,9 +1136,24 @@ export const Importer = {
       }
 
       Logger.log(`[Importer] Successfully imported to: ${destFolder}`, "success");
+      void recordLibraryChange({
+        paths: [finalPath],
+        seriesIds: series?.id ? [series.id] : undefined,
+        reason: 'import',
+        source: 'importer',
+      });
       return true;
 
     } catch (e: any) {
+      if (landedInLibrary) {
+        // Partial failure: the file reached the library but a later step threw.
+        void recordLibraryChange({
+          paths: [finalPath],
+          seriesIds: series?.id ? [series.id] : undefined,
+          reason: 'import',
+          source: 'importer:partial',
+        });
+      }
       Logger.log(`[Importer] Import Failed: ${e.message}`, "error");
       if (req) {
           // --- FIX: Safely route the failed Series metadata mapping ---

@@ -9,6 +9,8 @@ const mocks = vi.hoisted(() => ({
     requestCreate: vi.fn().mockResolvedValue({ id: 'req_123' }),
     readingListDeleteMany: vi.fn(),
     readingListCreate: vi.fn().mockResolvedValue({ id: 'list_123' }),
+    // Phase 4: a re-import reads the Komga links BEFORE deleteMany (they cascade with the list).
+    komgaLinkFindMany: vi.fn().mockResolvedValue([]),
     issueFindMany: vi.fn().mockResolvedValue([]),
     readingListItemCreateMany: vi.fn(),
     log: vi.fn()
@@ -20,6 +22,7 @@ vi.mock('@/lib/db', () => ({
         series: { findMany: mocks.seriesFindMany },
         request: { findFirst: mocks.requestFindFirst, create: mocks.requestCreate },
         readingList: { deleteMany: mocks.readingListDeleteMany, create: mocks.readingListCreate },
+        komgaReadListLink: { findMany: mocks.komgaLinkFindMany },
         issue: { findMany: mocks.issueFindMany },
         readingListItem: { createMany: mocks.readingListItemCreateMany }
     }
@@ -85,6 +88,42 @@ describe('API Route: AniList Import', () => {
         // Verify the missing series was requested
         expect(mocks.requestCreate).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ activeDownloadName: 'Chainsaw Man' })
+        }));
+    });
+
+    it('reads the Komga links before the re-import deletes the old list, and keeps komgaSync on', async () => {
+        mocks.seriesFindMany.mockResolvedValue([{ id: 'series_aot', name: 'Attack on Titan' }]);
+        mocks.komgaLinkFindMany.mockResolvedValue([{ readingListId: 'old_list', komgaReadListId: 'KL_OLD' }]);
+        // mockResolvedValue, not Once: with clearMocks the base implementation is wiped between
+        // tests, so a single-shot mock leaves later calls answering undefined and the route hangs.
+        vi.mocked(global.fetch).mockResolvedValue({
+            ok: true,
+            json: async () => ({
+                data: {
+                    MediaListCollection: {
+                        lists: [{
+                            name: "Reading",
+                            entries: [{ media: { title: { english: "Attack on Titan" } } }],
+                        }],
+                    },
+                },
+            }),
+        } as any);
+        mocks.requestFindFirst.mockResolvedValue(null);
+
+        const req = new Request('http://localhost/api/reading-lists/import-anilist', {
+            method: 'POST',
+            body: JSON.stringify({ username: 'testuser', requestMissing: true, isGlobal: false }),
+        });
+        const res = await POST(req);
+        expect(res.status).toBe(200);
+        // The link lookup must happen while the rows still exist.
+        expect(mocks.komgaLinkFindMany).toHaveBeenCalled();
+        expect(mocks.komgaLinkFindMany.mock.invocationCallOrder[0])
+            .toBeLessThan(mocks.readingListDeleteMany.mock.invocationCallOrder[0]);
+        // ...and the replacement inherits the sync opt-in so it adopts the old remote list.
+        expect(mocks.readingListCreate).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ komgaSync: true }),
         }));
     });
 });

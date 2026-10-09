@@ -1,7 +1,7 @@
 // src/lib/metadata/providers/metron.ts
 import { IMetadataProvider, MetadataSeries, MetadataIssue, SearchSeriesOptions } from '../provider';
 import { Logger } from '@/lib/logger';
-import { getMetronAuth, metronGet, MetronHttpError, MetronPace, MetronResponse } from '@/lib/metron/client';
+import { getMetronAuth, metronGet, MetronHttpError, MetronPace, MetronRateLimitError, MetronResponse } from '@/lib/metron/client';
 
 /** Results per Metron list page (their API's page size). */
 const METRON_PAGE_SIZE = 100;
@@ -32,6 +32,20 @@ const mapSeriesType = (seriesType: any): 'Print' | 'OneShot' | 'TPB' | 'GN' | nu
     if (name.includes('graphic novel')) return 'GN';
     return 'Print'; // Ongoing, Limited, Annual, Digital Chapters, etc. are all standard print series
 };
+
+/** The compact single-issue view the reading-list "Fix match" preview needs (getIssueSummary). */
+export interface MetronIssueSummary {
+    id: number;
+    number: string;
+    title: string | null;
+    seriesId: number | null;
+    seriesName: string | null;
+    seriesYearBegan: number | null;
+    publisher: string | null;
+    coverDate: string | null;
+    storeDate: string | null;
+    image: string | null;
+}
 
 export class MetronProvider implements IMetadataProvider {
     private readonly baseUrl = 'https://metron.cloud/api';
@@ -280,7 +294,9 @@ export class MetronProvider implements IMetadataProvider {
                         parsedSeriesId = parseInt(searchRes.data.results[0].id);
                     }
                 }
-            } catch(e) {}
+            } catch(e) {
+                // Optional enrichment only: a failed series-id lookup must not fail the match.
+            }
         }
         
         let fullName = seriesName ? `${seriesName} #${issue.number || '0'}` : `Issue #${issue.number || '0'}`;
@@ -318,6 +334,62 @@ export class MetronProvider implements IMetadataProvider {
             // Issue.name convention is raw titles (parity with ComicVine), so the detail
             // pass needs it unwrapped. Placeholders ("Issue 154") stay out (#199 round 3).
             storyTitle: issueTitle && !isGeneric ? issueTitle : null
+        };
+    }
+
+    /**
+     * One issue by numeric id for an interactive lookup (reading-list Fix match): a single attempt
+     * through the shared Metron client — no burst/429 sleeps, no retry — so a busy Metron surfaces
+     * as an error the user can act on instead of a request that hangs. No series fallback search
+     * (unlike getIssueDetails): one upstream call at most. Resolves null when Metron has no such
+     * issue. Throws METRON_INVALID_ID / METRON_NOT_CONFIGURED before any I/O; upstream failures are
+     * re-thrown as FATAL_RATE_LIMIT or "HTTP Error: <status>" for the typed issue-match errors.
+     */
+    async getIssueSummary(id: string): Promise<MetronIssueSummary | null> {
+        if (!/^\d+$/.test(id)) throw new Error('METRON_INVALID_ID');
+        const auth = await getMetronAuth();
+        // An undecryptable secret (enc:…, e.g. after a NEXTAUTH_SECRET change) can only be rejected.
+        // Check the secret field itself — not a user:pass concatenation, which hides the enc: prefix —
+        // and the settings UI's '********' mask, which is not a credential.
+        const secret = auth ? (auth.kind === 'token' ? auth.token : auth.pass) : undefined;
+        if (!auth || /^(enc:|\*{8})/.test(secret ?? '')) throw new Error('METRON_NOT_CONFIGURED');
+
+        let res;
+        try {
+            res = await metronGet(`${this.baseUrl}/issue/${id}/`, { auth, pace: 'interactive', maxAttempts: 1, timeoutMs: 10000 });
+        } catch (e) {
+            // The shared client's typed errors re-map to the strings issue-match dispatches on. A
+            // 404 is still a real upstream call, so usage counting stays inside metronGet too.
+            if (e instanceof MetronRateLimitError) throw new Error('FATAL_RATE_LIMIT');
+            const status = e instanceof MetronHttpError ? e.status : undefined;
+            // A short 429 (inline-wait sized) exhausts maxAttempts:1 as a plain MetronHttpError;
+            // issue-match still needs the typed METRON_RATE_LIMITED string to react to it.
+            if (status === 429) throw new Error('METRON_RATE_LIMITED');
+            if (status === 401 || status === 403) throw new Error(`HTTP Error: ${status}`);
+            throw e;
+        }
+
+        const issue = res.data;
+        if (res.status === 404 || issue?.id == null || Number(issue.id) !== Number(id)) return null;
+
+        const rawName = Array.isArray(issue.name) ? issue.name[0] : issue.name;
+        const candidateTitle = (typeof issue.title === 'string' && issue.title.trim())
+            ? issue.title
+            : (typeof rawName === 'string' && rawName.trim() ? rawName : null);
+        const title = candidateTitle && !/^Issue\s*#?\s*-?\d+$/i.test(candidateTitle.trim()) ? candidateTitle : null;
+        const seriesObj = issue.series && typeof issue.series === 'object' ? issue.series : null;
+
+        return {
+            id: Number(issue.id),
+            number: String(issue.number ?? ''),
+            title,
+            seriesId: Number(seriesObj?.id ?? issue.series_id) || null,
+            seriesName: seriesObj?.name ?? (typeof issue.series === 'string' ? issue.series : null),
+            seriesYearBegan: Number(seriesObj?.year_began) || null,
+            publisher: issue.publisher?.name ?? null,
+            coverDate: issue.cover_date ?? null,
+            storeDate: issue.store_date ?? null,
+            image: issue.image ?? null,
         };
     }
 }

@@ -21,6 +21,7 @@ import { prisma } from '@/lib/db';
 import { AuditLogger } from '@/lib/audit-logger';
 import { Logger } from '@/lib/logger';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
+import { recordLibraryChange } from '@/lib/komga/changes';
 import { CONFIG_DIR } from '@/lib/utils/paths';
 
 export type InsertCoverOutcome =
@@ -78,6 +79,15 @@ export async function embedUploadedCoverIntoArchive(
     } catch {
         return { ok: false, status: 502, error: 'The Rust engine is unreachable — embedding the cover needs it. The cover was still saved for display.' };
     }
+
+    // The archive is already rewritten (in place, or repacked to a sibling .cbz for RAR/7z).
+    void recordLibraryChange({
+        paths: newFilePath ? [issue.filePath, newFilePath] : [issue.filePath],
+        seriesIds: [issue.seriesId],
+        issueIds: [issueId],
+        reason: 'insert-cover',
+        source: `insert-cover-core:${context}`,
+    });
 
     // --- Index fixups. The file is already rewritten; these must not be skippable, so they run
     // as one batch transaction (array form — no interleaved work, per the #195 rule).

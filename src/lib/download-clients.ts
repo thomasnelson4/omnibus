@@ -15,6 +15,7 @@ import { enabledHostersFromSetting } from './getcomics';
 import { decryptSecret } from './encryption';
 import { assertSafeFetchUrl, assertSafeRedirect, isTrustedConfiguredOrigin } from './utils/ssrf';
 import { looksLikeHtmlPage } from './utils/content-sniff';
+import { isSameDownloadTitle, isSameDownloadUrl } from './utils/download-title';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 
 async function getNetworkHeaders() {
@@ -93,7 +94,97 @@ export async function qbitAuthHeaders(
     throw new Error('qBittorrent answered the login but returned no session cookie — a reverse proxy in front of qBittorrent may be stripping cookies.');
 }
 
+// ---------------------------------------------------------------------------
+// Per-client QUEUE listing used by the enqueue-dedupe and the re-fire guard.
+// Unlike getAllActiveDownloads (the dashboard/importer poll: all clients, history merge,
+// category filter), this asks ONE client for its live QUEUE only — the minimal read both
+// guards need:
+//   • enqueue dedupe: "does this client already hold this download?" — the production
+//     incident was 159 same-NZB re-enqueues the client then paused as duplicates.
+//   • re-fire guard: "is this tracked job id still alive in the client's queue?"
+// History is deliberately NOT consulted for dedupe: adopting a FAILED/COMPLETED history
+// item would strand the request against a dead job. Only queue presence blocks a re-add.
+// Any per-client API failure THROWS so callers can distinguish "absent" from "unknown"
+// (dedupe fails open; the reaper refuses to reap on unknown client state).
+// ---------------------------------------------------------------------------
+export async function listClientQueueItems(rawClient: any): Promise<Array<{ id: string, name: string, status: string, progress: number }>> {
+    // Credentials are encrypted at rest; decrypt into a local copy before use.
+    const client = { ...rawClient, pass: await decryptSecret(rawClient.pass), apiKey: await decryptSecret(rawClient.apiKey) };
+    const cleanUrl = client.url.replace(/\/$/, '');
+    const networkHeaders = await getNetworkHeaders();
+    const baseConfig = { headers: { 'User-Agent': 'Omnibus/1.0', ...networkHeaders }, timeout: 15000 };
+
+    if (client.type === 'sab') {
+        const res = await axios.get(`${cleanUrl}/api`, { params: { mode: 'queue', apikey: client.apiKey, output: 'json' }, ...baseConfig });
+        return (res.data?.queue?.slots || []).map((s: any) => ({
+            id: String(s.nzo_id), name: s.filename || s.name || '', status: s.status || '', progress: parseFloat(s.percentage) || 0
+        }));
+    }
+    if (client.type === 'qbit') {
+        const authHeaders = await qbitAuthHeaders(client, cleanUrl, baseConfig.headers, baseConfig.timeout);
+        const res = await axios.get(`${cleanUrl}/api/v2/torrents/info`, { params: { filter: 'all' }, headers: authHeaders, timeout: 15000 });
+        return (Array.isArray(res.data) ? res.data : []).map((t: any) => ({
+            id: String(t.hash), name: t.name || '', status: t.state || '', progress: Math.round((t.progress || 0) * 100)
+        }));
+    }
+    if (client.type === 'nzbget') {
+        const auth = Buffer.from(`${client.user}:${client.pass}`).toString('base64');
+        const res = await axios.post(`${cleanUrl}/jsonrpc`, { method: "listgroups", params: [] }, { ...baseConfig, headers: { ...baseConfig.headers, Authorization: `Basic ${auth}` } });
+        return (Array.isArray(res.data?.result) ? res.data.result : []).map((g: any) => ({
+            id: String(g.NZBID), name: g.NZBName || '', status: g.Status || '', progress: g.FileSizeMB ? Math.round((g.DownloadedSizeMB / g.FileSizeMB) * 100) : 0
+        }));
+    }
+    if (client.type === 'deluge') {
+        const authRes = await axios.post(`${cleanUrl}/json`, { method: "auth.login", params: [client.pass], id: 1 }, baseConfig);
+        const cookie = authRes.headers['set-cookie'];
+        const res = await axios.post(`${cleanUrl}/json`, { method: "web.update_ui", params: [["name", "progress", "state"], {}], id: 2 }, { ...baseConfig, headers: { ...baseConfig.headers, Cookie: cookie } });
+        const torrents = res.data.result?.torrents || {};
+        return Object.keys(torrents).map(hash => ({
+            id: hash, name: torrents[hash].name || '', status: torrents[hash].state || '', progress: (torrents[hash].progress || 0)
+        }));
+    }
+    return [];
+}
+
 export const DownloadService = {
+
+  // ---------------------------------------------------------------------------
+  // Enqueue-time dedupe (production incident layer 1): BEFORE submitting, ask the client
+  // whether it already holds this download and skip the duplicate that would otherwise be
+  // created (and then paused by the client as a duplicate — 159 rows in the incident).
+  // Per client type via listClientQueueItems; matches by NZB/torrent URL when the item
+  // exposes one, else normalised title + issue number (isSameDownloadTitle).
+  // FAILS OPEN: if the client's queue listing errors, the enqueue proceeds (a broken listing
+  // API must not block downloads). Returns the matching queue item, or null when new/unknown.
+  // ---------------------------------------------------------------------------
+  async checkDuplicateDownload(rawClient: any, downloadUrl: string, title: string): Promise<{ id: string, name: string, status: string } | null> {
+      try {
+          const queueItems = await listClientQueueItems(rawClient);
+          for (const item of queueItems) {
+              if (item.progress >= 100) continue; // a completed item is not a queue duplicate
+              if (isSameDownloadUrl(item.name, downloadUrl) || isSameDownloadTitle(item.name, title)) {
+                  return { id: item.id, name: item.name, status: item.status };
+              }
+          }
+      } catch (e: any) {
+          Logger.log(`[Download Service] Duplicate check could not read ${rawClient?.name || 'client'}'s queue (${getErrorMessage(e)}); proceeding with the enqueue.`, 'warn');
+          return null;
+      }
+      return null;
+  },
+
+  // ---------------------------------------------------------------------------
+  // Re-fire guard (layer 2): does this tracked job id STILL exist in the client's queue?
+  // Throws on client API failure — callers must treat "unknown" as alive (leave alone)
+  // rather than re-enqueue blindly. Queue-only: a job parked in history is gone for
+  // enqueue purposes (its terminal state is the client's answer, not a live job).
+  // ---------------------------------------------------------------------------
+  async jobExistsInClient(rawClient: any, downloadId: string): Promise<boolean> {
+      const queueItems = await listClientQueueItems(rawClient);
+      const needle = String(downloadId).toLowerCase();
+      return queueItems.some(item => item.id.toLowerCase() === needle);
+  },
+
   async addDownload(rawClient: any, downloadUrl: string, title: string, seedTimeLimit: number, seedRatio: number = 0, isManga: boolean = false) {
     let downloadId: string | undefined;
     // Credentials are encrypted at rest; decrypt into a local copy before use.
@@ -188,8 +279,10 @@ export const DownloadService = {
         const delugeLabel = primaryCategory.toLowerCase().replace(/[^a-z0-9_-]/g, '');
         if (delugeTorrentId && typeof delugeTorrentId === 'string' && delugeLabel) {
             const labelHeaders = { ...baseConfig.headers, Cookie: cookie };
-            try { await axios.post(`${cleanUrl}/json`, { method: "label.add", params: [delugeLabel], id: 3 }, { ...baseConfig, headers: labelHeaders }); } catch (e) {}
-            try { await axios.post(`${cleanUrl}/json`, { method: "label.set_torrent", params: [delugeTorrentId, delugeLabel], id: 4 }, { ...baseConfig, headers: labelHeaders }); } catch (e) {}
+            // Best-effort by design: with the Label plugin disabled Deluge answers in a 200 body and
+            // the torrent just stays unlabeled — labelling must never fail the add itself.
+            try { await axios.post(`${cleanUrl}/json`, { method: "label.add", params: [delugeLabel], id: 3 }, { ...baseConfig, headers: labelHeaders }); } catch (e) { /* optional plugin — ignore */ }
+            try { await axios.post(`${cleanUrl}/json`, { method: "label.set_torrent", params: [delugeTorrentId, delugeLabel], id: 4 }, { ...baseConfig, headers: labelHeaders }); } catch (e) { /* optional plugin — ignore */ }
         }
       }
       else if (client.type === 'sab') {
@@ -318,8 +411,10 @@ export const DownloadService = {
           data: { clientDownloadId: null, downloadClientId: null }
       });
 
-      const { Importer } = await import('./importer');
-      
+      // (Kept for the historical import hand-off seam; the engine/mega paths below return to
+      // their callers who run the Importer — nothing here uses it. Prefixed to satisfy lint.)
+      const { Importer: _Importer } = await import('./importer');
+
       const extMatch = url.split(/[#?]/)[0].split('.').pop();
       const ext = (extMatch && extMatch.length <= 4) ? extMatch : 'cbz';
       let finalFilename = filename.toLowerCase().endsWith(`.${ext}`) ? filename : `${filename}.${ext}`;
@@ -639,6 +734,9 @@ export const DownloadService = {
                         id: s.nzo_id, name: s.name, progress: isComplete ? '100.0' : '0.0',
                         status: s.status, clientName: client.name, clientId: client.id, clientType: 'sab',
                         contentPath: typeof s.storage === 'string' ? s.storage.trim() : '',
+                        // The client's own failure/pause reason (nzbfast reports "duplicate" here) —
+                        // mirrored onto the request so the UI can explain a non-progressing download.
+                        statusMessage: typeof s.fail_message === 'string' ? s.fail_message.trim() : '',
                         isComplete, size: s.size
                     };
                     const existing = downloads.findIndex(d => d.id === item.id);
@@ -682,7 +780,7 @@ export const DownloadService = {
                         id: String(g.NZBID), name: g.Name, progress: g.Status.includes('SUCCESS') ? "100.0" : "0.0", status: g.Status, clientName: client.name, size: g.FileSizeMB + " MB"
                     })));
                 }
-            } catch (e) { }
+            } catch (e) { /* history is best-effort: a queue-only listing still serves the dashboard */ }
         }
       } catch (err) {
           // Surface a broken/mis-authed client instead of silently contributing zero downloads — that made

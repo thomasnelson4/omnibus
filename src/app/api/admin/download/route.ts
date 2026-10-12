@@ -53,8 +53,33 @@ export async function POST(req: Request) {
 
     // Resolve manga-vs-comics from the request's series so the download is filed under the right
     // category/label in the client (manga → second configured category).
-    const dlReq = await prisma.request.findUnique({ where: { id: requestId }, select: { volumeId: true, metadataSource: true } });
+    const dlReq = await prisma.request.findUnique({ where: { id: requestId }, select: { volumeId: true, metadataSource: true, clientDownloadId: true, downloadClientId: true } });
     const dlSeries = dlReq ? await prisma.series.findFirst({ where: { metadataId: dlReq.volumeId, metadataSource: dlReq.metadataSource }, select: { isManga: true } }) : null;
+
+    // Re-fire guard (production incident layer 2): re-sending a request that still has a live
+    // job in this client's queue creates the second copy the client then pauses as a duplicate.
+    if (dlReq?.clientDownloadId && (!dlReq.downloadClientId || dlReq.downloadClientId === client.id)) {
+        const alive = await DownloadService.jobExistsInClient(client, dlReq.clientDownloadId).catch(() => true); // unreadable client = leave alone
+        if (alive) {
+            Logger.log(`[Admin Download] Request ${requestId} still has live job ${dlReq.clientDownloadId} in ${client.name}; not re-sending.`, 'warn');
+            return NextResponse.json({ success: true, message: 'Download already active in the client queue.' });
+        }
+        Logger.log(`[Admin Download] Previous job ${dlReq.clientDownloadId} is gone from ${client.name}; clearing it and re-sending.`, 'info');
+        await prisma.request.update({ where: { id: requestId }, data: { clientDownloadId: null, downloadClientId: null } });
+    }
+
+    // Enqueue-time dedupe (production incident layer 1): skip when the client already holds this
+    // download and track its existing job instead of creating a paused duplicate.
+    const existingClientJob = await DownloadService.checkDuplicateDownload(client, urlToDownload, title).catch(() => null);
+    if (existingClientJob) {
+        Logger.log(`[Admin Download] ${client.name} already holds "${existingClientJob.name}" (job ${existingClientJob.id}); tracking it instead of re-sending.`, 'warn');
+        await prisma.request.update({
+            where: { id: requestId },
+            data: { status: 'DOWNLOADING', downloadLink: downloadHash || 'PENDING_MATCH', clientDownloadId: existingClientJob.id, downloadClientId: client.id, progress: 0 }
+        });
+        if (userId) await AuditLogger.log('ADMIN_SENT_TO_CLIENT', { title, protocol }, userId);
+        return NextResponse.json({ success: true, message: 'Download already present in the client queue — tracked the existing job.' });
+    }
 
     // Send the link to the unified DownloadService
     const submission = await DownloadService.addDownload(client, urlToDownload, title, 0, 0, dlSeries?.isManga ?? false);

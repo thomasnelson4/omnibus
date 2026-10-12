@@ -65,6 +65,9 @@ function isNewerVersion(latest: string, current: string): boolean {
 // last_storage_scan timestamps. The old Node getFolderSize/runStorageScan walk was deleted; callers
 // (LIBRARY_SCAN below, the STORAGE_SCAN job) forward to the engine instead.
 
+// SAFETY: BullMQ Queue/Worker/IORedis singletons are memoized on globalThis to survive Next.js
+// dev-mode module re-instantiation. TypeScript cannot see that the global key always holds the
+// same runtime shape we put there; the cast only re-attaches that known shape.
 const globalForMQ = globalThis as unknown as {
     omnibusQueue: Queue; 
     omnibusWorker: Worker; 
@@ -93,7 +96,8 @@ if (process.env.NODE_ENV !== 'production') globalForMQ.omnibusQueue = omnibusQue
 // by the queue - the next scheduled run is its retry - so a provider having a bad minute doesn't get
 // the same run twice more within seconds (#216). A manual "Run Now" keeps the queue's default retries.
 const NO_RETRY_SCHEDULED_JOBS = new Set([
-    'METADATA_SYNC', 'SERIES_MONITOR', 'DISCOVER_SYNC', 'FOR_YOU_SYNC', 'UNMATCHED_SWEEP', 'UPDATE_CHECK'
+    'METADATA_SYNC', 'SERIES_MONITOR', 'DISCOVER_SYNC', 'FOR_YOU_SYNC', 'UNMATCHED_SWEEP', 'UPDATE_CHECK',
+    'DOWNLOAD_REAPER' // idempotent sweep: the next scheduled pass is its retry
 ]);
 
 export async function syncSchedules() {
@@ -105,7 +109,7 @@ export async function syncSchedules() {
                     'diagnostics_sync_schedule', 'backup_sync_schedule', 'backup_sync_day', 'popular_sync_schedule',
                     'weekly_digest_schedule', 'weekly_digest_day', 'cbr_conversion_schedule', 'embed_metadata_schedule',
                     'series_json_schedule', 'cache_cleanup_schedule', 'watched_sync_schedule', 'health_check_schedule',
-                    'unmatched_sweep_schedule'
+                    'unmatched_sweep_schedule', 'download_reaper_schedule'
                 ]
             }
         }
@@ -196,6 +200,9 @@ export async function syncSchedules() {
     // Unmatched-series retry sweep (discussion #177): budget-aware; default hourly.
     await addJob('UNMATCHED_SWEEP', config.unmatched_sweep_schedule || '1');
     await addJob('SYSTEM_HEALTH_CHECK', config.health_check_schedule || '0.25'); 
+    // Zombie-download reaper (production incident layer 4): hourly by default, threshold via the
+    // `download_reaper_stale_days` SystemSetting (default 3) read inside the sweep itself.
+    await addJob('DOWNLOAD_REAPER', config.download_reaper_schedule || '1');
 
     // Leave the GitHub update checker at 24 hours
     await addJob('UPDATE_CHECK', '24');
@@ -476,6 +483,49 @@ export function initWorker() {
 
                             Logger.log(`[BullMQ] Routing ${bestMatch.protocol.toUpperCase()} release to external client: ${clientConfig.name}`, 'info');
 
+                            // Re-fire guard (production incident layer 2): this request may already be
+                            // tracked against a live client job (a re-fired sweep/retry lands here for a row
+                            // that is still DOWNLOADING with a clientDownloadId). If that job still exists in
+                            // the client's queue, leave the request alone — re-submitting is how a second
+                            // copy of the same NZB got queued and paused as a duplicate. Only when the job is
+                            // genuinely gone do we clear the old id and re-enqueue. An unreadable client
+                            // (jobExistsInClient throws) counts as "alive": never re-fire blind.
+                            const liveReq = await prisma.request.findUnique({ where: { id: requestId }, select: { clientDownloadId: true, downloadClientId: true } });
+                            if (liveReq?.clientDownloadId) {
+                                const sameClient = !liveReq.downloadClientId || liveReq.downloadClientId === clientConfig.id;
+                                if (sameClient) {
+                                    let alive = true;
+                                    try {
+                                        alive = await DownloadService.jobExistsInClient(clientConfig, liveReq.clientDownloadId);
+                                    } catch (e: any) {
+                                        Logger.log(`[BullMQ] Re-fire guard could not read ${clientConfig.name}'s queue (${e?.message || e}) — treating job ${liveReq.clientDownloadId} as alive and leaving the request alone.`, 'warn');
+                                    }
+                                    if (alive) {
+                                        Logger.log(`[BullMQ] Re-fire guard: request ${requestId} still has live job ${liveReq.clientDownloadId} in ${clientConfig.name}. Not re-enqueuing.`, 'info');
+                                        await prisma.request.update({ where: { id: requestId }, data: { status: 'DOWNLOADING', activeDownloadName: bestMatch.title } });
+                                        break;
+                                    }
+                                    // Clear the dead id BEFORE re-enqueuing so no window exists where the
+                                    // row tracks a job the client no longer has.
+                                    Logger.log(`[BullMQ] Re-fire guard: previous job ${liveReq.clientDownloadId} is gone from ${clientConfig.name}; clearing it and re-enqueuing.`, 'info');
+                                    await prisma.request.update({ where: { id: requestId }, data: { clientDownloadId: null, downloadClientId: null } });
+                                }
+                            }
+
+                            // Enqueue-time dedupe (production incident layer 1): the DB release dedup above
+                            // only sees what Omnibus itself submitted — a download added outside Omnibus (or
+                            // re-added while its first copy is paused in the client's queue) slips past it.
+                            // Ask the client what it already holds before submitting.
+                            const existingClientJob = await DownloadService.checkDuplicateDownload(clientConfig, bestMatch.downloadUrl, bestMatch.title).catch(() => null);
+                            if (existingClientJob) {
+                                Logger.log(`[BullMQ] Enqueue dedupe: ${clientConfig.name} already holds "${existingClientJob.name}" (job ${existingClientJob.id}, status ${existingClientJob.status}). Skipping submission of "${bestMatch.title}" and tracking the existing job instead.`, 'warn');
+                                await prisma.request.update({
+                                    where: { id: requestId },
+                                    data: { status: 'DOWNLOADING', activeDownloadName: bestMatch.title, downloadLink: trackingHash, clientDownloadId: existingClientJob.id, downloadClientId: clientConfig.id, indexer: bestMatch.indexer }
+                                });
+                                break;
+                            }
+
                             // File manga under its own category/label in the client (manga → second configured category).
                             const submission = await DownloadService.addDownload(clientConfig, bestMatch.downloadUrl, bestMatch.title, 0, 0, isManga || false);
 
@@ -544,9 +594,9 @@ export function initWorker() {
                                     await prisma.systemSetting.delete({ where: { key: cache.key } });
                                     dbDeletedCount++;
                                 }
-                            } catch(e) {}
+                            } catch(e) { /* malformed cache entry — skip it, keep sweeping */ }
                         }
-                    } catch (e) {}
+                    } catch (e) { /* cache settings are best-effort housekeeping */ }
 
                     const { cleanupMetadataExtractorCache } = await import('@/lib/metadata-extractor');
                     const memDeletedCount = cleanupMetadataExtractorCache();
@@ -1112,6 +1162,18 @@ export function initWorker() {
                     break;
                 }
 
+                case 'DOWNLOAD_REAPER': {
+                    // Reap zombie downloads: DOWNLOADING rows at progress=0 with no updatedAt movement
+                    // for `download_reaper_stale_days` days (default 3) whose client-side state confirms
+                    // they are not actively progressing. Marks them FAILED with a human-readable reason
+                    // (never deletes, never re-enqueues). The sweep writes its own JobLog row.
+                    const { reapStaleDownloads, logReaperSweep } = await import('./download-reaper');
+                    const reaperStart = Date.now();
+                    const result = await reapStaleDownloads();
+                    await logReaperSweep(result, Date.now() - reaperStart);
+                    break;
+                }
+
                 case 'STORAGE_SCAN': {
                     await prisma.systemSetting.upsert({ 
                         where: { key: 'last_storage_scan' }, 
@@ -1216,8 +1278,8 @@ export function initWorker() {
 
                     if (newIssues.length === 0) break;
 
-                    const comicsMap: Record<string, any> = {}; 
-                    const mangaMap: Record<string, any> = {};
+                    const comicsMap: Record<string, { name: string, coverUrl: string, publisher: string, year: string, description: string, issues: string[] }> = {}; 
+                    const mangaMap: Record<string, { name: string, coverUrl: string, publisher: string, year: string, description: string, issues: string[] }> = {};
 
                     for (const issue of newIssues) {
                         const targetMap = issue.series.isManga ? mangaMap : comicsMap;
@@ -1227,7 +1289,7 @@ export function initWorker() {
                         if (!targetMap[sId]) {
                             targetMap[sId] = { 
                                 name: issue.series.name, 
-                                coverUrl: issue.series.coverUrl, 
+                                coverUrl: issue.series.coverUrl || "", 
                                 publisher: issue.series.publisher || "Unknown", 
                                 year: issue.series.year?.toString() || "????", 
                                 description: issue.series.description || "No synopsis available.", 

@@ -423,3 +423,69 @@ describe('Issue #198: removeDownload reaches HISTORY items, not just the queue',
         expect(ok).toBe(true);
     });
 });
+
+describe('Enqueue-time dedupe + re-fire guard primitives (stuck-download incident)', () => {
+    const sabClient = { id: 'sab_1', name: 'SAB', type: 'sab', url: 'http://sab:8080', apiKey: 'k', category: 'comics' };
+    const qbitClient = { id: 'qbt_1', name: 'qBit', type: 'qbit', url: 'http://qbit:8080', user: 'u', pass: 'p', category: 'comics' };
+
+    beforeEach(() => {
+        mocks.axiosGet.mockReset();
+        mocks.axiosPost.mockReset();
+        mocks.findManyHeaders.mockResolvedValue([]);
+        mocks.findManyClients.mockResolvedValue([]);
+        mocks.settingFindUnique.mockResolvedValue(null);
+    });
+
+    it('finds an existing SAB queue item by normalised title + issue number (the duplicate that gets paused)', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [
+            { nzo_id: 'nzo_dup', filename: 'King In Black 001 (2021)', status: 'Paused', percentage: 0 }
+        ] } } });
+        expect(await DownloadService.checkDuplicateDownload(sabClient, 'https://indexer.example/kib.nzb', 'King In Black #1 (2021)'))
+            .toEqual({ id: 'nzo_dup', name: 'King In Black 001 (2021)', status: 'Paused' });
+    });
+
+    it('returns null (and the enqueue proceeds) when the download is genuinely new', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [
+            { nzo_id: 'nzo_other', filename: ' totally different title ', status: 'Downloading', percentage: 40 }
+        ] } } });
+        expect(await DownloadService.checkDuplicateDownload(sabClient, 'https://indexer.example/new.nzb', 'S.W.O.R.D. #7')).toBeNull();
+    });
+
+    it('never matches a completed queue item (progress >= 100 is not a duplicate to skip)', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [
+            { nzo_id: 'nzo_done', filename: 'King In Black 001 (2021)', status: 'Downloading', percentage: 100 }
+        ] } } });
+        expect(await DownloadService.checkDuplicateDownload(sabClient, 'https://indexer.example/kib.nzb', 'King In Black #1 (2021)')).toBeNull();
+    });
+
+    it('fails OPEN: an unreadable client queue returns null so the enqueue still happens', async () => {
+        mocks.axiosGet.mockRejectedValueOnce(new Error('ECONNREFUSED 127.0.0.1:6379'));
+        expect(await DownloadService.checkDuplicateDownload(sabClient, 'https://indexer.example/x.nzb', 'Batman #1')).toBeNull();
+    });
+
+    it('matches a qbit torrent by normalised title (queue item shape differs per client type)', async () => {
+        mocks.axiosPost.mockResolvedValueOnce({ headers: { 'set-cookie': ['SID=abc; path=/'] } }); // login
+        mocks.axiosGet.mockResolvedValueOnce({ data: [ // torrents/info
+            // The dotted rename shape SAB/nzbfast actually produce (year glued on, quality tag).
+            { hash: 'deadbeef', name: 'king.in.black.001.2021.digital', state: 'pausedDL', progress: 0 }
+        ] });
+        expect(await DownloadService.checkDuplicateDownload(qbitClient, 'https://indexer.example/kib.torrent', 'King In Black #1 (2021)'))
+            .toEqual({ id: 'deadbeef', name: 'king.in.black.001.2021.digital', status: 'pausedDL' });
+    });
+
+    it('jobExistsInClient: true when the tracked job id is still in the queue (re-fire guard leg)', async () => {
+        // BOTH invocations below make their own queue read — a Once-mock would starve the second.
+        mocks.axiosGet.mockResolvedValue({ data: { queue: { slots: [
+            { nzo_id: 'nzo_live', filename: 'Batman 001', status: 'Paused', percentage: 0 }
+        ] } } });
+        expect(await DownloadService.jobExistsInClient(sabClient, 'nzo_live')).toBe(true);
+        expect(await DownloadService.jobExistsInClient(sabClient, 'NZO_LIVE')).toBe(true); // case-insensitive
+    });
+
+    it('jobExistsInClient: false when the job left the queue — and history is NOT consulted', async () => {
+        mocks.axiosGet.mockResolvedValueOnce({ data: { queue: { slots: [] } } });
+        expect(await DownloadService.jobExistsInClient(sabClient, 'nzo_dead')).toBe(false);
+        // Only ONE axios call was made: queue. A history hit must not resurrect a dead job.
+        expect(mocks.axiosGet).toHaveBeenCalledTimes(1);
+    });
+});

@@ -47,7 +47,8 @@ export async function POST(request: Request) {
             'update_check': 'UPDATE_CHECK',
             'weekly_digest': 'WEEKLY_DIGEST',
             'cache_cleanup': 'CACHE_CLEANUP',
-            'unmatched_sweep': 'UNMATCHED_SWEEP'
+            'unmatched_sweep': 'UNMATCHED_SWEEP',
+            'download_reaper': 'DOWNLOAD_REAPER'
         };
 
         // Komga triggers get their OWN map and their OWN queue. `omnibusQueue`'s worker throws

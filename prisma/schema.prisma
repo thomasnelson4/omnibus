@@ -96,6 +96,12 @@ model Request {
   // Client job identity stays separate from the indexer release link used for batch deduplication.
   clientDownloadId   String?
   downloadClientId   String?
+  // Mirrored client-side state: what the download client itself reported about this job at the
+  // last poll (e.g. SABnzbd slot status "Paused", qBittorrent state "stalledDL"). Null when the
+  // job is in a normal/resolved state. Surfaced in the requests UI so a non-progressing download
+  // explains itself instead of showing a blank 0% card. The reaper also reads it.
+  clientStatus        String?
+  clientStatusMessage String?
   activeDownloadName String?
   failedLinks        String? @default("[]")
   // Set when an admin dismisses/snoozes the System Health warning for this request. Snoozed items are

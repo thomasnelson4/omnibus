@@ -26,6 +26,11 @@ const mocks = vi.hoisted(() => ({
     downloadClientFindMany: vi.fn(),
     addDownload: vi.fn(),
     downloadDirectFile: vi.fn(),
+    checkDuplicateDownload: vi.fn().mockResolvedValue(null),
+    jobExistsInClient: vi.fn().mockResolvedValue(false),
+    listClientQueueItems: vi.fn().mockResolvedValue([]),
+    reapStaleDownloads: vi.fn().mockResolvedValue({ reaped: 0, examined: 0, skippedClientUnreadable: 0, skippedActivelyProgressing: 0 }),
+    logReaperSweep: vi.fn().mockResolvedValue(undefined),
     searchAndDownload: vi.fn().mockResolvedValue(undefined),
     sendWeeklyDigest: vi.fn().mockResolvedValue(true),
     digestHistoryCreate: vi.fn(),
@@ -65,7 +70,19 @@ vi.mock('@/lib/api-client', () => ({
 }));
 
 vi.mock('@/lib/health-checker', () => ({ runSystemHealthCheck: mocks.runSystemHealthCheck }));
-vi.mock('@/lib/download-clients', () => ({ DownloadService: { addDownload: mocks.addDownload, downloadDirectFile: mocks.downloadDirectFile } }));
+vi.mock('@/lib/download-clients', () => ({
+    DownloadService: {
+        addDownload: mocks.addDownload,
+        downloadDirectFile: mocks.downloadDirectFile,
+        checkDuplicateDownload: mocks.checkDuplicateDownload,
+        jobExistsInClient: mocks.jobExistsInClient
+    },
+    listClientQueueItems: mocks.listClientQueueItems
+}));
+vi.mock('@/lib/download-reaper', () => ({
+    reapStaleDownloads: mocks.reapStaleDownloads,
+    logReaperSweep: mocks.logReaperSweep
+}));
 vi.mock('@/lib/automation', () => ({ searchAndDownload: mocks.searchAndDownload }));
 
 // Mock the mailer for the digest
@@ -689,5 +706,101 @@ describe('Cron: BullMQ Worker Router', () => {
             where: { id: 'req_sab' },
             data: expect.objectContaining({ downloadLink: 'release-guid', clientDownloadId: 'SABnzbd_nzo_42', downloadClientId: 'sab_1', status: 'DOWNLOADING' })
         });
+    });
+
+    it('DOWNLOAD_REAPER runs the sweep and writes its JobLog row', async () => {
+        initWorker();
+        mocks.reapStaleDownloads.mockResolvedValueOnce({ reaped: 2, examined: 5, skippedClientUnreadable: 0, skippedActivelyProgressing: 3 });
+
+        await mocks.workerCb.current({ id: 'job_reaper', data: { type: 'DOWNLOAD_REAPER' }, updateProgress: vi.fn() });
+
+        expect(mocks.reapStaleDownloads).toHaveBeenCalled();
+        expect(mocks.logReaperSweep).toHaveBeenCalledWith(
+            { reaped: 2, examined: 5, skippedClientUnreadable: 0, skippedActivelyProgressing: 3 },
+            expect.any(Number)
+        );
+    });
+});
+
+describe('External-client re-fire guard + enqueue dedupe (stuck-download incident)', () => {
+    let originalSetTimeout: typeof setTimeout;
+
+    beforeEach(() => {
+        (globalThis as unknown as { omnibusWorker: unknown }).omnibusWorker = null;
+        process.env.NEXTAUTH_SECRET = 'test-secret';
+        mocks.engineFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+        vi.stubGlobal('fetch', mocks.engineFetch);
+        originalSetTimeout = global.setTimeout;
+        vi.stubGlobal('setTimeout', (cb: (...args: unknown[]) => void) => originalSetTimeout(cb, 0));
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    const sabJob = async (requestRow: Record<string, unknown>) => {
+        initWorker();
+        mocks.requestFindUnique.mockResolvedValue(requestRow);
+        mocks.systemSettingFindMany.mockResolvedValue([]);
+        mocks.requestFindFirst.mockResolvedValue(null);
+        mocks.downloadClientFindMany.mockResolvedValue([{ id: 'sab_1', name: 'SAB', type: 'sab', protocol: 'usenet' }]);
+        mocks.engineFetch.mockResolvedValue({
+            ok: true, status: 200,
+            json: async () => ({ success: true, best_match: { title: 'Batman 001', protocol: 'usenet', downloadUrl: 'https://indexer.example/file.nzb', guid: 'release-guid', indexer: 'Indexer' } })
+        });
+        await mocks.workerCb.current({
+            id: 'job_sab', data: { type: 'SEARCH_AND_DOWNLOAD', requestId: 'req_sab', name: 'Batman #1', year: '2016', isManga: false, skipIndexers: false }, updateProgress: vi.fn()
+        });
+    };
+
+    it('leaves a request alone when its tracked job is STILL LIVE in the client queue', async () => {
+        mocks.jobExistsInClient.mockResolvedValueOnce(true); // the old job is still there
+        await sabJob({ id: 'req_sab', volumeId: '0', failedLinks: '[]', clientDownloadId: 'nzo_live', downloadClientId: 'sab_1' });
+
+        // No addDownload call — the second copy is never created.
+        expect(mocks.addDownload).not.toHaveBeenCalled();
+        // The row is kept DOWNLOADING with its EXISTING job id untouched.
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_sab' },
+            data: expect.objectContaining({ status: 'DOWNLOADING' })
+        }));
+        const updateData = mocks.requestUpdate.mock.calls[0][0].data;
+        expect(updateData).not.toHaveProperty('clientDownloadId'); // id left alone
+        expect(mocks.checkDuplicateDownload).not.toHaveBeenCalled();
+    });
+
+    it('re-enqueues (clearing the old id) when the tracked job is GONE from the client queue', async () => {
+        mocks.jobExistsInClient.mockResolvedValueOnce(false); // job genuinely gone
+        mocks.addDownload.mockResolvedValueOnce({ success: true, downloadId: 'nzo_new' });
+        await sabJob({ id: 'req_sab', volumeId: '0', failedLinks: '[]', clientDownloadId: 'nzo_dead', downloadClientId: 'sab_1' });
+
+        expect(mocks.addDownload).toHaveBeenCalled();
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_sab' },
+            data: expect.objectContaining({ status: 'DOWNLOADING', clientDownloadId: 'nzo_new', downloadClientId: 'sab_1' })
+        }));
+    });
+
+    it('treats an UNREADABLE client as alive and does not re-fire', async () => {
+        mocks.jobExistsInClient.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+        await sabJob({ id: 'req_sab', volumeId: '0', failedLinks: '[]', clientDownloadId: 'nzo_maybe', downloadClientId: 'sab_1' });
+
+        expect(mocks.addDownload).not.toHaveBeenCalled();
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_sab' },
+            data: expect.objectContaining({ status: 'DOWNLOADING' })
+        }));
+    });
+
+    it('skips the submission entirely when the client already holds the download (enqueue dedupe)', async () => {
+        mocks.checkDuplicateDownload.mockResolvedValueOnce({ id: 'nzo_existing', name: 'Batman 001', status: 'Paused' });
+        await sabJob({ id: 'req_sab', volumeId: '0', failedLinks: '[]', clientDownloadId: null, downloadClientId: null });
+
+        // No second copy: addDownload never ran, and the row now tracks the client's EXISTING job.
+        expect(mocks.addDownload).not.toHaveBeenCalled();
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_sab' },
+            data: expect.objectContaining({ status: 'DOWNLOADING', clientDownloadId: 'nzo_existing', downloadClientId: 'sab_1' })
+        }));
     });
 });

@@ -365,6 +365,15 @@ export function AdminRequestManagement() {
                             Perform Interactive Search
                         </Badge>
                       )}
+                      {/* Mirrored client-side state (e.g. "Client: Paused — duplicate") — what the
+                          download client itself reported, so a non-progressing row explains itself. */}
+                      {(req.clientStatus || req.clientStatusMessage) && (
+                        <div className="text-[9px] font-bold text-amber-600 dark:text-amber-400 mt-1.5 uppercase tracking-tighter truncate" title={req.clientStatusMessage || req.clientStatus || ''}>
+                          {req.clientStatus
+                            ? `Client: ${req.clientStatus}${req.clientStatusMessage ? ` — ${req.clientStatusMessage}` : ''}`
+                            : req.clientStatusMessage}
+                        </div>
+                      )}
                       {isExhausted && (
                         <div className="text-[9px] text-red-500 font-bold mt-1.5 uppercase tracking-tighter flex items-center gap-1">
                           <AlertTriangle className="w-3 h-3" /> Admin Intervention Required
@@ -441,6 +450,14 @@ export function AdminRequestManagement() {
                               <Badge variant="outline" className="text-[9px] uppercase font-black px-1.5 py-0 border-blue-500 text-blue-600 bg-blue-50 dark:bg-blue-900/20">
                                   Perform Interactive Search
                               </Badge>
+                          </div>
+                      )}
+                      {/* Mirrored client-side state, same as the desktop status cell. */}
+                      {(req.clientStatus || req.clientStatusMessage) && (
+                          <div className="text-[10px] font-bold text-amber-600 dark:text-amber-400 mt-1.5 truncate" title={req.clientStatusMessage || req.clientStatus || ''}>
+                              {req.clientStatus
+                                  ? `Client: ${req.clientStatus}${req.clientStatusMessage ? ` — ${req.clientStatusMessage}` : ''}`
+                                  : req.clientStatusMessage}
                           </div>
                       )}
                       {isExhausted && (

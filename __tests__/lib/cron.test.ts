@@ -269,3 +269,65 @@ describe('Cron Logic: Automated Download Checker', () => {
     });
 
 });
+
+describe('Cron Logic: client-state mirror (stuck-download incident layer 3)', () => {
+    beforeEach(() => {
+        (globalThis as any)._cronInitialized = false;
+        vi.stubGlobal('setInterval', (cb: any) => { mocks.cronCb.current = cb; });
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+    });
+
+    const pausedCycle = async (requestRow: Record<string, unknown>, sabItem: Record<string, unknown>) => {
+        mocks.requestFindMany.mockImplementation(async (args) => args.where.status === 'DOWNLOADING' ? [requestRow] : []);
+        mocks.seriesFindMany.mockResolvedValue([]);
+        mocks.getAllActiveDownloads.mockResolvedValue([sabItem]);
+        initCronJobs();
+        await mocks.cronCb.current();
+    };
+
+    it('writes the client\'s Paused state (with the client\'s own reason) onto the request', async () => {
+        await pausedCycle(
+            { id: 'req_paused', volumeId: 'vol_1', activeDownloadName: 'King In Black #1', clientDownloadId: 'nzo_1', downloadClientId: 'sab_1', progress: 0, clientStatus: null, clientStatusMessage: null },
+            { id: 'nzo_1', clientId: 'sab_1', clientType: 'sab', name: 'King In Black #1', isComplete: false, progress: '0', status: 'Paused' }
+        );
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_paused' },
+            data: expect.objectContaining({ clientStatus: 'Paused', clientStatusMessage: null })
+        }));
+    });
+
+    it('carries a client-provided reason (e.g. "duplicate") into clientStatusMessage', async () => {
+        await pausedCycle(
+            { id: 'req_dup', volumeId: 'vol_1', activeDownloadName: 'King In Black #1', clientDownloadId: 'nzo_2', downloadClientId: 'sab_1', progress: 0, clientStatus: null, clientStatusMessage: null },
+            { id: 'nzo_2', clientId: 'sab_1', clientType: 'sab', name: 'King In Black #1', isComplete: false, progress: '0', status: 'Paused', statusMessage: 'duplicate' }
+        );
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_dup' },
+            data: expect.objectContaining({ clientStatus: 'Paused', clientStatusMessage: 'duplicate' })
+        }));
+    });
+
+    it('clears the mirror when the client state resolves back to a normal status', async () => {
+        await pausedCycle(
+            { id: 'req_resumed', volumeId: 'vol_1', activeDownloadName: 'King In Black #1', clientDownloadId: 'nzo_3', downloadClientId: 'sab_1', progress: 0, clientStatus: 'Paused', clientStatusMessage: 'duplicate' },
+            { id: 'nzo_3', clientId: 'sab_1', clientType: 'sab', name: 'King In Black #1', isComplete: false, progress: '30', status: 'Downloading' }
+        );
+        const update = mocks.requestUpdate.mock.calls.find(c => c[0].where?.id === 'req_resumed');
+        expect(update?.[0].data.clientStatus).toBeNull();
+        expect(update?.[0].data.clientStatusMessage).toBeNull();
+        // And progress moves with it (the row was stuck at 0 while paused).
+        expect(update?.[0].data.progress).toBe(30);
+    });
+
+    it('writes NOTHING when the mirrored state is unchanged (updatedAt stays clean for the reaper)', async () => {
+        await pausedCycle(
+            { id: 'req_quiet', volumeId: 'vol_1', activeDownloadName: 'King In Black #1', clientDownloadId: 'nzo_4', downloadClientId: 'sab_1', progress: 0, clientStatus: 'Paused', clientStatusMessage: 'duplicate' },
+            { id: 'nzo_4', clientId: 'sab_1', clientType: 'sab', name: 'King In Black #1', isComplete: false, progress: '0', status: 'Paused', statusMessage: 'duplicate' }
+        );
+        // Same id, same name, same mirrored state, same progress → no update, no updatedAt churn.
+        expect(mocks.requestUpdate).not.toHaveBeenCalled();
+    });
+});

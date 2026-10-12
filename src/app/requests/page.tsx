@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input"
 import { 
   Loader2, Search, RefreshCw, Clock, CheckCircle2, Calendar, FileText, 
   ChevronLeft, ChevronRight, Info, List, ImageIcon, Server, XCircle, Library,
-  CheckSquare, Square, ExternalLink
+  CheckSquare, Square, ExternalLink, PauseCircle
 } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
 import { COMIC_EXT_REGEX } from "@/lib/utils/formats"
@@ -160,6 +160,20 @@ function RequestCard({
                             {req.status === 'PENDING_APPROVAL' ? 'Needs Approval' : req.status === 'MANUAL_DDL' ? 'GETCOMICS' : req.status === 'AWAITING_RELEASE' ? 'Awaiting' : req.status}
                         </Badge>
                         {req.status === 'DOWNLOADING' && <span className="text-[11px] font-mono text-primary font-bold bg-primary/10 px-2 py-0.5 rounded">{req.progress}%</span>}
+                        {req.status === 'DOWNLOADING' && req.clientStatus && (
+                            <span className="text-[11px] font-bold text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-2 py-0.5 rounded flex items-center gap-1">
+                                <PauseCircle className="w-3 h-3" />
+                                {/* Mirrored client state: e.g. "Paused by download client: duplicate" —
+                                    the reason the download is not moving, in the client's own words. */}
+                                {/pause/i.test(req.clientStatus) ? 'Paused by download client' : `${req.clientStatus} — download client`}
+                                {req.clientStatusMessage ? `: ${req.clientStatusMessage}` : ''}
+                            </span>
+                        )}
+                        {['FAILED', 'STALLED', 'ERROR'].includes(req.status) && req.clientStatusMessage && (
+                            <span className="text-[11px] font-medium text-red-700 dark:text-red-400 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 px-2 py-0.5 rounded" title={req.clientStatusMessage}>
+                                {req.clientStatusMessage}
+                            </span>
+                        )}
                         {isCompleted && <span className="text-[11px] text-green-700 dark:text-green-400 flex items-center gap-1 font-bold bg-green-50 dark:bg-green-900/20 px-2 py-0.5 rounded"><CheckCircle2 className="w-3 h-3"/> Ready in Library</span>}
                     </div>
                 </div>

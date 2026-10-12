@@ -11,8 +11,12 @@ import { extractIssueNumber } from '@/lib/utils/issue-parser';
 import { JUNK_WORDS as junkWords } from '@/lib/utils/search-terms';
 import { deleteUsenetSource } from '@/lib/utils/usenet-cleanup';
 import { resolveRemotePath, resolveClientPath } from '@/lib/utils/path-resolver';
+import { mirrorClientStatus } from './client-state-mirror';
 import path from 'path';
 
+// SAFETY: initCronJobs() must register the 60s interval exactly once per process even when Next.js
+// dev-mode re-instantiates this module; the singleton flag is memoized on globalThis, and this cast
+// re-attaches the shape this module itself put there.
 const globalForCron = globalThis as unknown as { _cronInitialized: boolean };
 
 // In-process re-entrancy guard for the 60s download checker. A completed download triggers an in-process
@@ -260,20 +264,41 @@ export function initCronJobs() {
               }
               
               if (match) {
-                  if (torrent.clientType === 'sab') {
-                      await prisma.request.update({
-                          where: { id: match.id },
-                          data: { clientDownloadId: torrent.id, downloadClientId: torrent.clientId, activeDownloadName: torrent.name }
-                      });
-                      match.clientDownloadId = torrent.id;
-                      match.downloadClientId = torrent.clientId;
-                  } else if (match.downloadLink !== torrent.id || match.activeDownloadName !== torrent.name) {
-                      await prisma.request.update({
-                          where: { id: match.id },
-                          data: { activeDownloadName: torrent.name, downloadLink: torrent.id }
-                      });
-                      match.downloadLink = torrent.id;
-                      match.activeDownloadName = torrent.name;
+                  // --- Mirror the client-side state (production incident layer 3) ---
+                  // The poller used to touch every matched row unconditionally each cycle, which is
+                  // exactly how the incident's 159 paused-as-duplicate rows kept their updatedAt
+                  // fresh for 9+ days while showing a blank 0%. Now every field below is written
+                  // ONLY when its value actually changed, and the client's own status/paused/error
+                  // state is persisted onto the request (clientStatus / clientStatusMessage) so the
+                  // UI can explain a non-progressing download — and cleared again once it resolves.
+                  const mirrored = mirrorClientStatus(torrent);
+                  const mirrorStatus = mirrored?.status ?? null;
+                  const mirrorMessage = mirrored?.message ?? null;
+                  const progressPct = Math.max(0, Math.min(100, Math.round(parseFloat(torrent.progress) || 0)));
+
+                  const wantsIdSync = torrent.clientType === 'sab' && (match.clientDownloadId !== torrent.id || match.downloadClientId !== torrent.clientId || match.activeDownloadName !== torrent.name);
+                  const wantsLinkSync = torrent.clientType !== 'sab' && (match.downloadLink !== torrent.id || match.activeDownloadName !== torrent.name);
+                  // `?? null` normalises rows created before the mirror columns existed (undefined ≠
+                  // null, and an unnormalised compare would re-write nulls — and refresh updatedAt —
+                  // on every cycle, which is exactly the updatedAt churn this block exists to stop).
+                  const mirrorChanged = ((match as any).clientStatus ?? null) !== mirrorStatus || ((match as any).clientStatusMessage ?? null) !== mirrorMessage;
+                  const progressChanged = progressPct !== (match.progress ?? 0);
+
+                  if (wantsIdSync || wantsLinkSync || mirrorChanged || progressChanged) {
+                      const data: Record<string, unknown> = {};
+                      if (wantsIdSync) { data.clientDownloadId = torrent.id; data.downloadClientId = torrent.clientId; data.activeDownloadName = torrent.name; }
+                      if (wantsLinkSync) { data.activeDownloadName = torrent.name; data.downloadLink = torrent.id; }
+                      if (mirrorChanged) { data.clientStatus = mirrorStatus; data.clientStatusMessage = mirrorMessage; }
+                      if (progressChanged) { data.progress = progressPct; }
+                      await prisma.request.update({ where: { id: match.id }, data });
+
+                      // Keep the in-memory copies coherent for the rest of this tick.
+                      if (wantsIdSync) { match.clientDownloadId = torrent.id; match.downloadClientId = torrent.clientId; }
+                      if (wantsLinkSync) { match.downloadLink = torrent.id; }
+                      if (wantsIdSync || wantsLinkSync) { match.activeDownloadName = torrent.name; }
+                      (match as any).clientStatus = mirrorStatus;
+                      (match as any).clientStatusMessage = mirrorMessage;
+                      match.progress = progressPct;
                   }
 
                   // --- NEW: Detect Failed Downloads ---
@@ -314,7 +339,7 @@ export function initCronJobs() {
                       const req = await prisma.request.findUnique({ where: { id: match.id } });
                       if (req && (req.retryCount || 0) < 3) {
                           let currentFailed: string[] = [];
-                          try { currentFailed = JSON.parse((req as any).failedLinks || "[]"); } catch(e){}
+                          try { currentFailed = JSON.parse((req as any).failedLinks || "[]"); } catch(e){ /* corrupted blocklist — start from an empty one */ }
                           
                           // Block BOTH the specific hash/url and the exact Release Title
                           if (req.downloadLink && !currentFailed.includes(req.downloadLink)) currentFailed.push(req.downloadLink);
@@ -327,6 +352,10 @@ export function initCronJobs() {
                                   downloadLink: null,
                                   clientDownloadId: null,
                                   downloadClientId: null,
+                                  // Fresh re-queue = fresh client state; the old client-reported status
+                                  // (e.g. "Paused") must not bleed onto the new download attempt.
+                                  clientStatus: null,
+                                  clientStatusMessage: null,
                                   retryCount: (req.retryCount || 0) + 1,
                                   failedLinks: JSON.stringify(currentFailed)
                               } as any

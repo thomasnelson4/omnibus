@@ -451,6 +451,7 @@ async fn run_unmatched_sweep_at(db: Db, service: Option<&MatchService>) -> anyho
 /// `expected_updated_at` adds the shared-service CAS: the decision was made over an earlier read,
 /// so the row must still be untouched (`updatedAt` unchanged), still unlocked
 /// (`hasCustomMetadata = false`) and still unmatched/IGNORED-free or the write is refused.
+#[allow(clippy::too_many_arguments)]
 async fn apply_match(db: &Db, series_id: &str, series_name: &str, source: &str, id: &str, cv_id: Option<i32>, metron_id: Option<i32>, expected_updated_at: Option<&str>) -> bool {
     let taken: Option<String> = sqlx::query_scalar(
         r#"SELECT id FROM "Series" WHERE "metadataSource" = $1 AND "metadataId" = $2 AND id <> $3"#,

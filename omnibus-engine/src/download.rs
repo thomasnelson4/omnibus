@@ -193,14 +193,24 @@ const ERR_INCOMPLETE: &str = "Downloaded archive is incomplete";
 
 /// The download-integrity failures above. For a getcomics link these are NOT "manual download
 /// required" - the file came through and was bad - so they pass through for the next hoster.
-fn is_integrity_failure(err: &str) -> bool {
-    [ERR_TRUNCATED, ERR_RESTART, ERR_CORRUPT, ERR_INCOMPLETE].iter().any(|m| err.contains(m))
-}
+/// A getcomics failure becomes the "manual download required" hold ONLY when a human is the only
+/// way through: an unsolved Cloudflare challenge (warm-up found no cookies, or the link answered
+/// with an HTML page) or a stalled/empty stream from the solver consuming getcomics' one-shot
+/// signed download — plus a stub file that is really an error page.
+///
+/// Everything else surfaces as its own error: a DNS/connect blip, a mid-stream drop, an SSRF-guard
+/// refusal or a 429 throttle must reach the normal retry/stall lifecycle. The old blanket hold
+/// turned all of those into "manual download required", which asked the user to click through a
+/// network hiccup and made the two failure worlds indistinguishable.
+const HUMAN_GATED_MARKERS: [&str; 4] = [
+    "warm-up obtained no cookies",
+    "Download URL returned an HTML webpage instead of a comic file.",
+    "Download stalled for",
+    "Downloaded file is suspiciously small",
+];
 
-/// A getcomics failure becomes the "manual download required" hold unless it is a 429 throttle (the
-/// user would click into the same throttle) or an integrity failure (the file arrived and was bad).
 fn holds_for_manual_download(err: &str) -> bool {
-    !err.contains("rate limited") && !is_integrity_failure(err)
+    HUMAN_GATED_MARKERS.iter().any(|marker| err.contains(marker))
 }
 
 /// `Content-Range: bytes <start>-<end>/<total|*>` → (start, total).
@@ -1158,6 +1168,18 @@ mod tests {
         assert!(!holds_for_manual_download("Download truncated: received 10 of 20 bytes"));
         assert!(!holds_for_manual_download("Downloaded archive is corrupt (invalid Zip archive); every announced byte arrived, so the file itself is bad"));
         assert!(!holds_for_manual_download("Downloaded archive is incomplete (invalid Zip archive); restarting from zero"));
+    }
+
+    // Only a human-gated failure is held. A transport blip, a refusal or a throttle must keep its
+    // own error so the retry/stall lifecycle re-fires it instead of parking a MANUAL_DDL row.
+    #[test]
+    fn transient_and_refused_failures_are_not_held_for_manual_download() {
+        assert!(holds_for_manual_download("warm-up obtained no cookies"));
+        assert!(!holds_for_manual_download("dns error: failed to lookup address information"));
+        assert!(!holds_for_manual_download("error sending request for url (https://getcomics.org/dls/x)"));
+        assert!(!holds_for_manual_download("Refusing to download from internal address: 127.0.0.1"));
+        assert!(!holds_for_manual_download("Refusing to download from non-HTTP(S) scheme: file:"));
+        assert!(!holds_for_manual_download("GetComics rate limited (429) the download link; deferring for a later retry."));
     }
 
     #[tokio::test]

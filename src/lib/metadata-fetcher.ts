@@ -17,7 +17,7 @@ import { isSameIssue } from '@/lib/utils/issue-parser';
 import { resolveSyncedName, detailNameWrite } from '@/lib/utils/synced-name';
 import { findLocalCoverBasename, providerCoverBlocked } from '@/lib/utils/cover-plan';
 import { CV_VOLUME_CREDIT_FIELDS, parseVolumeCredits, persistSeriesCredits } from '@/lib/utils/volume-credits';
-import { guessBookTypeFromCvVolume, isCvRateLimited, isRealGenre, resolveSyncedReleaseDate } from './utils/metadata-policy';
+import { guessBookTypeFromCvVolume, isCvRateLimited, resolveSyncedReleaseDate } from './utils/metadata-policy';
 
 // Providers rarely report when a series ends, so Omnibus guesses: no new issue
 // within the admin-configured window (months) = Ended. Returns null when the
@@ -343,7 +343,9 @@ export async function syncSeriesMetadata(metadataId: string, folderPath: string,
 
     const imageUrl = volData.image?.medium_url || volData.image?.super_url;
 
-    const volGenres = parseComicVineCredits(undefined, undefined, volData.concepts || undefined).genres.filter(isRealGenre);
+    // The engine twin (metadata.rs::is_genre_noise) keeps every concept that isn't cover/variant
+    // noise — parseComicVineCredits already applies that filter, so no second, narrower whitelist.
+    const volGenres = parseComicVineCredits(undefined, undefined, volData.concepts || undefined).genres;
     
     let cvFallbackCover = imageUrl || series.coverUrl;
 

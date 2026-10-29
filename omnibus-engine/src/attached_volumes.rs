@@ -14,7 +14,7 @@
 
 use crate::db::Db;
 use crate::metadata::{
-    cv_issue_credits, is_cv_rate_limited, is_same_issue, json_num_string, merge_credit_json,
+    cv_issue_credits, is_cv_rate_limited, is_same_issue, json_num_string, mark_flag, merge_credit_json,
     metron_auth, metron_fetch, metron_issue_credits, metron_issue_name, next_match_state,
     parse_date_ms, prefer_existing, resolve_synced_name,
 };
@@ -729,6 +729,7 @@ async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyh
             let resp = client.execute(vol_req).await?;
             crate::api_usage::log(&db.pool, "comicvine", &vol_url).await;
             if is_cv_rate_limited(resp.status()) {
+                mark_flag(db, "cv_rate_limit_time").await;
                 anyhow::bail!("ComicVine rate limited (429/420) on the attached volume fetch");
             }
             let j: serde_json::Value = resp.json().await?;
@@ -773,6 +774,7 @@ async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyh
                 let resp = client.execute(req).await?;
                 crate::api_usage::log(&db.pool, "comicvine", "https://comicvine.gamespot.com/api/issues/").await;
                 if is_cv_rate_limited(resp.status()) {
+                    mark_flag(db, "cv_rate_limit_time").await;
                     anyhow::bail!("ComicVine rate limited (429/420) on the attached issues fetch");
                 }
                 let j: serde_json::Value = resp.json().await?;

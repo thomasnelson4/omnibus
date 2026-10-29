@@ -1,17 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { guessBookTypeFromCvVolume, isCvRateLimited, isRealGenre, resolveSyncedReleaseDate } from '@/lib/utils/metadata-policy';
+import { guessBookTypeFromCvVolume, isCvRateLimited, resolveSyncedReleaseDate } from '@/lib/utils/metadata-policy';
 
 describe('metadata provider policies', () => {
     it('treats both ComicVine rate-limit statuses as fatal to a batch', () => {
         expect(isCvRateLimited(420)).toBe(true);
         expect(isCvRateLimited(429)).toBe(true);
         expect(isCvRateLimited(500)).toBe(false);
-    });
-    it('filters concept noise without losing real genres', () => {
-        expect(isRealGenre(' Superhero ')).toBe(true);
-        expect(isRealGenre('Science Fiction')).toBe(true);
-        expect(isRealGenre('Homage Covers')).toBe(false);
-        expect(isRealGenre('Variant Cover: Action Figure')).toBe(false);
     });
     it('does not label a new or undated one-issue series as a one-shot', () => {
         expect(guessBookTypeFromCvVolume({count_of_issues: 1, start_year: 2026}, 2026)).toBeNull();

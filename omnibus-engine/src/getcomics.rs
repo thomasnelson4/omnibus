@@ -23,18 +23,59 @@ pub struct HosterPref {
     pub enabled: bool,
 }
 
-/// Default hoster order. Both GetComics variants sit at the TOP — `getcomics_direct` (the comicfiles
-/// CDN) first, then `getcomics_main` (the getcomics.org/dls/ "main server"). The /dls/ direct download
-/// succeeds for the majority of issues; only the subset behind a live Cloudflare challenge falls
-/// through to the download-time manual-hold. It deliberately outranks the third-party mirrors because
-/// those (rootz/vikingfile/terabox) are far less reliable to resolve. This matches the original single
-/// `getcomics`-first ordering. Mirrors the Node `DEFAULT_HOSTER_ORDER`.
+/// Default hoster order. Reliable-by-scraping mirrors are tried BEFORE the one hoster that needs a
+/// browser solver: `getcomics_direct` (comicfiles CDN, never Cloudflare-gated) → `mediafire` / `mega` /
+/// `pixeldrain` (all resolvable by plain scraping) → `getcomics_main` (getcomics.org/dls/ "main
+/// server", the only Cloudflare-gated hoster and the only path that can end in MANUAL_DDL). It used
+/// to sit second, ahead of every working mirror, funnelling the bulk of downloads at the most
+/// failure-prone path. `getcomics_main` stays ENABLED (many issues only expose a /dls/ link); it is
+/// just tried last. Mirrors the Node `DEFAULT_HOSTER_ORDER`.
 fn default_hoster_prefs() -> Vec<HosterPref> {
     // rootz/vikingfile/terabox are listed but DISABLED by default — they're Cloudflare/JS/app-gated and
     // can't be resolved by scraping, so they're off out of the box (kept toggleable so a user can try).
-    [("getcomics_direct", true), ("getcomics_main", true), ("mediafire", true), ("mega", true),
-     ("pixeldrain", true), ("rootz", false), ("vikingfile", false), ("terabox", false)]
+    [("getcomics_direct", true), ("mediafire", true), ("mega", true), ("pixeldrain", true),
+     ("getcomics_main", true), ("rootz", false), ("vikingfile", false), ("terabox", false)]
         .iter().map(|(h, en)| HosterPref { hoster: h.to_string(), enabled: *en }).collect()
+}
+
+/// The order shipped before `getcomics_main` was demoted below the scraping mirrors. Only the
+/// "untouched config" fingerprint for [`migrate_pristine_default_order`]. Mirrors the Node
+/// `LEGACY_DEFAULT_ORDER`.
+const LEGACY_DEFAULT_ORDER: [(&str, bool); 8] = [
+    ("getcomics_direct", true),
+    ("getcomics_main", true),
+    ("mediafire", true),
+    ("mega", true),
+    ("pixeldrain", true),
+    ("rootz", false),
+    ("vikingfile", false),
+    ("terabox", false),
+];
+
+/// Moves a PRISTINE stored config onto the new default order.
+///
+/// `hoster_priority` is a persisted per-install setting, so changing [`default_hoster_prefs`] alone
+/// only helps installs where it is unset — every existing install keeps its stored order, including
+/// the ones drowning in MANUAL_DDL. Reordering stored configs wholesale would be a regression though:
+/// it cannot distinguish "the user never touched this" from "the user deliberately put
+/// getcomics_main first", and silently overwriting deliberate tuning is not acceptable.
+///
+/// So this fires ONLY when the stored list is exactly the order WE shipped (same hosters, same order,
+/// same enabled flags). Any customisation — a reordered entry, a toggled hoster, a dropped or added
+/// hoster — fails the comparison and is left completely untouched. Pure and read-path only (no DB
+/// write, exactly like [`migrate_legacy_getcomics`]), so it is idempotent by construction. Mirrors the
+/// Node `migratePristineHosterOrder`.
+fn migrate_pristine_default_order(prefs: Vec<HosterPref>) -> Vec<HosterPref> {
+    let pristine = prefs.len() == LEGACY_DEFAULT_ORDER.len()
+        && LEGACY_DEFAULT_ORDER
+            .iter()
+            .zip(prefs.iter())
+            .all(|((h, en), p)| p.hoster == *h && p.enabled == *en);
+    if pristine {
+        default_hoster_prefs()
+    } else {
+        prefs
+    }
 }
 
 /// Migrates a legacy single `getcomics` entry into the split scheme: `getcomics_direct` keeps the
@@ -71,7 +112,7 @@ pub async fn hoster_prefs(db: &sqlx::AnyPool) -> Vec<HosterPref> {
         }).collect()
     };
     migrate_legacy_getcomics(&mut prefs);
-    prefs
+    migrate_pristine_default_order(prefs)
 }
 
 /// The set of currently-enabled hosters, priority order preserved (Node's `enabledHosters`).
@@ -239,30 +280,46 @@ impl SolverHealth {
     }
 
     /// Why solving should be SKIPPED right now — breaker open or host negative-cached — or None.
-    /// An elapsed breaker half-opens (state cleared, the next attempt probes for real).
-    pub(crate) fn skip_reason(&mut self, host: &str, now: std::time::Instant) -> Option<String> {
+    /// An elapsed breaker half-opens (state cleared, the next attempt probes for real) and reports
+    /// `breaker_recovered` so the caller can clear the stale `solver_unresponsive_time` stamp:
+    /// otherwise the health panel keeps warning about a solver that came back minutes ago (the
+    /// health checker only treats a stamp as recovered after 30 minutes).
+    pub(crate) fn skip_reason(&mut self, host: &str, now: std::time::Instant) -> SkipDecision {
+        let mut decision = SkipDecision::default();
         if let Some(until) = self.breaker_until {
             if now < until {
-                return Some(format!(
+                decision.reason = Some(format!(
                     "solver circuit is open after {} consecutive transport failures; solve attempts resume in {}s",
                     self.transport_failures,
                     (until - now).as_secs()
                 ));
+                return decision;
             }
             self.breaker_until = None;
             self.transport_failures = 0;
+            decision.breaker_recovered = true;
         }
         if let Some(until) = self.negative_hosts.get(host) {
             if now < *until {
-                return Some(format!(
+                decision.reason = Some(format!(
                     "solver recently failed to solve this host's challenge (ran its full budget); skipping re-solves for another {}s",
                     (*until - now).as_secs()
                 ));
+                return decision;
             }
             self.negative_hosts.remove(host);
         }
-        None
+        decision
     }
+}
+
+/// The verdict of a [`SolverHealth::skip_reason`] probe. `breaker_recovered` is reported separately
+/// from `reason` because a half-open breaker is NOT a skip: the caller goes on to solve AND clears
+/// the stale `solver_unresponsive_time` stamp.
+#[derive(Default)]
+pub(crate) struct SkipDecision {
+    pub reason: Option<String>,
+    pub breaker_recovered: bool,
 }
 
 fn solver_health() -> &'static std::sync::Mutex<SolverHealth> {
@@ -393,11 +450,16 @@ pub(crate) async fn solver_request_get(client: &Client, db: &sqlx::AnyPool, flar
     // Fail fast while the breaker is open or the host's challenge was just declared unsolvable —
     // a wedged solver queues requests forever, and re-solving a definitively failed challenge
     // seconds later burns the full budget for the same verdict.
-    {
+    let decision = {
         let mut health = solver_health().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(reason) = health.skip_reason(&host, std::time::Instant::now()) {
-            anyhow::bail!("{reason}");
-        }
+        health.skip_reason(&host, std::time::Instant::now())
+    };
+    if decision.breaker_recovered {
+        log::info!("[Solver] breaker cooldown elapsed — probe attempts resume; clearing the stale solver health flag.");
+        clear_time_flag(db, "solver_unresponsive_time").await;
+    }
+    if let Some(reason) = decision.reason {
+        anyhow::bail!("{reason}");
     }
 
     let session_id = if sc.kind == "flaresolverr" {
@@ -1371,21 +1433,26 @@ mod tests {
         let mut h = super::SolverHealth::default();
         let t0 = Instant::now();
         assert!(!h.record_transport_failure(t0), "first failure must not open the breaker");
-        assert!(h.skip_reason("getcomics.org", t0).is_none());
+        assert!(h.skip_reason("getcomics.org", t0).reason.is_none());
         assert!(h.record_transport_failure(t0), "failure #{} opens the breaker exactly once", super::SOLVER_BREAKER_THRESHOLD);
         assert!(!h.record_transport_failure(t0), "already-open breaker must not re-report the transition");
-        let reason = h.skip_reason("getcomics.org", t0 + Duration::from_secs(1));
+        let reason = h.skip_reason("getcomics.org", t0 + Duration::from_secs(1)).reason;
         assert!(reason.is_some(), "solves are skipped while the breaker is open");
         assert!(reason.unwrap().contains("circuit"), "reason names the breaker");
-        // Cooldown elapsed → half-open: attempts flow again.
-        assert!(h.skip_reason("getcomics.org", t0 + super::SOLVER_BREAKER_COOLDOWN + Duration::from_secs(1)).is_none());
+        // Cooldown elapsed → half-open: attempts flow again, and the caller is told to clear the
+        // stale `solver_unresponsive_time` stamp so the health panel stops warning.
+        let recovered = h.skip_reason("getcomics.org", t0 + super::SOLVER_BREAKER_COOLDOWN + Duration::from_secs(1));
+        assert!(recovered.reason.is_none());
+        assert!(recovered.breaker_recovered, "half-open must report the recovery transition");
+        // Only the transition reports it.
+        assert!(!h.skip_reason("getcomics.org", t0 + super::SOLVER_BREAKER_COOLDOWN + Duration::from_secs(2)).breaker_recovered);
         // A healthy response closes an open breaker exactly once (the caller clears the flag on that transition).
         let mut h2 = super::SolverHealth::default();
         h2.record_transport_failure(t0);
         h2.record_transport_failure(t0);
         assert!(h2.record_healthy_transport(), "closing transition reported");
         assert!(!h2.record_healthy_transport(), "no transition when already closed");
-        assert!(h2.skip_reason("getcomics.org", t0 + Duration::from_secs(1)).is_none());
+        assert!(h2.skip_reason("getcomics.org", t0 + Duration::from_secs(1)).reason.is_none());
     }
 
     #[test]
@@ -1394,11 +1461,11 @@ mod tests {
         let mut h = super::SolverHealth::default();
         let t0 = Instant::now();
         h.mark_unsolvable("getcomics.org", t0);
-        let reason = h.skip_reason("getcomics.org", t0 + Duration::from_secs(5));
+        let reason = h.skip_reason("getcomics.org", t0 + Duration::from_secs(5)).reason;
         assert!(reason.is_some(), "the failed host is skipped");
         assert!(reason.unwrap().contains("failed to solve"), "reason names the unsolved challenge");
-        assert!(h.skip_reason("annas-archive.org", t0 + Duration::from_secs(5)).is_none(), "other hosts are unaffected");
-        assert!(h.skip_reason("getcomics.org", t0 + super::SOLVER_NEGATIVE_TTL + Duration::from_secs(1)).is_none(), "expires after the TTL");
+        assert!(h.skip_reason("annas-archive.org", t0 + Duration::from_secs(5)).reason.is_none(), "other hosts are unaffected");
+        assert!(h.skip_reason("getcomics.org", t0 + super::SOLVER_NEGATIVE_TTL + Duration::from_secs(1)).reason.is_none(), "expires after the TTL");
     }
 
     #[test]
@@ -1802,6 +1869,128 @@ mod tests {
         migrate_legacy_getcomics(&mut prefs);
         let after: Vec<_> = prefs.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
         assert_eq!(before, after);
+    }
+    // The only hoster that needs a browser solver must not outrank the ones that plain scraping can
+    // resolve — otherwise the bulk of downloads are funnelled at the sole MANUAL_DDL-capable path.
+    #[test]
+    fn default_order_tries_scraping_mirrors_before_the_gated_main_server() {
+        let names: Vec<_> = default_hoster_prefs().iter().map(|p| p.hoster.clone()).collect();
+        assert_eq!(
+            names,
+            ["getcomics_direct", "mediafire", "mega", "pixeldrain", "getcomics_main", "rootz", "vikingfile", "terabox"]
+                .iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        // getcomics_main is still ENABLED (many issues only expose a /dls/ link) — just tried last.
+        let prefs = default_hoster_prefs();
+        assert!(prefs.iter().any(|p| p.hoster == "getcomics_main" && p.enabled));
+        // The unresolvable-by-scraping hosters stay off out of the box.
+        for off in ["rootz", "vikingfile", "terabox"] {
+            assert!(prefs.iter().any(|p| p.hoster == off && !p.enabled), "{off} must stay disabled by default");
+        }
+    }
+
+    // A stored config that is byte-for-byte what we shipped IS an untouched config, so it gets the
+    // new default order — the only way existing installs benefit from the change at all.
+    #[test]
+    fn migrate_pristine_default_order_reorders_the_untouched_config() {
+        let legacy: Vec<HosterPref> = LEGACY_DEFAULT_ORDER
+            .iter()
+            .map(|(h, en)| HosterPref { hoster: h.to_string(), enabled: *en })
+            .collect();
+        let migrated = migrate_pristine_default_order(legacy);
+        assert_eq!(
+            migrated.iter().map(|p| p.hoster.clone()).collect::<Vec<_>>(),
+            default_hoster_prefs().iter().map(|p| p.hoster.clone()).collect::<Vec<_>>()
+        );
+        // Idempotent: a second pass finds a list that no longer matches the legacy fingerprint.
+        let before: Vec<_> = migrated.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        let again = migrate_pristine_default_order(migrated);
+        let after: Vec<_> = again.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        assert_eq!(before, after);
+    }
+
+    // The whole point of the pristine check: anything that isn't exactly the shipped default is a
+    // DELIBERATE config and must survive byte-for-byte.
+    #[test]
+    fn migrate_pristine_default_order_never_clobbers_custom_configs() {
+        let base: Vec<HosterPref> = LEGACY_DEFAULT_ORDER
+            .iter()
+            .map(|(h, en)| HosterPref { hoster: h.to_string(), enabled: *en })
+            .collect();
+        let names = |p: &Vec<HosterPref>| p.iter().map(|x| (x.hoster.clone(), x.enabled)).collect::<Vec<_>>();
+
+        let mut deliberate = base.clone();
+        deliberate.swap(1, 3);
+        let before = names(&deliberate);
+        assert_eq!(names(&migrate_pristine_default_order(deliberate)), before, "reordered config must be untouched");
+
+        let toggled = base
+            .iter()
+            .cloned()
+            .map(|mut p| {
+                if p.hoster == "getcomics_main" {
+                    p.enabled = false;
+                }
+                p
+            })
+            .collect::<Vec<_>>();
+        let before = names(&toggled);
+        assert_eq!(names(&migrate_pristine_default_order(toggled)), before, "toggled config must be untouched");
+
+        let trimmed = base[..base.len() - 1].to_vec();
+        let before = names(&trimmed);
+        assert_eq!(names(&migrate_pristine_default_order(trimmed)), before);
+        let mut extended = base.clone();
+        extended.push(HosterPref { hoster: "custom".into(), enabled: true });
+        let before = names(&extended);
+        assert_eq!(names(&migrate_pristine_default_order(extended)), before);
+        // An explicitly empty config means "no hosters" — never reinterpreted as "use the defaults".
+        assert!(migrate_pristine_default_order(Vec::new()).is_empty());
+    }
+
+    // Legacy key split + pristine reorder compose: the split scheme IS the legacy fingerprint, so it
+    // gets demoted to the new default order on the same read.
+    #[test]
+    fn legacy_split_then_pristine_reorder() {
+        let mut legacy_key = vec![
+            HosterPref { hoster: "getcomics".into(), enabled: true },
+            HosterPref { hoster: "mediafire".into(), enabled: true },
+            HosterPref { hoster: "mega".into(), enabled: true },
+            HosterPref { hoster: "pixeldrain".into(), enabled: true },
+            HosterPref { hoster: "rootz".into(), enabled: false },
+            HosterPref { hoster: "vikingfile".into(), enabled: false },
+            HosterPref { hoster: "terabox".into(), enabled: false },
+        ];
+        migrate_legacy_getcomics(&mut legacy_key);
+        assert_eq!(legacy_key[0].hoster, "getcomics_direct");
+        assert_eq!(legacy_key[1].hoster, "getcomics_main");
+        let out = migrate_pristine_default_order(legacy_key);
+        let after: Vec<_> = out.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        assert_eq!(after, default_hoster_prefs().iter().map(|p| (p.hoster.clone(), p.enabled)).collect::<Vec<_>>());
+        // Idempotent on a second pass.
+        assert_eq!(
+            migrate_pristine_default_order(out.clone()).iter().map(|p| (p.hoster.clone(), p.enabled)).collect::<Vec<_>>(),
+            after
+        );
+    }
+
+    // A legacy key the user had already reordered is NOT pristine, so only the split applies.
+    #[test]
+    fn legacy_split_leaves_deliberate_ordering_alone() {
+        let mut deliberate = vec![
+            HosterPref { hoster: "mediafire".into(), enabled: true },
+            HosterPref { hoster: "getcomics".into(), enabled: true },
+            HosterPref { hoster: "mega".into(), enabled: true },
+            HosterPref { hoster: "pixeldrain".into(), enabled: true },
+            HosterPref { hoster: "rootz".into(), enabled: false },
+            HosterPref { hoster: "vikingfile".into(), enabled: false },
+            HosterPref { hoster: "terabox".into(), enabled: false },
+        ];
+        migrate_legacy_getcomics(&mut deliberate);
+        let before: Vec<_> = deliberate.iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        let after: Vec<_> = migrate_pristine_default_order(deliberate).iter().map(|p| (p.hoster.clone(), p.enabled)).collect();
+        assert_eq!(before, after);
+        assert_eq!(after[0].0, "mediafire", "the user's own top choice is preserved");
     }
 }
 

@@ -6,6 +6,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { AuditLogger } from '@/lib/audit-logger';
+import { settleDuplicateOnLink } from '@/lib/request-dedupe';
 
 export async function POST(req: Request) {
   try {
@@ -33,21 +34,28 @@ export async function POST(req: Request) {
     const downloadHash = infoHash || guid;
 
     if (downloadHash) {
-        const duplicateDownload = await prisma.request.findFirst({
-            where: {
-                downloadLink: downloadHash,
-                status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] },
-                id: { not: requestId }
-            }
-        });
+        const duplicateDownload = await settleDuplicateOnLink(downloadHash, requestId);
 
-        if (duplicateDownload) {
+        if (duplicateDownload.action === 'park') {
              Logger.log(`[Admin Download] Batch torrent already downloading (${downloadHash}). Queuing for batch extraction.`, 'info');
              await prisma.request.update({
                  where: { id: requestId },
                  data: { status: 'DOWNLOADING', downloadLink: downloadHash, clientDownloadId: duplicateDownload.clientDownloadId, downloadClientId: duplicateDownload.downloadClientId, progress: 0 }
              });
              return NextResponse.json({ success: true });
+        }
+        if (duplicateDownload.action === 'join') {
+             // #240 PR B: the pack is already in the watched folder for another request — the
+             // request waits on that import (the reconciler closes it) instead of re-downloading.
+             Logger.log(`[Admin Download] Pack already in the watched folder (${downloadHash}). Joining its wait.`, 'info');
+             await prisma.request.update({
+                 where: { id: requestId },
+                 data: { status: 'IMPORTING', progress: 100, downloadLink: downloadHash }
+             });
+             return NextResponse.json({ success: true, waiting: true });
+        }
+        if (duplicateDownload.action === 'settle') {
+             return NextResponse.json({ success: true, settled: duplicateDownload.status });
         }
     }
 

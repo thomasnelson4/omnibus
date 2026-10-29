@@ -8,15 +8,36 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { HardDrive, Trash2, Plus, Loader2, CheckCircle2, RotateCcw } from "lucide-react"
 import { StatusBox } from "./shared"
 import type { SettingsBag } from "./shared"
+import { issueFileName, issuePaddingFromSetting, seriesFolderSegments, type NamingInput } from "@/lib/utils/naming"
+
+// Sample values for the live previews. The previews run the same naming rules (naming.ts) as every
+// path that names a file, so what they show is what an import, a match or Standardize will write.
+const COMIC_SAMPLE: NamingInput = {
+  publisher: "Marvel", imprint: "Marvel MAX", series: "Amazing Spider-Man", seriesYear: 2022,
+  issueNumber: "1", releaseDate: "2022-04-06", issueTitle: "The Hunt", universe: "Earth-616", seriesGroup: "Spider-Man",
+}
+const MANGA_SAMPLE: NamingInput = {
+  publisher: "Shueisha", imprint: "Jump Comics", series: "Chainsaw Man", seriesYear: 2018,
+  issueNumber: "1", releaseDate: "2018-12-04", issueTitle: "Dog & Chainsaw", seriesGroup: "Chainsaw Man",
+}
 
 export function LibraryFilesTab({ s }: { s: SettingsBag }) {
   const {
     config, setConfig, configuredLibraries, addLibrary, removeLibrary, updateLibrary,
     setLibraryDefault, handleTest, testing, testResults, handleRestoreNamingDefaults
   } = s;
+
+  const padding = issuePaddingFromSetting(config.issue_number_padding);
+  const folderPreview = seriesFolderSegments(config.folder_naming_pattern || "{Publisher}/{Series} ({Year})", COMIC_SAMPLE)?.join("/")
+    ?? "(no folder inside the library - check the pattern)";
+  const filePreview = (pattern: string, sample: NamingInput) => {
+    const name = issueFileName(pattern, sample, padding);
+    return name ? `${name}.cbz` : "(no file name - check the pattern)";
+  };
 
   return (
     <>
@@ -54,7 +75,8 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                                 </div>
                                 <div className="space-y-1.5">
                                     <Label className="text-base sm:text-lg font-bold text-primary">Root Path</Label>
-                                    <Input value={lib.path} onChange={e => updateLibrary(lib.id, 'path', e.target.value)} placeholder={typeof window !== 'undefined' && navigator.platform.indexOf('Win') > -1 ? "C:\\Comics\\Library" : "/library"} className="h-12 sm:h-10 font-mono bg-background border-border text-foreground text-sm" />
+                                    <Input value={lib.path} onChange={e => updateLibrary(lib.id, 'path', e.target.value)} placeholder="/data/comics" className="h-12 sm:h-10 font-mono bg-background border-border text-foreground text-sm" />
+                                    <p className="text-[11px] text-muted-foreground">The folder as Omnibus sees it. In Docker, use the container side of a volume in your compose file (e.g. /data/comics), not a Windows path like C:\Comics.</p>
                                 </div>
                                 <Button variant="ghost" size="icon" className="absolute top-2 right-2 h-10 w-10 sm:h-8 sm:w-8 text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-900/20 transition-opacity opacity-100 sm:opacity-0 group-hover:opacity-100" onClick={() => removeLibrary(lib.id)}>
                                     <Trash2 className="w-5 h-5 sm:h-4 sm:w-4" />
@@ -72,10 +94,10 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                         <Input 
                             value={config.download_path} 
                             onChange={e => setConfig({...config, download_path: e.target.value})} 
-                            placeholder={typeof window !== 'undefined' && navigator.platform.indexOf('Win') > -1 ? "C:\\Downloads\\Comics" : "/downloads"} 
+                            placeholder="/data/downloads"
                             className="h-12 sm:h-10 font-mono bg-muted/30 border-border text-foreground"
                         />
-                        <p className="text-[11px] text-muted-foreground">The folder Omnibus scans for finished downloads before routing them into your libraries.</p>
+                        <p className="text-[11px] text-muted-foreground">The folder Omnibus scans for finished downloads before routing them into your libraries - like the library folders, the path as Omnibus sees it inside its container.</p>
                     </div>
 
                     <div className="border-t border-border my-4" />
@@ -89,7 +111,7 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                                 <h3 className="text-lg font-bold text-foreground">Media Naming Conventions</h3>
                                 <p className="text-[11px] text-muted-foreground mt-1">
                                     Customize how Omnibus names your folders and files during imports. 
-                                    Available tags: <code className="bg-muted px-1 rounded border border-border">{"{Publisher}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Imprint}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Series}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Year}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{VolumeYear}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{IssueYear}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Issue}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{IssueTitle}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{UniverseName}"}</code>
+                                    Available tags: <code className="bg-muted px-1 rounded border border-border">{"{Publisher}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Imprint}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Series}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Year}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{VolumeYear}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{IssueYear}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{Issue}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{IssueTitle}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{UniverseName}"}</code>, <code className="bg-muted px-1 rounded border border-border">{"{SeriesGroup}"}</code>
                                 </p>
                             </div>
                             <Button 
@@ -150,6 +172,22 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                                 />
                                 <p className="text-[10px] text-muted-foreground">Applied to trades and omnibuses attached to a series as collected editions. The same file tokens, including {`{Imprint}`}, are available. Their number is whatever you set, so it doubles as reading order.</p>
                             </div>
+
+                            {/* #244: one padding rule for every file name Omnibus writes. */}
+                            <div className="space-y-2 md:col-span-2 lg:col-span-1">
+                                <Label htmlFor="issue_number_padding" className="text-foreground font-semibold">Issue Number Padding</Label>
+                                <Select value={padding} onValueChange={(v) => setConfig({ ...config, issue_number_padding: v })}>
+                                    <SelectTrigger id="issue_number_padding" className="h-12 sm:h-10 bg-muted/30 border-border text-foreground">
+                                        <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="3">3 digits (#001)</SelectItem>
+                                        <SelectItem value="2">2 digits (#01)</SelectItem>
+                                        <SelectItem value="none">None (#1)</SelectItem>
+                                    </SelectContent>
+                                </Select>
+                                <p className="text-[10px] text-muted-foreground">How {`{Issue}`} is written in every file name: downloads, the watched folder, the Smart Matcher and Standardize. Decimals and letters keep their place (#001.5, #001A). Changing this renames your files the next time you run Standardize.</p>
+                            </div>
                         </div>
 
                         {/* --- LIVE PREVIEW BOX --- */}
@@ -160,59 +198,19 @@ export function LibraryFilesTab({ s }: { s: SettingsBag }) {
                             <div className="grid gap-3 text-xs font-mono">
                                 <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4">
                                     <span className="text-muted-foreground w-28 shrink-0">Folder:</span>
-                                    <span className="text-primary break-all">
-                                        {(config.folder_naming_pattern || "{Publisher}/{Series} ({Year})")
-                                            .replace(/{Publisher}/gi, "Marvel")
-                                            .replace(/{Imprint}/gi, "Marvel MAX")
-                                            .replace(/{Series}/gi, "Amazing Spider-Man")
-                                            .replace(/{Year}/gi, "2022")
-                                            .replace(/{VolumeYear}/gi, "2022")
-                                            .replace(/{IssueYear}/gi, "2022")
-                                            .replace(/{UniverseName}/gi, "Earth-616")
-                                            .replace(/{SeriesGroup}/gi, "Spider-Man")
-                                            .replace(/\(\s*\)/g, '')
-                                            .replace(/\[\s*\]/g, '')
-                                            .replace(/\s+/g, ' ')
-                                            .trim()}
-                                    </span>
+                                    <span className="text-primary break-all">{folderPreview}</span>
                                 </div>
                                 <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4">
                                     <span className="text-muted-foreground w-28 shrink-0">Standard Comic:</span>
-                                    <span className="text-primary break-all">
-                                        {(config.file_naming_pattern || "{Series} #{Issue}")
-                                            .replace(/{Publisher}/gi, "Marvel")
-                                            .replace(/{Imprint}/gi, "Marvel MAX")
-                                            .replace(/{Series}/gi, "Amazing Spider-Man")
-                                            .replace(/{Year}/gi, "2022")
-                                            .replace(/{VolumeYear}/gi, "2022")
-                                            .replace(/{IssueYear}/gi, "2022")
-                                            .replace(/{UniverseName}/gi, "Earth-616")
-                                            .replace(/{SeriesGroup}/gi, "Spider-Man")
-                                            .replace(/{Issue}/gi, "01")
-                                            .replace(/\(\s*\)/g, '')
-                                            .replace(/\[\s*\]/g, '')
-                                            .replace(/\s+/g, ' ')
-                                            .trim()}.cbz
-                                    </span>
+                                    <span className="text-primary break-all">{filePreview(config.file_naming_pattern || "{Series} #{Issue}", COMIC_SAMPLE)}</span>
                                 </div>
                                 <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4">
                                     <span className="text-muted-foreground w-28 shrink-0">Manga:</span>
-                                    <span className="text-primary break-all">
-                                        {(config.manga_file_naming_pattern || "{Series} Vol. {Issue}")
-                                            .replace(/{Publisher}/gi, "Shueisha")
-                                            .replace(/{Imprint}/gi, "Jump Comics")
-                                            .replace(/{Series}/gi, "Chainsaw Man")
-                                            .replace(/{Year}/gi, "2018")
-                                            .replace(/{VolumeYear}/gi, "2018")
-                                            .replace(/{IssueYear}/gi, "2018")
-                                            .replace(/{UniverseName}/gi, "")
-                                            .replace(/{SeriesGroup}/gi, "Chainsaw Man")
-                                            .replace(/{Issue}/gi, "01")
-                                            .replace(/\(\s*\)/g, '')
-                                            .replace(/\[\s*\]/g, '')
-                                            .replace(/\s+/g, ' ')
-                                            .trim()}.cbz
-                                    </span>
+                                    <span className="text-primary break-all">{filePreview(config.manga_file_naming_pattern || "{Series} Vol. {Issue}", MANGA_SAMPLE)}</span>
+                                </div>
+                                <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-4">
+                                    <span className="text-muted-foreground w-28 shrink-0">Collected Edition:</span>
+                                    <span className="text-primary break-all">{filePreview(config.collected_file_naming_pattern || "{Series} Vol. {Issue} ({IssueYear})", COMIC_SAMPLE)}</span>
                                 </div>
                             </div>
                         </div>

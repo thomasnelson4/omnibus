@@ -13,6 +13,7 @@ import { prisma } from '@/lib/db';
 import { getToken } from 'next-auth/jwt';
 import { detectManga } from '@/lib/manga-detector';
 import { searchAndDownload } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 vi.mock('next-auth/jwt', () => ({ getToken: vi.fn() }));
 vi.mock('@/lib/automation', () => ({
@@ -141,8 +142,8 @@ describe('API: request approval reuses the stored Series.isManga (PATCH)', () =>
 
         expect(res.status).toBe(200);
         expect(detectManga).not.toHaveBeenCalled();
-        // searchAndDownload(id, searchName, year, publisher, isManga, skipIndexers)
-        expect(searchAndDownload).toHaveBeenCalledWith('req-9', 'Naruto #700', '1999', 'VIZ Media', true, false);
+        // searchAndDownload(id, searchName, year, publisher, isManga, skipIndexers, priority)
+        expect(searchAndDownload).toHaveBeenCalledWith('req-9', 'Naruto #700', '1999', 'VIZ Media', true, false, JOB_PRIORITY.REQUESTED);
     });
 
     it('falls back to detection when no Series row exists', async () => {
@@ -160,6 +161,49 @@ describe('API: request approval reuses the stored Series.isManga (PATCH)', () =>
 
         expect(res.status).toBe(200);
         expect(detectManga).toHaveBeenCalled();
-        expect(searchAndDownload).toHaveBeenCalledWith('req-9', 'Mystery Book #1', '', '', false, false);
+        expect(searchAndDownload).toHaveBeenCalledWith('req-9', 'Mystery Book #1', '', '', false, false, JOB_PRIORITY.REQUESTED);
+    });
+});
+
+// An approval is one request at a time, but approving a whole series sends one per issue. Those are
+// a bulk ask (the same batch the "N Issues Approved" alert gathers: the requester's other requests for
+// that series, made within two hours), so they must not crowd out another reader's single request.
+describe('API: approving one issue of a series batch is a bulk ask (PATCH)', () => {
+    // The mocked module's functions keep Prisma's real (generic) types; this is the vi.fn behind each.
+    const mockOf = (fn: unknown) => fn as ReturnType<typeof vi.fn>;
+
+    beforeEach(() => {
+        mockOf(getToken).mockResolvedValue({ id: 'admin-1', role: 'ADMIN', name: 'Admin' });
+        mockOf(prisma.systemSetting.findUnique).mockImplementation(settingsByKey());
+        mockOf(prisma.request.update).mockResolvedValue({});
+        mockOf(prisma.request.findUnique).mockResolvedValue({
+            id: 'req-3', userId: 'user-1', volumeId: '555', metadataSource: 'COMICVINE',
+            activeDownloadName: 'Saga #3', downloadLink: null,
+            createdAt: new Date(), user: { username: 'reader', email: null }
+        });
+        mockOf(prisma.series.findFirst).mockResolvedValue({
+            id: 'ser-2', name: 'Saga', year: 2012, publisher: 'Image', description: '', isManga: false
+        });
+    });
+
+    const approve = () => PATCH(new NextRequest('http://localhost/api/request', {
+        method: 'PATCH',
+        body: JSON.stringify({ id: 'req-3', status: 'PENDING' })
+    }));
+
+    it('while more of the batch still waits for approval', async () => {
+        mockOf(prisma.request.count).mockResolvedValue(4); // four more issues still PENDING_APPROVAL
+
+        expect((await approve()).status).toBe(200);
+        expect(searchAndDownload).toHaveBeenCalledWith('req-3', 'Saga #3', '2012', 'Image', false, false, JOB_PRIORITY.BULK);
+    });
+
+    it('for the last approval of the batch too', async () => {
+        mockOf(prisma.request.count)
+            .mockResolvedValueOnce(0)  // nothing left pending approval…
+            .mockResolvedValueOnce(5); // …because five of the series' requests were approved together
+
+        expect((await approve()).status).toBe(200);
+        expect(searchAndDownload).toHaveBeenCalledWith('req-3', 'Saga #3', '2012', 'Image', false, false, JOB_PRIORITY.BULK);
     });
 });

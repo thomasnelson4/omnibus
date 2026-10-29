@@ -17,6 +17,8 @@ import {
     Sparkles, Server
 } from "lucide-react"
 import { getErrorMessage } from "@/lib/utils/error"
+import { SCHEDULE_DEFAULTS } from "@/lib/schedule-defaults"
+import { restoreCompleteToast, rememberRestoreWarnings, takeRestoreWarnings } from "@/lib/restore-warnings"
 
 const INTERVALS = [
     { label: "Disabled (Manual Only)", value: "0" },
@@ -34,9 +36,11 @@ const INTERVALS = [
 
 export default function ScheduledJobsPage() {
   const router = useRouter()
-  const [metadataSyncSchedule, setMetadataSyncSchedule] = useState("24")
-  const [embedMetadataSchedule, setEmbedMetadataSchedule] = useState("0")
-  const [seriesJsonSchedule, setSeriesJsonSchedule] = useState("0")
+  // A schedule nobody saved shows its shared default - the same value the scheduler runs on.
+  const D = SCHEDULE_DEFAULTS
+  const [metadataSyncSchedule, setMetadataSyncSchedule] = useState<string>(D.metadata_sync_schedule)
+  const [embedMetadataSchedule, setEmbedMetadataSchedule] = useState<string>(D.embed_metadata_schedule)
+  const [seriesJsonSchedule, setSeriesJsonSchedule] = useState<string>(D.series_json_schedule)
   // Feature toggles are READ-ONLY here (Phase 3, one owner per setting): the series.json export
   // lives in Settings → Metadata and CBR auto-conversion in Settings → Library & Files. This page
   // only reflects their state so a scheduled job that would skip is explained, never flips them.
@@ -45,20 +49,20 @@ export default function ScheduledJobsPage() {
   // Same rule for Komga: read-only here. The integration is owned by Settings → Media Servers; this
   // page only reflects it so a "Run Now" that would be skipped is explained, never silently green.
   const [komgaEnabled, setKomgaEnabled] = useState(false)
-  const [librarySyncSchedule, setLibrarySyncSchedule] = useState("12") 
-  const [monitorSyncSchedule, setMonitorSyncSchedule] = useState("24") 
-  const [diagnosticsSyncSchedule, setDiagnosticsSyncSchedule] = useState("168")
-  const [backupSyncSchedule, setBackupSyncSchedule] = useState("168")
-  const [backupSyncDay, setBackupSyncDay] = useState("1")
-  const [cacheCleanupSchedule, setCacheCleanupSchedule] = useState("24") 
-  const [popularSyncSchedule, setPopularSyncSchedule] = useState("24")
-  const [converterSyncSchedule, setConverterSyncSchedule] = useState("24")
-  const [weeklyDigestSchedule, setWeeklyDigestSchedule] = useState("168")
-  const [weeklyDigestDay, setWeeklyDigestDay] = useState("1") 
-  
+  const [librarySyncSchedule, setLibrarySyncSchedule] = useState<string>(D.library_sync_schedule)
+  const [monitorSyncSchedule, setMonitorSyncSchedule] = useState<string>(D.monitor_sync_schedule)
+  const [diagnosticsSyncSchedule, setDiagnosticsSyncSchedule] = useState<string>(D.diagnostics_sync_schedule)
+  const [backupSyncSchedule, setBackupSyncSchedule] = useState<string>(D.backup_sync_schedule)
+  const [backupSyncDay, setBackupSyncDay] = useState<string>(D.backup_sync_day)
+  const [cacheCleanupSchedule, setCacheCleanupSchedule] = useState<string>(D.cache_cleanup_schedule)
+  const [popularSyncSchedule, setPopularSyncSchedule] = useState<string>(D.popular_sync_schedule)
+  const [converterSyncSchedule, setConverterSyncSchedule] = useState<string>(D.cbr_conversion_schedule)
+  const [weeklyDigestSchedule, setWeeklyDigestSchedule] = useState<string>(D.weekly_digest_schedule)
+  const [weeklyDigestDay, setWeeklyDigestDay] = useState<string>(D.weekly_digest_day)
+
   // --- ADDED: State for new jobs ---
-  const [watchedSyncSchedule, setWatchedSyncSchedule] = useState("0.25")
-  const [healthCheckSchedule, setHealthCheckSchedule] = useState("0.25")
+  const [watchedSyncSchedule, setWatchedSyncSchedule] = useState<string>(D.watched_sync_schedule)
+  const [healthCheckSchedule, setHealthCheckSchedule] = useState<string>(D.health_check_schedule)
   
   const [savingJobs, setSavingJobs] = useState(false)
   const [runningJob, setRunningJob] = useState<string | null>(null) 
@@ -82,6 +86,12 @@ export default function ScheduledJobsPage() {
   });
 
   const hasUnsavedChanges = isDataLoaded && initialStateHash !== "" && currentStateString !== initialStateHash;
+
+  // A restore's folder warnings, carried across the reload that follows it (restore-warnings.ts).
+  useEffect(() => {
+      const pending = takeRestoreWarnings();
+      if (pending.length > 0) toast(restoreCompleteToast(pending, ''));
+  }, [toast]);
 
   useEffect(() => {
       if (isDataLoaded && initialStateHash === "") {
@@ -261,8 +271,11 @@ export default function ScheduledJobsPage() {
           const data = await res.json();
 
           if (res.ok) {
-              toast({ title: "Restore Complete", description: "Your library and progress data has been successfully merged!" });
-              setTimeout(() => window.location.reload(), 1500); 
+              // Folders the server can't use don't stop a restore - it says which ones to fix, and
+              // the warnings are shown again after the reload (restore-warnings.ts).
+              toast(restoreCompleteToast(data.warnings, "Your library and progress data has been successfully merged!"));
+              rememberRestoreWarnings(data.warnings);
+              setTimeout(() => window.location.reload(), 1500);
           } else {
               throw new Error(data.error || "Failed to restore");
           }

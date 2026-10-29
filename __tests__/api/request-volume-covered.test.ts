@@ -8,6 +8,8 @@ import { NextRequest } from 'next/server';
 import { prisma } from '@/lib/db';
 import { getToken } from 'next-auth/jwt';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
+import { processAutomationQueue } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 vi.mock('next-auth/jwt', () => ({ getToken: vi.fn() }));
 vi.mock('@/lib/automation', () => ({ searchAndDownload: vi.fn().mockResolvedValue(undefined), processAutomationQueue: vi.fn() }));
@@ -68,6 +70,38 @@ describe('API: volume request vs. coverage (POST)', () => {
         // #1 is on disk, #5-6 are in the trade; #3 is asked for even though a trade row may carry "3".
         expect(filed).toEqual(['Saga #2', 'Saga #3', 'Saga #4']);
         expect(ownedWhere).toEqual(expect.objectContaining({ seriesId: 'series-1', filePath: { not: null }, attachedVolumeId: null, isAnnual: false }));
+    });
+
+    // A series request files one request per missing issue. Those searches are a bulk ask: ahead of
+    // the Series Monitor's own searches, behind another reader's single issue - unless the series is
+    // missing just one issue, which is a single ask like any other.
+    const requestSeries = () => POST(new NextRequest('http://localhost/api/request', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'volume', cvId: 4242, name: 'Saga', metadataSource: 'COMICVINE', year: '2012', publisher: 'Image' }),
+    }));
+    // The library owns these issue numbers of the run (and no collected edition).
+    const ownedIssues = (numbers: string[]) =>
+        (prisma.issue.findMany as unknown as ReturnType<typeof vi.fn>).mockImplementation(
+            async ({ where }: { where: { attachedVolume?: unknown } }) => where.attachedVolume ? [] : numbers.map(number => ({ number }))
+        );
+
+    it('queues the searches of a series request as one bulk ask', async () => {
+        ownedIssues(['1']);
+
+        expect((await requestSeries()).status).toBe(200);
+        expect(processAutomationQueue).toHaveBeenCalledTimes(1);
+        const [items, priority] = vi.mocked(processAutomationQueue).mock.calls[0];
+        expect(items).toHaveLength(5);
+        expect(priority).toBe(JOB_PRIORITY.BULK);
+    });
+
+    it('queues a series request that is missing only one issue as a single ask', async () => {
+        ownedIssues(['1', '2', '3', '4', '5']);
+
+        expect((await requestSeries()).status).toBe(200);
+        const [items, priority] = vi.mocked(processAutomationQueue).mock.calls[0];
+        expect(items).toHaveLength(1);
+        expect(priority).toBe(JOB_PRIORITY.REQUESTED);
     });
 
     it('does not trust a request payload to set or overwrite a series imprint', async () => {

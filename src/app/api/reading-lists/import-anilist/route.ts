@@ -5,6 +5,7 @@ import { getServerSession } from 'next-auth/next';
 import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { Logger } from '@/lib/logger';
 import { processAutomationQueue } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 import { getErrorMessage } from '@/lib/utils/error';
 import { enqueueKomgaReadListDeleteNow, triggerReadListPushSoon } from '@/lib/komga/readlist-trigger';
 
@@ -174,7 +175,8 @@ export async function POST(request: Request) {
             }
         }
 
-        if (automationQueue.length > 0) processAutomationQueue(automationQueue).catch(() => {});
+        // An import is a bulk ask (job-priority.ts): ahead of the Series Monitor, behind a single request.
+        if (automationQueue.length > 0) processAutomationQueue(automationQueue, JOB_PRIORITY.BULK).catch(() => {});
 
         if (totalMatchedSeries === 0 && missingRequested === 0) {
             return NextResponse.json({ error: "Found AniList account, but none of the manga matched your server." }, { status: 404 });

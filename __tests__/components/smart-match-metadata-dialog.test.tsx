@@ -32,6 +32,15 @@ describe('buildFolderPreview imprint token', () => {
             imprint: '', name: 'Batman', year: 2016,
         })).toBe('Batman (2016)');
     });
+
+    // The naming cleanup: the preview runs the same rules (naming.ts) as the folder the server
+    // creates - it used to keep a trailing period the server strips, and print an unknown year.
+    it('previews exactly the folder the match will create', () => {
+        expect(buildFolderPreview('{Publisher}/{Series} ({Year})', { name: 'Batman Inc.', year: 2011, publisher: 'DC Comics' })).toBe('DC Comics/Batman Inc (2011)');
+        expect(buildFolderPreview('{Publisher}/{Series} ({Year})', { name: 'Batman', year: 0, publisher: '' })).toBe('Other/Batman');
+        expect(buildFolderPreview('{series} [{SERIESGROUP}]', { name: 'Cash $& Carry', seriesGroup: 'Heist' })).toBe('Cash $& Carry [Heist]');
+        expect(buildFolderPreview('../{Series}', { name: 'Batman' })).toBe('');
+    });
 });
 
 

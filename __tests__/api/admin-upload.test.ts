@@ -5,6 +5,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Writable } from 'stream';
 import path from 'path';
 import { POST } from '@/app/api/admin/upload/route';
+import { describeIssueFromFilename } from '@/lib/utils/issue-parser';
 
 const mocks = vi.hoisted(() => ({
     session: vi.fn(),
@@ -111,6 +112,26 @@ describe('API Route: /api/admin/upload (single-shot + chunked)', () => {
             { overwrite: false },
         );
         expect(writtenBytes('.upload-')).toBe('hello');
+    });
+
+    // A name already taken used to become " (1)", which the Smart Matcher's filename parser reads
+    // as the issue number on scene-style names ("Saga 054 (2018) (Digital) (1).cbz" → #1). It
+    // takes " (copy N)" now - the same rule as the engine's move into /unmatched.
+    it('an upload whose name is taken lands as "(copy N)" and still parses as its own issue', async () => {
+        const taken = path.join('/unmatched', 'Saga 054 (2018) (Digital).cbz');
+        mocks.pathExists.mockImplementation(async (p: string) => p === taken);
+
+        const res = await upload({ destination: 'unmatched', filename: 'Saga 054 (2018) (Digital).cbz' }, 'hello');
+        expect(res.status).toBe(200);
+        const json = await res.json();
+
+        expect(json.filename).toBe('Saga 054 (2018) (Digital) (copy 1).cbz');
+        expect(mocks.move).toHaveBeenCalledWith(
+            expect.stringContaining('.part'),
+            path.join('/unmatched', 'Saga 054 (2018) (Digital) (copy 1).cbz'),
+            { overwrite: false },
+        );
+        expect(describeIssueFromFilename(json.filename).number).toBe('54');
     });
 
     it('chunked: appends offset-verified chunks and finalizes only on the last one', async () => {

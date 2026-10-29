@@ -152,5 +152,25 @@ describe('Security: Next.js Front-Door Middleware', () => {
 
             expect(res?.headers.get('Location')).toBeNull();
         });
+
+        // The session is the admin's even while its role is the impersonated user's.
+        it('keeps an admin impersonating a user on the 2h admin window', async () => {
+            mocks.getToken.mockResolvedValueOnce({ id: 'user_1', role: 'USER', isImpersonating: true, originalAdminId: 'admin_1', lastActive: Date.now() - 3 * HOUR });
+            const res = await middleware(createReq('/library')) as Response;
+
+            expect([302, 307]).toContain(res?.status);
+            expect(res?.headers.get('Location')).toMatch(/\/login/);
+        });
+    });
+
+    // Stopping an impersonation must be reachable by the impersonating session, whose role is the
+    // user's — so the stop route lives outside the /api/admin gate (found in the v1.4.7 sweep: the old
+    // stop action sat behind it and could never be reached).
+    it('lets an impersonating session (USER role) reach /api/impersonation/stop', async () => {
+        mocks.getToken.mockResolvedValueOnce({ id: 'user_1', role: 'USER', isImpersonating: true, originalAdminId: 'admin_1', lastActive: Date.now() });
+        const res = await middleware(createReq('/api/impersonation/stop')) as Response;
+
+        expect(res?.status).not.toBe(403);
+        expect(res.headers.get('x-middleware-request-x-pathname')).toBe('/api/impersonation/stop');
     });
 });

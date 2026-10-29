@@ -1,6 +1,6 @@
 // #204: the pure pieces of the session-expiry fix.
 import { describe, it, expect, beforeEach } from 'vitest';
-import { isSafeReturnPath, loginUrlFor, isPublicPath, sessionLooksExpired, isGuardedApiUrl, claimExpiryOnce, __resetExpiryForTests } from '@/lib/session-expiry-client';
+import { isSafeReturnPath, loginUrlFor, isPublicPath, sessionLooksExpired, sessionPayloadIsGone, isGuardedApiUrl, claimExpiryOnce, __resetExpiryForTests } from '@/lib/session-expiry-client';
 
 describe('session-expiry-client', () => {
     beforeEach(() => __resetExpiryForTests());
@@ -30,6 +30,14 @@ describe('session-expiry-client', () => {
         expect(sessionLooksExpired('unauthenticated', undefined, false)).toBe(false);      // an anonymous visitor
         expect(sessionLooksExpired('loading', undefined, true)).toBe(false);
         expect(sessionLooksExpired('authenticated', undefined, true)).toBe(false);
+    });
+
+    it("reads the session endpoint's answer: NextAuth's empty {} or the flag = gone; a user = alive; anything odd = not proof", () => {
+        expect(sessionPayloadIsGone({})).toBe(true);                                  // the cookie lapsed
+        expect(sessionPayloadIsGone({ error: 'SessionExpired' })).toBe(true);         // the inactivity flag
+        expect(sessionPayloadIsGone({ user: undefined, error: 'SessionExpired' })).toBe(true);
+        expect(sessionPayloadIsGone({ user: { id: 'u2', role: 'USER' }, expires: 'x' })).toBe(false);
+        for (const odd of [null, undefined, 'nope', 42, []]) expect(sessionPayloadIsGone(odd)).toBe(false);
     });
 
     it("guards our own /api routes only — never NextAuth's, never another origin", () => {

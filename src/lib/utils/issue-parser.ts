@@ -4,16 +4,11 @@
 // normalizeFractionNumbers mirrors metadata.rs::normalize_fraction_numbers. The automated
 // search/scan path runs the Rust copies; interactive/import runs these. Keep the two sides in sync.
 import { Logger } from '@/lib/logger';
+import { normalizeFractionNumbers } from '@/lib/utils/naming';
 
-// Issue #200: ComicVine numbers half-issues with Unicode vulgar fractions ("½", X-Men (1991)'s
-// "Thrall"), which no digit-based rule can see. Rewrite them as decimals — merged with a glued
-// preceding integer, so Wizard-era "1½" reads 1.5 — before any parse or comparison. Conservative
-// set on purpose: these three are the fractions comic numbering actually uses.
-const VULGAR_FRACTIONS: Record<string, string> = { '½': '.5', '¼': '.25', '¾': '.75' };
-
-export function normalizeFractionNumbers(s: string): string {
-    return s.replace(/(\d+)?([½¼¾])/g, (_, int, frac) => (int || '0') + VULGAR_FRACTIONS[frac]);
-}
+// Issue #200's vulgar-fraction rewrite lives in naming.ts (dependency-free, so file names can use
+// it in the browser too); re-exported here for the parsers and their callers.
+export { normalizeFractionNumbers };
 
 export function isSameIssue(num1: string | number, num2: string | number): boolean {
     // 1. Regex updated to capture optional leading negative sign natively

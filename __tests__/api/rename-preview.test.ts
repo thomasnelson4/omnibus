@@ -53,6 +53,25 @@ describe('API Route: Rename Preview', () => {
         expect(previews[0].newPath).toBe('/data/comics/Batman/Batman - - #001.cbz');
     });
 
+    // #244: the preview promises the padding the renamers will use, and no "(0000)" for a series
+    // with no year.
+    it.each([
+        { padding: 'none', name: 'Batman #1.cbz' },
+        { padding: '2', name: 'Batman #01.cbz' },
+        { padding: undefined, name: 'Batman #001.cbz' },
+    ])('promises the padding setting ($padding)', async ({ padding, name }) => {
+        mocks.systemSettingFindMany.mockResolvedValue(padding ? [{ key: 'issue_number_padding', value: padding }] : []);
+        mocks.issueFindMany.mockResolvedValue([{
+            id: 'issue_1', number: '1', name: null, releaseDate: null, filePath: '/data/comics/old/Batman 1.cbz', attachedVolume: null,
+        }]);
+        mocks.seriesFindUnique.mockResolvedValue({
+            id: 'series_1', libraryId: 'lib_1', folderPath: '/data/comics/Batman', publisher: 'DC Comics', name: 'Batman', year: 0, imprint: null, isManga: false,
+        });
+        const res = await post({ seriesIds: ['series_1'], folderPattern: '{Series} ({Year})', filePattern: '{Series} #{Issue} ({IssueYear})' });
+        const { previews } = await res.json();
+        expect(previews[0].newPath).toBe(`/data/comics/Batman/${name}`);
+    });
+
     it('promises a LOCAL collected edition\'s books under the edition\'s name, and everything else under the series', async () => {
         mocks.issueFindMany.mockResolvedValue([
             {

@@ -4,7 +4,7 @@ import { filePatternForIssue, seriesTokenForIssue } from '@/lib/utils/file-patte
 import path from 'path';
 import { getToken } from 'next-auth/jwt';
 import { Logger } from '@/lib/logger';
-import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
+import { issueFileName, issuePaddingFromSetting, issueTitleForName, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
 
 export async function POST(request: NextRequest) {
     try {
@@ -29,6 +29,7 @@ export async function POST(request: NextRequest) {
         const config = Object.fromEntries(settings.map((s: any) => [s.key, s.value]));
         const activeMangaFilePattern = mangaFilePattern || config.manga_file_naming_pattern || "{Series} Vol. {Issue}";
         const activeCollectedFilePattern = collectedFilePattern || config.collected_file_naming_pattern || null;
+        const issuePadding = issuePaddingFromSetting(config.issue_number_padding);
 
         // Loop through each selected series individually to prevent massive DB joins
         for (const seriesId of seriesIds) {
@@ -60,58 +61,21 @@ export async function POST(request: NextRequest) {
             const lib = libraries.find(l => l.id === series.libraryId) || libraries.find(l => l.isDefault && l.isManga === series.isManga) || libraries[0];
             const libraryRoot = lib?.path || '';
 
-            const safePublisher = series.publisher ? series.publisher.replace(/[<>:"/\\|?*]/g, '').trim() : "Other";
-            const safeName = series.name ? series.name.replace(/[<>:"/\\|?*]/g, '').trim() : "Unknown Series";
-            const safeYear = series.year ? series.year.toString() : "";
-            const safeUniverse = (series as any).universe ? (series as any).universe.replace(/[<>:"/\\|?*]/g, '').trim() : "";
-            const safeSeriesGroup = (series as any).seriesGroup ? (series as any).seriesGroup.replace(/[<>:"/\\|?*]/g, '').trim() : "";
-            const safeImprint = (series as any).imprint ? sanitizeNamingPart((series as any).imprint) : "";
-
-            let relFolderPath = folderPattern
-                .replace(/{Publisher}/gi, safePublisher)
-                .replace(/{Series}/gi, safeName)
-                .replace(/{Year}/gi, safeYear)
-                .replace(/{VolumeYear}/gi, safeYear)
-                .replace(/{UniverseName}/gi, safeUniverse)
-                .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-            relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint);
-            relFolderPath = relFolderPath.replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '').replace(/\s+/g, ' ').trim();
-
-            const folderParts = relFolderPath.split(/[/\\]/).map((p: string) => p.trim()).filter(Boolean);
+            // The preview promises exactly what the renamers produce: the same pattern resolver and
+            // the same naming rules (naming.ts, twinned with the engine renamer).
+            const seriesValues: NamingInput = {
+                publisher: series.publisher, series: series.name, seriesYear: series.year,
+                universe: (series as any).universe, seriesGroup: (series as any).seriesGroup, imprint: (series as any).imprint,
+            };
+            const folderParts = seriesFolderSegments(folderPattern, seriesValues);
+            if (!folderParts) {
+                Logger.log(`[Rename Preview Debug] Series "${series.name}": the folder pattern gives no folder inside the library; Standardize will skip it.`, 'debug');
+                continue;
+            }
             const targetFolderPath = path.join(libraryRoot, ...folderParts).replace(/\\/g, '/');
 
             for (const issue of downloadedIssues) {
                 const ext = path.extname(issue.filePath as string);
-                const issueYear = issue.releaseDate ? issue.releaseDate.split('-')[0] : safeYear;
-                
-                let formattedNum = String(issue.number || "0");
-                
-                // 1. Check for and temporarily remove the negative sign
-                const isNegative = formattedNum.startsWith('-');
-                if (isNegative) formattedNum = formattedNum.substring(1);
-
-                // 2. Safely apply zero-padding
-                if (!formattedNum.includes('.')) {
-                    formattedNum = formattedNum.padStart(3, '0');
-                } else {
-                    const parts = formattedNum.split('.');
-                    formattedNum = `${parts[0].padStart(3, '0')}.${parts[1]}`;
-                }
-                
-                // 3. Re-attach the negative sign
-                if (isNegative) formattedNum = '-' + formattedNum;
-
-                // --- NEW: Add Issue Title extraction & cleanup ---
-                let cleanIssueName = issue.name || "";
-                if (safeName && cleanIssueName.startsWith(`${safeName} #${issue.number}: `)) {
-                    cleanIssueName = cleanIssueName.replace(`${safeName} #${issue.number}: `, '');
-                } else if (safeName && cleanIssueName === `${safeName} #${issue.number}`) {
-                    cleanIssueName = "";
-                }
-
-                // The preview has to promise what the renamer will actually do, so it resolves
-                // the template through the same shared helper both renamers use.
                 const isCollected = (issue as any).attachedVolume?.kind === 'COLLECTED';
                 const patternForIssue = filePatternForIssue({
                     isAnnual: (issue as any).isAnnual,
@@ -122,34 +86,23 @@ export async function POST(request: NextRequest) {
                     collectedFilePattern: activeCollectedFilePattern,
                 });
                 // A LOCAL collected edition's books are promised under the edition's name, exactly
-                // as both renamers will produce it (same helper, same sanitizing as safeName).
+                // as both renamers will produce it.
                 const seriesToken = seriesTokenForIssue({
                     isCollected,
                     attachmentSource: (issue as any).attachedVolume?.metadataSource,
                     attachmentName: (issue as any).attachedVolume?.name,
-                    seriesName: safeName,
-                }).replace(/[<>:"/\\|?*]/g, '').trim();
+                    seriesName: series.name || 'Unknown',
+                });
+                const stem = issueFileName(patternForIssue, {
+                    ...seriesValues,
+                    series: seriesToken,
+                    issueNumber: issue.number,
+                    releaseDate: issue.releaseDate,
+                    issueTitle: issueTitleForName(issue.name, series.name, issue.number),
+                }, issuePadding);
+                if (!stem) continue;
 
-                let newFileName = patternForIssue
-                    .replace(/{Publisher}/gi, safePublisher)
-                    .replace(/{Series}/gi, seriesToken)
-                    .replace(/{Year}/gi, safeYear)
-                    .replace(/{VolumeYear}/gi, safeYear)
-                    .replace(/{IssueYear}/gi, issueYear)
-                    .replace(/{Issue}/gi, formattedNum || "")
-                    .replace(/{IssueTitle}/gi, cleanIssueName.replace(/[<>:"/\\|?*]/g, '').trim()) // <-- ADD THIS
-                    .replace(/{UniverseName}/gi, safeUniverse) // <-- ADD THIS
-                    .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-                newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-                    .replace(/\(\s*\)/g, '')
-                    .replace(/\[\s*\]/g, '')
-                    .replace(/\s*-\s*-/g, ' - ')
-                    .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
-                    .replace(/\s+/g, ' ')
-                    .trim() + ext;
-
-                const targetFilePath = path.join(targetFolderPath, newFileName).replace(/\\/g, '/');
+                const targetFilePath = path.join(targetFolderPath, stem + ext).replace(/\\/g, '/');
 
                 previews.push({
                     seriesName: series.name,

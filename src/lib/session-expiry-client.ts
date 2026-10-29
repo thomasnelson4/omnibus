@@ -9,7 +9,10 @@
 //
 // These are the pure pieces of the fix (the guard in AuthProvider.tsx wires them up):
 //   - a session that turns empty AFTER the user was signed in is treated exactly like the flag;
-//   - any 401 from our own /api (not NextAuth's) while a user was signed in is the same event;
+//   - a 401 from our own /api (not NextAuth's) while a user was signed in is the same event — once
+//     the server's session endpoint confirms it. A 401 alone is only a hint: a route that refused a
+//     signed-in non-admin with 401 (the Library page's admin-settings read) signed every regular
+//     user out on the spot and bounced them again after each sign-in (2026-10-12);
 //   - the user lands on /login with a return path, so "pick up where you left off" is one click.
 // Pure and test-facing; `nav` is the one side effect, seamed so tests can watch it.
 
@@ -51,7 +54,18 @@ export function sessionLooksExpired(status: string, error: unknown, hadUser: boo
 }
 
 /**
- * Whether a fetch target is one of OUR api routes whose 401 means the session is gone. NextAuth's
+ * Whether /api/auth/session's answer means the session is over: NextAuth answers an empty `{}` once
+ * the cookie is gone and `{ error: "SessionExpired" }` for the inactivity flag. Anything that is not
+ * a session object at all is no proof either way — and only proof signs a user out.
+ */
+export function sessionPayloadIsGone(body: unknown): boolean {
+    if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+    const session = body as { user?: unknown; error?: unknown };
+    return session.error === 'SessionExpired' || !session.user;
+}
+
+/**
+ * Whether a fetch target is one of OUR api routes whose 401 may mean the session is gone. NextAuth's
  * own endpoints 401 for their own reasons (a wrong password, for one) and are left alone.
  */
 export function isGuardedApiUrl(input: RequestInfo | URL, origin: string = typeof window !== 'undefined' ? window.location.origin : ''): boolean {

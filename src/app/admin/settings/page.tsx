@@ -21,7 +21,7 @@ import Link from "next/link"
 import { useSession } from "next-auth/react"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 import { StatusBox, SYSTEM_EVENTS, hosterDisplayNames } from "./tabs/shared"
-import { computeDirtyTabs } from "./tabs/dirty"
+import { computeDirtyTabs, requestedSettingsTab } from "./tabs/dirty"
 import { SettingsTabsList } from "./tabs/tabs-list"
 import { MetadataTab } from "./tabs/metadata-tab"
 import { LibraryFilesTab } from "./tabs/library-files-tab"
@@ -408,6 +408,13 @@ export default function SettingsPage() {
       }
   }, [session, users, newKeyUserId]);
 
+  // `?tab=<value>` opens that tab directly - the first-run checklist links to Library & Files,
+  // Metadata and Search & Indexers. Read once on mount (useSearchParams would need a Suspense boundary).
+  useEffect(() => {
+      const tab = requestedSettingsTab(window.location.search);
+      if (tab) setActiveTab(tab);
+  }, []);
+
   const handleTabChange = (val: string) => {
       setActiveTab(val);
       if (val !== 'access') {
@@ -472,9 +479,13 @@ export default function SettingsPage() {
             }
         } else {
             const errData = await res.json().catch(() => ({} as any));
+            // A 400 is the server turning the save away before writing anything (a folder path it
+            // can't use, Force SSO without a local admin password) - nothing to reload for.
             toast({
                 title: "Save Failed",
-                description: `${errData?.error || `The server answered HTTP ${res.status}.`} Some changes may still have been applied — reload the page to see what persisted.`,
+                description: res.status === 400 && errData?.error
+                    ? errData.error
+                    : `${errData?.error || `The server answered HTTP ${res.status}.`} Some changes may still have been applied — reload the page to see what persisted.`,
                 variant: "destructive"
             });
         }
@@ -519,7 +530,8 @@ export default function SettingsPage() {
         folder_naming_pattern: "{Publisher}/{Series} ({Year})",
         file_naming_pattern: "{Series} #{Issue}",
         manga_file_naming_pattern: "{Series} Vol. {Issue}",
-        collected_file_naming_pattern: "{Series} Vol. {Issue} ({IssueYear})"
+        collected_file_naming_pattern: "{Series} Vol. {Issue} ({IssueYear})",
+        issue_number_padding: "3"
     }));
     toast({ 
         title: "Defaults Restored", 

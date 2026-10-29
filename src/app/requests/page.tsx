@@ -16,6 +16,7 @@ import {
 } from "lucide-react"
 import { useToast } from "@/components/ui/use-toast"
 import { COMIC_EXT_REGEX } from "@/lib/utils/formats"
+import { runBulk } from "@/lib/utils/bulk"
 import {
   Select,
   SelectContent,
@@ -157,7 +158,7 @@ function RequestCard({
                     <h3 className="font-bold text-lg sm:text-xl leading-tight line-clamp-1 text-foreground" title={displayName}>{displayName}</h3>
                     <div className="flex flex-wrap items-center gap-2">
                         <Badge variant="outline" className={`${getStatusColor(req.status)} text-[10px] font-bold uppercase tracking-wider`}>
-                            {req.status === 'PENDING_APPROVAL' ? 'Needs Approval' : req.status === 'MANUAL_DDL' ? 'GETCOMICS' : req.status === 'AWAITING_RELEASE' ? 'Awaiting' : req.status}
+                            {req.status === 'PENDING_APPROVAL' ? 'Needs Approval' : req.status === 'MANUAL_DDL' ? 'GETCOMICS' : req.status === 'AWAITING_RELEASE' ? 'Awaiting' : req.status === 'IMPORTING' ? 'Importing…' : req.status === 'NEEDS_REVIEW' ? 'Needs Review' : req.status}
                         </Badge>
                         {req.status === 'DOWNLOADING' && <span className="text-[11px] font-mono text-primary font-bold bg-primary/10 px-2 py-0.5 rounded">{req.progress}%</span>}
                         {req.status === 'DOWNLOADING' && req.clientStatus && (
@@ -303,14 +304,21 @@ export default function RequestsPage() {
   const handleBulkCancel = async () => {
       setIsBulkCancelling(true);
       try {
-          const promises = Array.from(selectedRequests).map(id =>
-              fetch(`/api/request?id=${id}`, { method: 'DELETE' })
+          const ids = Array.from(selectedRequests);
+          const { succeeded, failed, firstError } = await runBulk(ids, id =>
+              fetch(`/api/request?id=${encodeURIComponent(id)}`, { method: 'DELETE' })
           );
-          await Promise.all(promises);
-          toast({ title: "Requests Cancelled", description: `Successfully cancelled ${selectedRequests.size} requests.` });
-          setRequests(prev => prev.map(r => selectedRequests.has(r.id) ? { ...r, status: 'CANCELLED' } : r));
-          setSelectedRequests(new Set());
-          setIsSelectionMode(false);
+          // Only what the server accepted changes on screen; refused ones stay as they were, selected.
+          const cancelled = new Set(succeeded);
+          setRequests(prev => prev.map(r => cancelled.has(r.id) ? { ...r, status: 'CANCELLED' } : r));
+          if (failed.length === 0) {
+              toast({ title: "Requests Cancelled", description: `Cancelled ${succeeded.length} request${succeeded.length === 1 ? '' : 's'}.` });
+              setSelectedRequests(new Set());
+              setIsSelectionMode(false);
+          } else {
+              toast({ title: `${failed.length} of ${ids.length} cancellations failed`, description: firstError ?? undefined, variant: "destructive" });
+              setSelectedRequests(new Set(failed));
+          }
       } catch (e) {
           toast({ title: "Error cancelling requests", variant: "destructive" });
       } finally {
@@ -335,6 +343,12 @@ export default function RequestsPage() {
       case 'FAILED': case 'STALLED': case 'ERROR': return "bg-red-100 text-red-800 border-red-200 dark:bg-red-900/30 dark:text-red-400 dark:border-red-800"
       case 'UNRELEASED': return "bg-purple-100 text-purple-800 border-purple-200 dark:bg-purple-900/30 dark:text-purple-400 dark:border-purple-800"
       case 'AWAITING_RELEASE': return "bg-sky-100 text-sky-800 border-sky-200 dark:bg-sky-900/30 dark:text-sky-400 dark:border-sky-800"
+      // #240 PR B: the pack is in the watched folder and the sweep has not reported back yet —
+      // still active work, and deliberately not an arrival.
+      case 'IMPORTING': return "bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900/30 dark:text-blue-400 dark:border-blue-800"
+      // #240: the pack this issue came in was already consumed but the issue never reached the
+      // library — a person has to look at it, so it reads as "attention", not as a failure.
+      case 'NEEDS_REVIEW': return "bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-400 dark:border-yellow-800"
       default: return "bg-muted text-foreground border-border"
     }
   }
@@ -345,7 +359,9 @@ export default function RequestsPage() {
           if (!matchesSearch) return false;
 
           if (activeTab === "ALL") return true;
-          if (activeTab === "ACTIVE") return ['DOWNLOADING', 'PENDING', 'MANUAL_DDL'].includes(req.status);
+          // #240 PR B: an IMPORTING request is active work (and neither active nor completed would
+          // hide it from every tab but All).
+          if (activeTab === "ACTIVE") return ['DOWNLOADING', 'PENDING', 'MANUAL_DDL', 'IMPORTING'].includes(req.status);
           if (activeTab === "PENDING_APPROVAL") return req.status === 'PENDING_APPROVAL';
           if (activeTab === "UNRELEASED") return req.status === 'UNRELEASED';
           if (activeTab === "AWAITING") return req.status === 'AWAITING_RELEASE';

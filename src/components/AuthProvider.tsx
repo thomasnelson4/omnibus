@@ -6,6 +6,7 @@ import { useEffect, useRef } from "react"
 import { useToast } from "@/components/ui/use-toast"
 import {
   SESSION_EXPIRED_TOAST, claimExpiryOnce, isGuardedApiUrl, isPublicPath, loginUrlFor, nav, sessionLooksExpired,
+  sessionPayloadIsGone,
 } from "@/lib/session-expiry-client"
 
 // The jwt callback no longer counts ambient session reads (the 300s refetch below, background
@@ -42,7 +43,8 @@ export function SessionActivityTracker() {
  * user to /login with a return path instead of leaving a dead page up. Two observers, one action:
  *   - the session itself: the flag, or an EMPTY session after a user was present here;
  *   - a 401 from our own /api while a user was present (the race where the click lands before the
- *     refetch does — the black "Unauthorized Access" dialog of the report).
+ *     refetch does — the black "Unauthorized Access" dialog of the report), confirmed by the
+ *     server's session endpoint: a route that refuses a signed-in user with 401 is not an expiry.
  * Public pages never bounce; it fires once per page life.
  */
 export function SessionExpiryGuard() {
@@ -66,12 +68,27 @@ export function SessionExpiryGuard() {
   }, [status, session]);
 
   // The 401 net. Wraps window.fetch for this page's life; the caller still receives its response.
+  // A 401 only prompts the question — /api/auth/session answers it, one check at a time, and a
+  // check that can't be answered (server unreachable, a 500, not JSON) never signs anyone out.
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const original = window.fetch;
+    let checking = false;
+    const confirmExpiry = async () => {
+      if (checking) return;
+      checking = true;
+      try {
+        const res = await original('/api/auth/session', { cache: 'no-store' });
+        if (res.ok && sessionPayloadIsGone(await res.json())) fireRef.current();
+      } catch {
+        // No answer is no proof.
+      } finally {
+        checking = false;
+      }
+    };
     const wrapped: typeof window.fetch = async (input, init) => {
       const res = await original(input, init);
-      if (res.status === 401 && hadUserRef.current && isGuardedApiUrl(input)) fireRef.current();
+      if (res.status === 401 && hadUserRef.current && isGuardedApiUrl(input)) void confirmExpiry();
       return res;
     };
     window.fetch = wrapped;

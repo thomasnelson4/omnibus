@@ -8,6 +8,7 @@ import { enabledHostersFromSetting, scrapeDeepLinkViaEngine } from '@/lib/getcom
 import { Importer } from '@/lib/importer';
 import { omnibusQueue } from '@/lib/queue';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
+import { settleDuplicateOnLink } from '@/lib/request-dedupe';
 
 export const dynamic = 'force-dynamic';
 
@@ -36,7 +37,7 @@ export async function POST(request: NextRequest) {
         // --- NEW: PURGE GHOST JOBS ---
         // Find any delayed/waiting automated jobs in BullMQ related to this specific request and obliterate them
         try {
-            const existingJobs = await omnibusQueue.getJobs(['waiting', 'delayed', 'active', 'paused']);
+            const existingJobs = await omnibusQueue.getJobs(['waiting', 'delayed', 'active', 'paused', 'prioritized']);
             let purged = 0;
             for (const job of existingJobs) {
                 if (job.id === `SEARCH_${id}` || job.data?.requestId === id) {
@@ -194,21 +195,31 @@ export async function POST(request: NextRequest) {
                 if (cand) {
                     const safeSearchTitle = best.title.replace(/[<>:"/\\|?*]/g, ' - ').replace(/\s+/g, ' ').trim();
 
-                    const duplicateDownload = await prisma.request.findFirst({
-                        where: {
-                            downloadLink: cand.url,
-                            status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] },
-                            id: { not: id }
-                        }
-                    });
+                    const duplicateDownload = await settleDuplicateOnLink(cand.url, id);
 
-                    if (duplicateDownload) {
-                         Logger.log(`[Retry] Batch pack already downloading or downloaded (${cand.url}). Queuing for batch extraction.`, 'info');
+                    if (duplicateDownload.action === 'park') {
+                         Logger.log(`[Retry] Batch pack already downloading (${cand.url}). Queuing for batch extraction.`, 'info');
                          await prisma.request.update({
                              where: { id },
                              data: { status: 'DOWNLOADING', retryCount: 0, progress: 0, activeDownloadName: safeSearchTitle, downloadLink: cand.url, failedLinks: "[]" }
                          });
                          return NextResponse.json({ success: true, message: `Link recovered via ${cand.hoster.startsWith('getcomics') ? 'Direct' : cand.hoster} and queued for batch extraction.` });
+                    }
+                    if (duplicateDownload.action === 'join') {
+                         // #240 PR B: a sibling already handed this pack to the watched folder. Its
+                         // bytes are gone; this request waits for the sweep and is closed by the
+                         // reconciler (COMPLETED when the issue lands, NEEDS_REVIEW when it doesn't).
+                         Logger.log(`[Retry] Batch pack already in the watched folder (${cand.url}). Joining its wait instead of re-downloading.`, 'info');
+                         await prisma.request.update({
+                             where: { id },
+                             data: { status: 'IMPORTING', progress: 100, retryCount: 0, activeDownloadName: safeSearchTitle, downloadLink: cand.url, failedLinks: "[]" }
+                         });
+                         return NextResponse.json({ success: true, message: "This pack is already in the watched folder — the request waits for the import instead of downloading it again." });
+                    }
+                    if (duplicateDownload.action === 'settle') {
+                         return NextResponse.json({ success: true, message: duplicateDownload.status === 'COMPLETED'
+                             ? "That issue is already in your library — nothing was downloaded."
+                             : "That pack was already downloaded and consumed, but the issue never reached the library — the request is marked for review. Nothing was downloaded." });
                     }
                     await prisma.request.update({
                         where: { id },

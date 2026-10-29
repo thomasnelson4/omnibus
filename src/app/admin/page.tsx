@@ -21,6 +21,7 @@ import { Badge } from "@/components/ui/badge"
 import { AdminRequestManagement } from "@/components/admin-request-management"
 import { ConfirmationDialog } from "@/components/ui/confirmation-dialog"
 import { getErrorMessage } from "@/lib/utils/error"
+import { runBulk } from "@/lib/utils/bulk"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { InteractiveSearchModal } from "@/components/interactive-search-modal"
 import { ManualUploadDialog } from "@/components/manual-upload-dialog"
@@ -154,19 +155,21 @@ export default function AdminPage() {
   const handleBulkQueueRetry = async () => {
     if (selectedQueueItems.size === 0) return;
     setIsBulkQueueProcessing(true);
-    toast({ title: "Bulk Retry Started", description: `Queued ${selectedQueueItems.size} items for search.` });
-    
+    toast({ title: "Bulk Retry Started", description: `Retrying ${selectedQueueItems.size} requests…` });
+
     try {
-      const promises = Array.from(selectedQueueItems).map(id => 
-        fetch('/api/request/retry', { 
-          method: 'POST', 
-          headers: { 'Content-Type': 'application/json' }, 
-          body: JSON.stringify({ id }) 
+      const ids = Array.from(selectedQueueItems);
+      const { succeeded, failed, firstError } = await runBulk(ids, id =>
+        fetch('/api/request/retry', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id })
         })
       );
-      await Promise.all(promises);
-      toast({ title: "Bulk Retry Complete" });
-      setSelectedQueueItems(new Set());
+      if (failed.length === 0) toast({ title: "Bulk Retry Complete", description: `Retried ${succeeded.length} request${succeeded.length === 1 ? '' : 's'}.` });
+      else toast({ title: `${failed.length} of ${ids.length} retries failed`, description: firstError ?? undefined, variant: "destructive" });
+      // The failed ones stay selected, ready for another try.
+      setSelectedQueueItems(new Set(failed));
       fetchRequests();
     } catch (e) {
       toast({ title: "Error", variant: "destructive" });
@@ -188,7 +191,12 @@ export default function AdminPage() {
         toast({ title: "Requests Removed" });
         setSelectedQueueItems(new Set());
         fetchRequests();
+      } else {
+        const body = await res.json().catch(() => null);
+        toast({ title: "Delete Failed", description: body?.error || `HTTP ${res.status}`, variant: "destructive" });
       }
+    } catch (e) {
+      toast({ title: "Error", variant: "destructive" });
     } finally {
       setIsBulkQueueProcessing(false);
     }
@@ -285,8 +293,11 @@ export default function AdminPage() {
       const res = await fetch('/api/request', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, status }) });
       if (res.ok) {
         toast({ title: status === 'PENDING' ? "Request Approved" : "Request Denied" });
-        fetchRequests(); 
+        fetchRequests();
         setSelectedRequests(prev => { const n = new Set(prev); n.delete(id); return n; });
+      } else {
+        const body = await res.json().catch(() => null);
+        toast({ title: status === 'PENDING' ? "Approval Failed" : "Denial Failed", description: body?.error || `HTTP ${res.status}`, variant: "destructive" });
       }
     } catch (e) { toast({ title: "Error", variant: "destructive" }); }
   };
@@ -304,15 +315,21 @@ export default function AdminPage() {
       if (selectedRequests.size === 0) return;
       setIsBulkProcessing(true);
       try {
-          const promises = Array.from(selectedRequests).map(id => 
+          const ids = Array.from(selectedRequests);
+          const { succeeded, failed, firstError } = await runBulk(ids, id =>
               fetch('/api/request', { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, status }) })
           );
-          await Promise.all(promises);
-          toast({ 
-              title: status === 'PENDING' ? "Bulk Approval Complete" : "Bulk Denial Complete", 
-              description: `Successfully processed ${selectedRequests.size} requests.` 
-          });
-          setSelectedRequests(new Set()); 
+          const approving = status === 'PENDING';
+          if (failed.length === 0) {
+              toast({
+                  title: approving ? "Bulk Approval Complete" : "Bulk Denial Complete",
+                  description: `${approving ? 'Approved' : 'Denied'} ${succeeded.length} request${succeeded.length === 1 ? '' : 's'}.`
+              });
+          } else {
+              toast({ title: `${failed.length} of ${ids.length} ${approving ? 'approvals' : 'denials'} failed`, description: firstError ?? undefined, variant: "destructive" });
+          }
+          // The failed ones stay selected, ready for another try.
+          setSelectedRequests(new Set(failed));
           fetchRequests();
       } catch(e) {
           toast({ title: "Error", description: "Failed to process some requests", variant: "destructive" });

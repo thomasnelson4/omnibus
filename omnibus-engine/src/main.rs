@@ -11,6 +11,7 @@ mod annas_archive;
 mod rate_limiter;
 mod metadata_writer;
 mod watched_sync;
+mod naming;
 mod backup;
 mod diagnostics;
 mod manga_detector;
@@ -28,6 +29,7 @@ mod log_forward;
 mod library_events;
 mod renamer;
 mod secret_crypto;
+mod server_paths;
 
 use axum::{routing::{get, post}, Router, Json, extract::{State, Request}, http::{StatusCode, header}, middleware::{self, Next}, response::Response};
 use serde::{Deserialize, Serialize};
@@ -1046,6 +1048,9 @@ struct BulkRenameRequest {
     /// the built-in default. Configurable because TPB conventions vary far more than annuals do.
     #[serde(default)]
     collected_file_pattern: Option<String>,
+    /// #244: the issue_number_padding setting ("none" / "2" / "3"); absent = 3 digits.
+    #[serde(default)]
+    issue_padding: Option<String>,
 }
 
 /// Bulk rename / standardize, ported from the Node route. Runs SYNCHRONOUSLY (Node calls it via
@@ -1059,7 +1064,8 @@ async fn handle_bulk_rename(
     if req.series_ids.is_empty() || req.folder_pattern.trim().is_empty() || req.file_pattern.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    match renamer::run_bulk_rename(&state.db, &req.series_ids, &req.folder_pattern, &req.file_pattern, req.manga_file_pattern.as_deref(), req.collected_file_pattern.as_deref()).await {
+    let padding = naming::IssuePadding::from_setting(req.issue_padding.as_deref());
+    match renamer::run_bulk_rename(&state.db, &req.series_ids, &req.folder_pattern, &req.file_pattern, req.manga_file_pattern.as_deref(), req.collected_file_pattern.as_deref(), padding).await {
         Ok(summary) => Ok(Json(serde_json::json!({
             "filesRenamed": summary.files_renamed,
             "foldersRenamed": summary.folders_renamed,
@@ -1429,7 +1435,7 @@ async fn handle_search(
     // downloadable match.
     let (get_res_raw, annas_res_raw, prow_res_raw) = tokio::join!(
         async { if run_get {
-            getcomics::search(&state.db.pool, &state.limiter, &queries, false, &payload.name, req_year.as_deref(), series_year.as_deref(), is_manga, Some(use_packs)).await
+            getcomics::search(&state.db.pool, &state.limiter, &queries, false, &payload.name, req_year.as_deref(), series_year.as_deref(), is_manga, Some(use_packs), &acronyms).await
         } else { Ok::<Vec<prowlarr::ProwlarrResult>, anyhow::Error>(Vec::new()) } },
         async { if run_annas {
             annas_archive::search(&state.db.pool, &state.limiter, &queries, false, is_manga).await
@@ -1488,7 +1494,7 @@ async fn handle_search(
                 // GetComics results are already relevance-filtered in getcomics::search → operator
                 // junk/exclude lists + scoring only (skip_relevance = true).
                 if let Ok(Some(mut best_ddl)) = search_engine::filter_and_score(
-                    &state.db.pool, get_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), true, Some(use_packs)
+                    &state.db.pool, get_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), true, Some(use_packs), &acronyms
                 ).await {
                     // Resolve the article to concrete hoster links; scrape_deep_link drops disabled
                     // hosters, so an empty list means no enabled hoster can serve this match.
@@ -1533,7 +1539,7 @@ async fn handle_search(
                 if annas_res.is_empty() { continue; }
                 // Anna's Archive results aren't pre-filtered (unlike GetComics) → full relevance scoring.
                 if let Ok(Some(mut best_aa)) = search_engine::filter_and_score(
-                    &state.db.pool, annas_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs)
+                    &state.db.pool, annas_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs), &acronyms
                 ).await {
                     // The result's download_url is already the resolvable /md5/ link — emit one candidate
                     // tagged for the existing Node resolver (premium key → stream; keyless → MANUAL_DDL).
@@ -1547,7 +1553,7 @@ async fn handle_search(
             "prowlarr" => {
                 if prow_res.is_empty() { continue; }
                 if let Ok(Some(best_prow)) = search_engine::filter_and_score(
-                    &state.db.pool, prow_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs)
+                    &state.db.pool, prow_res.clone(), &payload.name, is_manga, req_year.clone(), series_year.clone(), false, Some(use_packs), &acronyms
                 ).await {
                     log::info!("[Prowlarr] Matched an indexer release for {}.", payload.name);
                     best_match = Some(best_prow);
@@ -1592,6 +1598,9 @@ async fn handle_interactive_search(
     log::info!("[Interactive] Prowlarr query ladder ({} rung(s)): {:?}", ladder.len(), ladder);
     let queries = vec![payload.query.clone()];
     let is_manga = payload.is_manga.unwrap_or(false);
+    // The GetComics filter compares acronym-expanded words on both sides ("TMNT" vs "Teenage
+    // Mutant Ninja Turtles"), interactive included.
+    let acronyms = search_engine::get_custom_acronyms(&state.db.pool).await.unwrap_or_default();
 
     // Anna's Archive is key-free for interactive search but OFF by default — only query it when the
     // admin has opted in. The empty-on-disabled future keeps all three sources in one concurrent join.
@@ -1599,7 +1608,7 @@ async fn handle_interactive_search(
 
     let (prow_res, get_res, annas_res) = tokio::join!(
         prowlarr::search(&state.db.pool, &state.limiter, &ladder, is_manga, false),
-        getcomics::search(&state.db.pool, &state.limiter, &queries, true, &payload.query, payload.year.as_deref(), payload.year.as_deref(), is_manga, None),
+        getcomics::search(&state.db.pool, &state.limiter, &queries, true, &payload.query, payload.year.as_deref(), payload.year.as_deref(), is_manga, None, &acronyms),
         async {
             if annas_enabled {
                 annas_archive::search(&state.db.pool, &state.limiter, &queries, true, is_manga).await
@@ -1724,23 +1733,29 @@ async fn handle_matcher_sweep(State(state): State<Arc<AppState>>) -> StatusCode 
 async fn handle_watched_sync(State(state): State<Arc<AppState>>) -> StatusCode {
     log::info!("Received request to process Watched Folder.");
 
-    tokio::spawn(async move {
+    // One sweep at a time (#240): a trigger during a sweep becomes one more sweep after it.
+    let spawned = watched_sync::spawn_exclusive(&watched_sync::WATCHED_SWEEP, move || {
         let db = state.db.clone();
-        let start_time = std::time::Instant::now();
+        async move {
+            let start_time = std::time::Instant::now();
 
-        match watched_sync::process_watched_folder(state.db.clone()).await {
-            Ok((_success, _unmatched, details)) => {
-                let duration = start_time.elapsed().as_millis() as i32;
-                log::info!("{}", details);
+            match watched_sync::process_watched_folder(db.clone()).await {
+                Ok((_success, _unmatched, details)) => {
+                    let duration = start_time.elapsed().as_millis() as i32;
+                    log::info!("{}", details);
 
-                write_joblog(&db, "WATCHED_FOLDER_SYNC", "COMPLETED", duration, details).await;
-            },
-            Err(e) => {
-                log::error!("❌ Background Watched Sync failed: {:?}", e);
-                write_failed_joblog(&db, "WATCHED_FOLDER_SYNC", start_time.elapsed().as_millis() as i32, format!("Watched folder sync failed: {:?}", e)).await;
-            },
+                    write_joblog(&db, "WATCHED_FOLDER_SYNC", "COMPLETED", duration, details).await;
+                },
+                Err(e) => {
+                    log::error!("❌ Background Watched Sync failed: {:?}", e);
+                    write_failed_joblog(&db, "WATCHED_FOLDER_SYNC", start_time.elapsed().as_millis() as i32, format!("Watched folder sync failed: {:?}", e)).await;
+                },
+            }
         }
     });
+    if spawned.is_none() {
+        log::info!("[Watched Sync] A sweep is already running; it will sweep once more when it finishes.");
+    }
 
     StatusCode::ACCEPTED
 }

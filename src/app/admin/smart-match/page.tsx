@@ -17,7 +17,7 @@ import Link from "next/link"
 import { Logger } from "@/lib/logger"
 import { getErrorMessage } from "@/lib/utils/error"
 import { extractIssueNumber } from "@/lib/utils/issue-parser"
-import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName } from "@/lib/utils/smart-match-search"
+import { buildManualSuggestion, buildKeepCarry, cleanProviderId, findIssueIdByNumber, resolveIssueIdByNumber, acceptableForBulk, seriesQueryFromName, pickSuggestion } from "@/lib/utils/smart-match-search"
 import SmartMatchMetadataDialog, { type SmartMatchOverride, buildFolderPreview, shouldEmbedIssueCover, COMIC_INFO_DEFAULT_KEYS } from "@/components/smart-match-metadata-dialog"
 import { FolderCollisionDialog, type FolderCollision, type CollisionResolution } from "@/components/folder-collision-dialog"
 import { AttachLocalCollectedDialog } from "@/components/attach-local-collected-dialog"
@@ -410,22 +410,91 @@ export default function SmartMatchPage() {
     const startSmartScan = async () => {
         setIsScanning(true);
         let matchCount = 0;
-        try {
-            for (const series of visibleUnmatched) {
-                if (series.isIgnored) continue;
-                try {
-                    const decision = await scanItem(series);
-                    if (decision.selected) matchCount++;
-                    if (['rate_limited', 'deferred'].includes(decision.status)) {
-                        toast({ title: 'Scan paused', description: decision.reasons.join(' '), variant: 'destructive' });
-                        break;
+
+        for (const series of visibleUnmatched) {
+            // An ignored series is visible only while the toggle is on; scanning it would put a
+            // suggestion back on a row the admin has already dealt with.
+            if (series.isIgnored) continue;
+            // Only an ERROR is retried. A suggestion is already handled, and a NOT_FOUND would come
+            // back the same: /api/search caches every result list for 12 hours, empty ones included,
+            // so retrying it only adds the per-row pause below.
+            if (suggestions[series.id] && suggestions[series.id] !== 'ERROR') continue;
+
+            try {
+                // The search term is the SERIES, not the file: a loose file arrives as its filename
+                // ("X-Men 001 (2024)"), and the issue number pollutes the provider query. The year is
+                // kept aside for ranking and never sent — the search route would only turn it into a
+                // boolean sort that pulls every same-year volume ahead of the exact name.
+                const { query: cleanName, year: nameYear } = seriesQueryFromName(series.name);
+                const wantedYear = series.year > 0 ? series.year : nameYear;
+                const query = `${cleanName} ${wantedYear ?? ''}`.trim();
+
+                Logger.log(`[Smart Match Debug] Auto-scanning for "${query}" using provider: ${searchProvider}`, 'debug');
+
+                // covers=none: the scan shows one suggestion per series, so it asks for that one's cover
+                // below instead of paying Metron for every result's (Metron beta 4).
+                const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&provider=${searchProvider}&covers=none`);
+                
+                if (res.status === 429) {
+                    throw new Error("FATAL_RATE_LIMIT");
+                }
+                // FIX (review of #231): a non-OK response (e.g. a 500 from the search route) used to
+                // fall straight into `data.results || []` below -- an empty list, same as a genuine
+                // no-match -- and get recorded as NOT_FOUND. A transient server hiccup then looked
+                // exactly like "nothing on the provider", and NOT_FOUND isn't retried (the provider
+                // genuinely has nothing new to say), so the series was stuck until a manual re-scan.
+                // Routing it through the catch block below records ERROR instead, which the retry-gap
+                // fix above DOES revisit on the next scan.
+                if (!res.ok) {
+                    throw new Error(`Search request failed with status ${res.status}`);
+                }
+
+                const data = await res.json();
+
+                // Score every candidate — name similarity first, the year as a tiebreaker — instead of
+                // trusting results[0]. A best candidate that barely resembles the name becomes
+                // NOT_FOUND on purpose: Accept All takes any row with a suggestion, and a confident-
+                // looking wrong answer there costs a folder move to undo.
+                const results: { id: string | number; name?: string; year?: string | number | null; image?: string | null; metadataSource?: string }[] = data.results || [];
+                const picked = pickSuggestion(cleanName, wantedYear, results);
+                if (picked) {
+                    setSuggestions(prev => ({ ...prev, [series.id]: picked }));
+                    matchCount++;
+                    if (!picked.image && picked.metadataSource === 'METRON') {
+                        try {
+                            const coverRes = await fetch(`/api/search/cover?provider=METRON&id=${encodeURIComponent(picked.id)}`);
+                            const { image } = coverRes.ok ? await coverRes.json() : { image: null };
+                            if (image) {
+                                setSuggestions(prev => {
+                                    const current = prev[series.id];
+                                    return current && typeof current === 'object' && current.id === picked.id
+                                        ? { ...prev, [series.id]: { ...current, image } }
+                                        : prev;
+                                });
+                            }
+                        } catch { /* a cover is a nice-to-have */ }
                     }
-                } catch {
-                    setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
+                } else {
+                    setSuggestions(prev => ({ ...prev, [series.id]: 'NOT_FOUND' }));
+                }
+            } catch (e: any) {
+                setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
+
+                if (e.message === "FATAL_RATE_LIMIT" || e.message?.includes("429")) {
+                    toast({ 
+                        title: "Rate Limit Exceeded", 
+                        description: "Omnibus has hit the API limits. Pausing the smart scan to protect your connection. Please attempt the scan again later to continue.", 
+                        variant: "destructive" 
+                    });
+                    break;
                 }
             }
-        } finally { setIsScanning(false); }
-        toast({ title: 'Scan complete', description: `Found candidates for ${matchCount} entries. Only convincing matches can be accepted automatically.` });
+
+            await new Promise(r => setTimeout(r, 1500));
+        }
+
+        setIsScanning(false);
+        toast({ title: "Scan Complete", description: `Found suggestions for ${matchCount} series.` });
     };
 
     // The exact single-accept payload, shared by the per-row accept, Accept Selected, and Accept

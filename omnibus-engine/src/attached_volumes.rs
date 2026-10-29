@@ -14,9 +14,9 @@
 
 use crate::db::Db;
 use crate::metadata::{
-    cv_issue_credits, is_same_issue, json_num_string, merge_credit_json, metron_auth, metron_fetch,
-    metron_issue_credits, metron_issue_name, next_match_state, parse_date_ms, prefer_existing,
-    resolve_synced_name,
+    cv_issue_credits, is_cv_rate_limited, is_same_issue, json_num_string, merge_credit_json,
+    metron_auth, metron_fetch, metron_issue_credits, metron_issue_name, next_match_state,
+    parse_date_ms, prefer_existing, resolve_synced_name,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -280,8 +280,7 @@ async fn sync_attachment(db: &Db, client: &Client, attachment_id: &str, claim: b
 
         let name_val = resolve_synced_name(col("name"), issue.name.clone(), &issue.number, locked, file_priority);
         let desc_val = prefer_existing(col("description"), issue.description.clone(), locked, file_priority);
-        let release_val = crate::metadata::resolve_synced_release(col("releaseDate"), issue.release_date.clone(),
-            locked, file_priority, col("filePath").is_some_and(|p| !p.trim().is_empty()));
+        let release_val = if locked { col("releaseDate") } else { issue.release_date.clone() };
         let cover_val = if has_custom_cover { col("coverUrl") } else { issue.cover_url.clone() };
         let match_state_val = next_match_state(col("matchState"));
         let c = &issue.credits;
@@ -729,8 +728,7 @@ async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyh
         None => {
             let resp = client.execute(vol_req).await?;
             crate::api_usage::log(&db.pool, "comicvine", &vol_url).await;
-            if crate::metadata::is_cv_rate_limited(resp.status()) {
-                crate::metadata::mark_flag(db, "cv_rate_limit_time").await;
+            if is_cv_rate_limited(resp.status()) {
                 anyhow::bail!("ComicVine rate limited (429/420) on the attached volume fetch");
             }
             let j: serde_json::Value = resp.json().await?;
@@ -774,8 +772,7 @@ async fn fetch_comicvine_lane(db: &Db, client: &Client, volume_id: &str) -> anyh
             None => {
                 let resp = client.execute(req).await?;
                 crate::api_usage::log(&db.pool, "comicvine", "https://comicvine.gamespot.com/api/issues/").await;
-                if crate::metadata::is_cv_rate_limited(resp.status()) {
-                    crate::metadata::mark_flag(db, "cv_rate_limit_time").await;
+                if is_cv_rate_limited(resp.status()) {
                     anyhow::bail!("ComicVine rate limited (429/420) on the attached issues fetch");
                 }
                 let j: serde_json::Value = resp.json().await?;

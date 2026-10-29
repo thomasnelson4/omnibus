@@ -49,8 +49,15 @@ vi.mock('bullmq', () => ({
 
 const SEED = '0123456789abcdef0123456789abcdef';
 
+// Answers like the database does: only the keys the query asks for. (Returning everything hid that
+// syncSchedules never loaded cbr_conversion_enabled, so its off switch was never read.)
 function withSettings(values: Record<string, string>) {
-    mocks.settingFindMany.mockResolvedValue(Object.entries(values).map(([key, value]) => ({ key, value })));
+    mocks.settingFindMany.mockImplementation(async (args?: { where?: { key?: { in?: string[] } } }) => {
+        const wanted = args?.where?.key?.in;
+        return Object.entries(values)
+            .filter(([key]) => !wanted || wanted.includes(key))
+            .map(([key, value]) => ({ key, value }));
+    });
 }
 
 function schedulerCall(id: string) {
@@ -171,5 +178,66 @@ describe('syncSchedules: per-install staggered schedules (#216)', () => {
         expect(schedulerCall('repeat_metadata_sync')).toBeUndefined();
         expect(mocks.removeJobScheduler).toHaveBeenCalledWith('repeat_metadata_sync');
         expect(mocks.removeJobScheduler).not.toHaveBeenCalledWith('repeat_series_monitor');
+    });
+});
+
+// A fresh install has saved no schedules: the Setup Wizard writes none, and Admin → Jobs only writes
+// them when someone presses Save. syncSchedules used to schedule only the jobs whose setting was
+// stored, so the library scan, metadata sync, the series monitor, backups and Discover never ran -
+// while Admin → Jobs showed them on their default cadence. One map now feeds both.
+describe('syncSchedules: an unsaved schedule runs on the default Admin → Jobs shows', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mocks.settingUpsert.mockResolvedValue({ key: 'schedule_seed', value: SEED });
+        mocks.getRepeatableJobs.mockResolvedValue([]);
+        mocks.getJobSchedulers.mockResolvedValue([]);
+    });
+
+    it('schedules every default-on job on a fresh install', async () => {
+        withSettings({});
+
+        await syncSchedules();
+
+        for (const [jobType, every] of [
+            ['LIBRARY_SCAN', 12 * HOUR], ['METADATA_SYNC', DAY], ['SERIES_MONITOR', DAY], ['DIAGNOSTICS', 7 * DAY],
+            ['DISCOVER_SYNC', DAY], ['FOR_YOU_SYNC', DAY], ['CBR_CONVERSION', DAY], ['CACHE_CLEANUP', DAY],
+        ] as const) {
+            const call = schedulerCall(`repeat_${jobType.toLowerCase()}`);
+            expect(call, jobType).toBeDefined();
+            expect(call![1]).toEqual({ every, offset: scheduleOffsetMs(SEED, jobType, every) });
+        }
+        // Weekly jobs keep their day-of-week patterns: Monday 03:00 backup, Monday 08:00 digest.
+        expect(schedulerCall('repeat_database_backup')![1]).toEqual({ pattern: '0 3 * * 1' });
+        expect(schedulerCall('repeat_weekly_digest')![1]).toEqual({ pattern: '0 8 * * 1' });
+        // Off by default, as Admin → Jobs shows them.
+        expect(schedulerCall('repeat_embed_metadata')).toBeUndefined();
+        expect(schedulerCall('repeat_export_series_json')).toBeUndefined();
+    });
+
+    it('always lets a saved value win - a different cadence, or 0 for off', async () => {
+        withSettings({ library_sync_schedule: '0', metadata_sync_schedule: '48' });
+
+        await syncSchedules();
+
+        expect(schedulerCall('repeat_library_scan')).toBeUndefined();
+        expect(schedulerCall('repeat_metadata_sync')![1]).toEqual({ every: 2 * DAY, offset: scheduleOffsetMs(SEED, 'METADATA_SYNC', 2 * DAY) });
+    });
+
+    it('treats a blank saved value as never saved', async () => {
+        withSettings({ monitor_sync_schedule: '' });
+
+        await syncSchedules();
+
+        expect(schedulerCall('repeat_series_monitor')![1]).toEqual({ every: DAY, offset: scheduleOffsetMs(SEED, 'SERIES_MONITOR', DAY) });
+    });
+
+    it('runs no CBR sweep while Auto-Convert CBR/RAR is off, whatever its schedule says', async () => {
+        withSettings({ cbr_conversion_enabled: 'false', cbr_conversion_schedule: '24' });
+        mocks.getJobSchedulers.mockResolvedValue([{ key: 'repeat_cbr_conversion', name: 'CBR_CONVERSION' }]);
+
+        await syncSchedules();
+
+        expect(schedulerCall('repeat_cbr_conversion')).toBeUndefined();
+        expect(mocks.removeJobScheduler).toHaveBeenCalledWith('repeat_cbr_conversion');
     });
 });

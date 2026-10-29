@@ -9,7 +9,8 @@ import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 export async function POST(request: Request) {
     const authOptions = await getAuthOptions();
     const session = await getServerSession(authOptions);
-    if (session?.user?.role !== 'ADMIN') return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    if (session.user.role !== 'ADMIN') return NextResponse.json({ error: "Forbidden" }, { status: 403 });
 
     try {
         const { seriesIds } = await request.json();

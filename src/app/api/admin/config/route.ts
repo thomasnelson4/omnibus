@@ -7,7 +7,7 @@ import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { syncSchedules } from '@/lib/queue';
-import { CACHE_DIR, LOGS_DIR, BACKUPS_DIR, WATCHED_DIR, UNMATCHED_DIR } from '@/lib/utils/paths';
+import { CACHE_DIR, LOGS_DIR, BACKUPS_DIR, WATCHED_DIR, UNMATCHED_DIR, serverPathProblem } from '@/lib/utils/paths';
 import { encryptSecret, decryptSecret } from '@/lib/encryption';
 import { SECRET_SETTING_KEYS } from '@/lib/secret-keys';
 import { testAnnasArchiveKey } from '@/lib/annas-test';
@@ -71,8 +71,14 @@ export async function GET(request: Request) {
   const authOptions = await getAuthOptions();
   const session = await getServerSession(authOptions);
   
-  if (session?.user?.role !== 'ADMIN') {
+  // Middleware lets this route through unauthenticated (the setup wizard saves here), so the role
+  // check is ours: 401 = no session, 403 = signed in but not an admin (a 401 reads as "your session
+  // ended" to the client's expiry guard).
+  if (!session?.user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  if (session.user.role !== 'ADMIN') {
+      return NextResponse.json({ error: "Forbidden: Admin privileges required." }, { status: 403 });
   }
 
   // 1. Fetch flat settings and securely obfuscate tokens
@@ -164,7 +170,22 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    
+
+    // Folders are stored exactly as they are checked below (beta.018 follow-up): serverPathProblem
+    // trims, so a folder typed with a space around it passed, was stored raw, and " /data/comics" is
+    // a RELATIVE path. Every value the check sees is the value that's written.
+    const trimmed = (v: unknown) => (typeof v === 'string' ? v.trim() : v);
+    const isRow = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
+    if (Array.isArray(body?.libraries)) {
+        body.libraries = body.libraries.map((lib: unknown) => (isRow(lib) ? { ...lib, path: trimmed(lib.path) } : lib));
+    }
+    if (Array.isArray(body?.downloadClients)) {
+        body.downloadClients = body.downloadClients.map((c: unknown) => (isRow(c) && 'localPath' in c ? { ...c, localPath: trimmed(c.localPath) } : c));
+    }
+    if (body?.settings && typeof body.settings === 'object' && 'download_path' in body.settings) {
+        body.settings = { ...body.settings, download_path: trimmed(body.settings.download_path) };
+    }
+
     const {
         settings,
         libraries, 
@@ -209,6 +230,33 @@ export async function POST(request: Request) {
         return !!account.username?.trim() !== !!account.password;
     })) {
         return NextResponse.json({ error: 'Enter both a MEGA email and password, or clear both for anonymous downloads.' }, { status: 400 });
+    }
+
+    // Folders Omnibus itself writes to must be paths the SERVER can use - inside Docker, the container
+    // side of a volume. A Windows path saved here (Docker Desktop users type `C:\Comics`) resolved under
+    // the app's working directory and failed every match with "mkdir 'C:'" (Discord field report,
+    // 2026-10-13). Checked before anything is written; a download client's Remote Path is the CLIENT's
+    // view, so it stays free-form.
+    const pathProblems: string[] = [];
+    if (Array.isArray(libraries)) {
+        for (const lib of libraries) {
+            const problem = serverPathProblem(lib?.path);
+            if (problem) pathProblems.push(`Root Path of library "${lib?.name || 'Unnamed'}": ${problem}`);
+        }
+    }
+    if (typeof settings?.download_path === 'string' && settings.download_path.trim()) {
+        const problem = serverPathProblem(settings.download_path, { example: '/data/downloads' });
+        if (problem) pathProblems.push(`Download Scan Root: ${problem}`);
+    }
+    if (Array.isArray(downloadClients)) {
+        for (const client of downloadClients) {
+            if (typeof client?.localPath !== 'string' || !client.localPath.trim()) continue;
+            const problem = serverPathProblem(client.localPath, { example: '/data/downloads' });
+            if (problem) pathProblems.push(`Local Path of download client "${client.name || 'Unnamed'}": ${problem}`);
+        }
+    }
+    if (pathProblems.length > 0) {
+        return NextResponse.json({ error: pathProblems.join(' ') }, { status: 400 });
     }
 
     // Encrypt credential fields at rest before persisting. '********' means "unchanged" (the GET

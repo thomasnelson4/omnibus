@@ -5,6 +5,15 @@
 export const ADMIN_TIMEOUT_MS = 2 * 60 * 60 * 1000;
 export const USER_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * The role whose idle window applies to a token. An impersonating session is the ADMIN's (only an
+ * admin can start one), even while its role is the impersonated user's — it keeps the 2h window.
+ */
+export function windowRole(token: { role?: unknown; isImpersonating?: unknown } | null | undefined): string | undefined {
+    if (token?.isImpersonating) return 'ADMIN';
+    return typeof token?.role === 'string' ? token.role : undefined;
+}
+
 export function isInactivityExpired(
     role: string | undefined | null,
     lastActive: number | undefined | null,

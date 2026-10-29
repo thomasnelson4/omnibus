@@ -13,7 +13,7 @@ import { COMIC_INFO_DEFAULT_KEYS, type ComicInfoDefaults } from "@/lib/utils/com
 import { ComicInfoGeneralExtras, ComicInfoCreditsFields, ComicInfoStoryFields, ComicInfoDetailsFields } from "@/components/comicinfo-fields"
 import { FileText, FileX, FolderTree, Check, Image as ImageIcon, Upload, Loader2, RefreshCw } from "lucide-react"
 import { resolveIssueIdByNumber } from "@/lib/utils/smart-match-search"
-import { replaceNamingToken, sanitizeNamingPart } from "@/lib/utils/naming"
+import { seriesFolderSegments } from "@/lib/utils/naming"
 import SmartMatchBoundIssue from "@/components/smart-match-bound-issue"
 
 // #199 ComicInfo defaults: the field list + types live in the shared lib module (the API routes
@@ -143,30 +143,18 @@ interface Props {
   providerFields?: Record<string, string>
 }
 
-// Mirrors the token substitution in /api/library/match-series EXACTLY so the preview matches the
-// folder that will actually be created. Inlined (not @/lib/utils/sanitize) because that module pulls
-// in sanitize-html, a server-only dependency we don't want in the client bundle.
-const sanitizePart = (s: string) => (s || "").replace(/[<>:"/\\|?*]/g, "").trim()
-
+// The folder /api/library/match-series will create: the same naming rules (naming.ts, which has no
+// server-only imports), so the preview can never promise a different folder. "" when the pattern
+// gives no folder inside the library (the match is refused then).
 export function buildFolderPreview(
   pattern: string,
   v: { name?: string; year?: string | number; publisher?: string; universe?: string; seriesGroup?: string; imprint?: string }
 ): string {
-  const yr = v.year != null ? v.year.toString() : ""
-  let out = (pattern || "{Publisher}/{Series} ({Year})")
-    .replace(/{Publisher}/gi, sanitizePart(v.publisher || "") || "Other")
-    .replace(/{Series}/gi, sanitizePart(v.name || "") || "Unknown Series")
-    .replace(/{Year}/gi, yr)
-    .replace(/{VolumeYear}/gi, yr)
-    .replace(/{UniverseName}/gi, sanitizePart(v.universe || ""))
-    .replace(/{SeriesGroup}/gi, sanitizePart(v.seriesGroup || ""))
-
-  out = replaceNamingToken(out, "{Imprint}", sanitizeNamingPart(v.imprint || ""))
-    .replace(/\(\s*\)/g, "")
-    .replace(/\[\s*\]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-  return out.split(/[/\\]/).map(p => p.trim()).filter(Boolean).join("/")
+  const segments = seriesFolderSegments(pattern || "{Publisher}/{Series} ({Year})", {
+    publisher: v.publisher, series: v.name, seriesYear: v.year,
+    universe: v.universe, seriesGroup: v.seriesGroup, imprint: v.imprint,
+  })
+  return segments ? segments.join("/") : ""
 }
 
 // #199 duplicate guard: only genuinely uploaded covers are embed candidates. A cover sourced from

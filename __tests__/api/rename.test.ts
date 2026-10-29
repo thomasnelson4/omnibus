@@ -92,7 +92,9 @@ describe('API Route: Bulk Library Renamer', () => {
             manga_file_pattern: '{Series} Vol. {Issue}',
             // #203 COLLECTED: resolved alongside the others so the engine and the local fallback
             // name a trade identically. null = the engine's built-in default.
-            collected_file_pattern: null
+            collected_file_pattern: null,
+            // #244: the issue_number_padding setting (3 digits when unset).
+            issue_padding: '3'
         });
         // Phase 2: the engine branch now takes ONE extra snapshot query for the pre-rename
         // folderPaths. The engine moves the files itself and its response carries only counts plus
@@ -158,6 +160,41 @@ describe('API Route: Bulk Library Renamer', () => {
 
         const body = JSON.parse(mocks.engineFetchLong.mock.calls[0][1].body);
         expect(body.manga_file_pattern).toBe('{Series} c{Issue}');
+    });
+
+    // #244: Standardize pads by the issue_number_padding setting - the engine gets it, and the Node
+    // fallback names with it.
+    it('sends the padding setting to the engine', async () => {
+        mocks.engineFetchLong.mockResolvedValue({ ok: true, json: async () => ({ filesRenamed: 1, foldersRenamed: 0, conflicts: 0, newPath: '/x' }) });
+        mocks.systemSettingFindMany.mockResolvedValue([{ key: 'issue_number_padding', value: 'none' }]);
+        await POST(new NextRequest('http://localhost/api/library/rename', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ seriesIds: ['series_1'], folderPattern: '{Series}', filePattern: '{Series} #{Issue}' }),
+        }));
+        expect(JSON.parse(mocks.engineFetchLong.mock.calls.at(-1)![1].body).issue_padding).toBe('none');
+    });
+
+    it.each([
+        { padding: 'none', filename: 'Batman #1.cbz' },
+        { padding: '2', filename: 'Batman #01.cbz' },
+    ])('pads the Node fallback filename by the setting ($padding)', async ({ padding, filename }) => {
+        mocks.systemSettingFindMany.mockResolvedValue([{ key: 'issue_number_padding', value: padding }]);
+        mocks.libraryFindMany.mockResolvedValue([{ id: 'lib_1', path: '/data/comics' }]);
+        mocks.fsExistsSync.mockImplementation((p: string | Buffer | URL) => !String(p).includes('#'));
+        mocks.seriesFindMany.mockResolvedValue([{
+            id: 'series_1', libraryId: 'lib_1', folderPath: '/data/comics/Batman',
+            publisher: 'DC Comics', name: 'Batman', year: 2016, isManga: false, imprint: null,
+        }]);
+        mocks.issueFindMany.mockResolvedValue([{
+            id: 'issue_1', seriesId: 'series_1', filePath: '/data/comics/Batman/Batman 1.cbz',
+            number: '1', releaseDate: '2016-01-01',
+        }]);
+        const res = await POST(new NextRequest('http://localhost/api/library/rename', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ seriesIds: ['series_1'], folderPattern: '{Series}', filePattern: '{Series} #{Issue}' }),
+        }));
+        expect(res.status).toBe(200);
+        expect(mocks.fsMove).toHaveBeenCalledWith('/data/comics/Batman/Batman 1.cbz', path.join('/data/comics/Batman', filename));
     });
 
     it.each([

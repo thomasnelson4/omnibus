@@ -8,11 +8,10 @@ import { getToken } from 'next-auth/jwt';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
 import { Logger } from '@/lib/logger';
-import { sanitizeFilename as sanitize } from '@/lib/utils/sanitize';
 import { cleanupEmptyDirs } from '@/lib/utils/safe-fs';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 import { recordLibraryChange } from '@/lib/komga/changes';
-import { replaceNamingToken } from '@/lib/utils/naming';
+import { issueFileName, issuePaddingFromSetting, issueTitleForName, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
 
 export async function POST(request: NextRequest) {
   try {
@@ -32,6 +31,8 @@ export async function POST(request: NextRequest) {
     // #203 COLLECTED: resolved up front for the same reason — both the engine offload and the local
     // fallback must name a trade identically. null = the engine's built-in default.
     const activeCollectedFilePattern = collectedFilePattern || earlyConfig.collected_file_naming_pattern || null;
+    // #244: the issue_number_padding setting - the engine and the local fallback pad alike.
+    const issuePadding = issuePaddingFromSetting(earlyConfig.issue_number_padding);
 
     // --- ENGINE OFFLOAD ---
     // The engine runs the identical standardize pipeline (per-file relocation, conflict guard,
@@ -61,7 +62,7 @@ export async function POST(request: NextRequest) {
         const engineRes = await engineFetchLong(ENGINE_URL + '/api/library/rename', {
             method: 'POST',
             headers: engineHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ series_ids: seriesIds, folder_pattern: folderPattern, file_pattern: filePattern, manga_file_pattern: activeMangaFilePattern, collected_file_pattern: activeCollectedFilePattern }),
+            body: JSON.stringify({ series_ids: seriesIds, folder_pattern: folderPattern, file_pattern: filePattern, manga_file_pattern: activeMangaFilePattern, collected_file_pattern: activeCollectedFilePattern, issue_padding: issuePadding }),
         });
         if (engineRes.ok) {
             const data = await engineRes.json();
@@ -129,32 +130,14 @@ export async function POST(request: NextRequest) {
 
         Logger.log(`[Rename Debug] Processing Series: "${s.name}" (ID: ${s.id}, isManga: ${s.isManga})`, 'debug');
 
-        // --- Shared substitution values (used for both folder + file patterns) ---
-        const safePublisher = s.publisher && s.publisher !== "Unknown" ? sanitize(s.publisher) : "Other";
-        const safeSeries = sanitize(s.name || "Unknown");
-        const safeYear = s.year ? s.year.toString() : "";
-        const safeUniverse = (s as any).universe ? sanitize((s as any).universe) : "";
-        const safeSeriesGroup = (s as any).seriesGroup ? sanitize((s as any).seriesGroup) : "";
-        const safeImprint = (s as any).imprint ? sanitize((s as any).imprint) : "";
-
-        // --- Compute the target folder from the active pattern ---
-        let relFolderPath = activeFolderPattern
-            .replace(/{Publisher}/gi, safePublisher)
-            .replace(/{Series}/gi, safeSeries)
-            .replace(/{Year}/gi, safeYear)
-            .replace(/{VolumeYear}/gi, safeYear)
-            .replace(/{UniverseName}/gi, safeUniverse)
-            .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-        relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-            .replace(/\(\s*\)/g, '')
-            .replace(/\[\s*\]/g, '')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-        const folderParts = relFolderPath.split(/[/\\]/).map((p: string) => p.trim()).filter(Boolean);
-        if (folderParts.length === 0) {
-            Logger.log(`[Rename Debug] Skipping series "${s.name}" - naming pattern produced an empty folder path.`, 'warn');
+        // --- Compute the target folder from the active pattern (naming.ts, twinned with the engine) ---
+        const seriesValues: NamingInput = {
+            publisher: s.publisher, series: s.name, seriesYear: s.year,
+            universe: (s as any).universe, seriesGroup: (s as any).seriesGroup, imprint: (s as any).imprint,
+        };
+        const folderParts = seriesFolderSegments(activeFolderPattern, seriesValues);
+        if (!folderParts) {
+            Logger.log(`[Rename Debug] Skipping series "${s.name}" - the folder pattern doesn't give a folder inside the library.`, 'warn');
             continue;
         }
         const targetFolder = path.join(libraryRoot, ...folderParts);
@@ -210,17 +193,6 @@ export async function POST(request: NextRequest) {
 
             const ext = path.extname(sourcePath);
 
-            let paddedNum = String(issue.number || "0");
-            const isNegative = paddedNum.startsWith('-');
-            if (isNegative) paddedNum = paddedNum.substring(1);
-            if (!paddedNum.includes('.')) {
-                paddedNum = paddedNum.padStart(3, '0');
-            } else {
-                const parts = paddedNum.split('.');
-                paddedNum = `${parts[0].padStart(3, '0')}.${parts[1]}`;
-            }
-            if (isNegative) paddedNum = '-' + paddedNum;
-
             // Annual, collected, manga or plain — one shared resolver, twinned with the engine's
             // renamer.rs, so the preview and both renamers can never disagree about the result.
             const isCollected = (issue as any).attachedVolume?.kind === 'COLLECTED';
@@ -240,34 +212,18 @@ export async function POST(request: NextRequest) {
                 attachmentName: (issue as any).attachedVolume?.name,
                 seriesName: s.name || 'Unknown',
             });
-            const issueYear = issue.releaseDate ? issue.releaseDate.split('-')[0] : (s.year?.toString() || '0000');
-
-            let cleanIssueName = issue.name || "";
-            if (s.name && cleanIssueName.startsWith(`${s.name} #${issue.number}: `)) {
-                cleanIssueName = cleanIssueName.replace(`${s.name} #${issue.number}: `, '');
-            } else if (s.name && cleanIssueName === `${s.name} #${issue.number}`) {
-                cleanIssueName = "";
+            const stem = issueFileName(patternToUse, {
+                ...seriesValues,
+                series: seriesToken,
+                issueNumber: issue.number,
+                releaseDate: issue.releaseDate,
+                issueTitle: issueTitleForName(issue.name, s.name, issue.number),
+            }, issuePadding);
+            if (!stem) {
+                Logger.log(`[Rename Debug] Skipping issue "${issue.name}" - the file pattern leaves no name.`, 'warn');
+                continue;
             }
-
-            let newFileName = patternToUse
-                .replace(/{Publisher}/gi, s.publisher || 'Unknown')
-                .replace(/{Series}/gi, seriesToken)
-                .replace(/{Year}/gi, s.year?.toString() || '0000')
-                .replace(/{VolumeYear}/gi, s.year?.toString() || '0000')
-                .replace(/{IssueYear}/gi, issueYear)
-                .replace(/{Issue}/gi, paddedNum)
-                .replace(/{IssueTitle}/gi, sanitize(cleanIssueName))
-                .replace(/{UniverseName}/gi, safeUniverse)
-                .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-            newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-                .replace(/\(\s*\)/g, '')
-                .replace(/\[\s*\]/g, '')
-                .replace(/\s*-\s*-/g, ' - ')
-                .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
-                .replace(/\s+/g, ' ');
-
-            newFileName = sanitize(newFileName) + ext;
+            const newFileName = stem + ext;
             const newFilePath = path.join(targetFolder, newFileName);
 
             Logger.log(`[Rename Debug] File Evaluation: Source=[${sourcePath}] | Target=[${newFilePath}]`, 'debug');

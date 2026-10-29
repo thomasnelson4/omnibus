@@ -1,16 +1,17 @@
 // src/app/api/request/route.ts
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma } from '@/lib/db';
+import path from 'path';
 import { getToken } from 'next-auth/jwt';
 import { Logger } from '@/lib/logger';
 import axios from 'axios';
-import path from 'path';
 import fs from 'fs';
 import { SystemNotifier } from '@/lib/notifications';
 import { evaluateTrophies } from '@/lib/trophy-evaluator'; 
 import { detectManga } from '@/lib/manga-detector'; 
 import { isReleasedYet } from '@/lib/utils';
 import { searchAndDownload, processAutomationQueue } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 import { getErrorMessage } from '@/lib/utils/error';
 import { syncSeriesMetadata } from '@/lib/metadata-fetcher'; 
 import { AuditLogger } from '@/lib/audit-logger';
@@ -22,7 +23,7 @@ import { ownedCoverageBySeries } from '@/lib/coverage-ownership';
 import { omnibusQueue } from '@/lib/queue';
 import { cachedCvGet } from '@/lib/metadata/metadata-cache';
 import { followSeries, followSeriesByCatalogId } from '@/lib/follows';
-import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
+import { seriesFolderSegments } from '@/lib/utils/naming';
 
 export const dynamic = 'force-dynamic';
 
@@ -249,29 +250,19 @@ export async function POST(request: NextRequest) {
           : libraries.find(l => l.isDefault && !l.isManga) || libraries.find(l => !l.isManga);
       if (!targetLib) targetLib = libraries[0];
 
-      const safeFolderName = name.replace(/[<>:"/\\|?*]/g, ' - ').replace(/\s+/g, ' ').trim();
-      const safePubFolder = safePublisher !== "Unknown" ? safePublisher.replace(/[<>:"/\\|?*]/g, '').trim() : "Other";
-      const safeImprint = sanitizeNamingPart(existingSeries?.imprint || '');
-
+      // The name, publisher and year can come straight from the requester (the provider only fills
+      // what's missing). The shared naming rules (naming.ts) sanitize each like ComicInfo metadata - a
+      // dots-only value becomes "_", a year is only ever a plausible year - and refuse a pattern that
+      // would leave the library.
       const settings = await prisma.systemSetting.findMany();
       const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
       const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
-
-      let relFolderPath = folderPattern
-          .replace(/{Publisher}/gi, safePubFolder)
-          .replace(/{Series}/gi, safeFolderName)
-          .replace(/{Year}/gi, year ? year.toString() : "")
-          .replace(/{VolumeYear}/gi, year ? year.toString() : "");
-
-      relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-          .replace(/\(\s*\)/g, '')
-          .replace(/\[\s*\]/g, '')
-          .replace(/\s+/g, ' ')
-          .trim();
-
-      const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+      const folderParts = seriesFolderSegments(folderPattern, { publisher, series: name, seriesYear: year, imprint: existingSeries?.imprint });
       const basePath = targetLib ? targetLib.path : `/${libraryTypeFolder}`;
-      
+      if (!folderParts) {
+          Logger.log(`[Request] Folder pattern "${folderPattern}" gives no folder inside the library for ${name}. Check Settings > Library & Files.`, 'warn');
+          return NextResponse.json({ error: "The folder naming pattern doesn't produce a folder inside the library for this series. Ask an admin to check Settings > Library & Files." }, { status: 400 });
+      }
       const folderPath = path.join(basePath, ...folderParts).replace(/\\/g, '/');
 
       const series = await prisma.series.upsert({
@@ -380,6 +371,10 @@ export async function POST(request: NextRequest) {
                           volumeId: resolvedCvId.toString(),
                           metadataSource: metadataSource,
                           status: issueStatus,
+                          // #240: the issue this request is for — the download overwrites
+                          // activeDownloadName with the release's title, and the monitor dedupes on
+                          // this column so a pack-titled request still matches its own issue.
+                          issueNumber: normNum ? String(normNum) : null,
                           activeDownloadName: searchName,
                           imageUrl: issueImage,
                           downloadLink: skipIndexers && issueStatus === 'PENDING_APPROVAL' ? 'DIRECT_GETCOMICS' : null 
@@ -439,7 +434,8 @@ export async function POST(request: NextRequest) {
               const newReq = await prisma.request.create({
                 data: {
                   userId: userId, volumeId: resolvedCvId.toString(), metadataSource: metadataSource,
-                  status: issueStatus, activeDownloadName: searchName, imageUrl: issueImage,
+                  status: issueStatus, issueNumber: normNum ? String(normNum) : null,
+                  activeDownloadName: searchName, imageUrl: issueImage,
                   downloadLink: skipIndexers && issueStatus === 'PENDING_APPROVAL' ? 'DIRECT_GETCOMICS' : null 
                 }
               });
@@ -451,7 +447,9 @@ export async function POST(request: NextRequest) {
       }
 
       if (createdRequests.length > 0) {
-        processAutomationQueue(createdRequests);
+        // A whole series is a bulk ask (job-priority.ts): ahead of the Series Monitor's own searches,
+        // behind another reader's single issue. A series missing just one issue is a single ask.
+        processAutomationQueue(createdRequests, createdRequests.length > 1 ? JOB_PRIORITY.BULK : JOB_PRIORITY.REQUESTED);
       }
 
       return NextResponse.json({ 
@@ -474,7 +472,8 @@ export async function POST(request: NextRequest) {
       const newReq = await prisma.request.create({
         data: {
           userId: userId, volumeId: resolvedCvId.toString(), metadataSource: metadataSource,
-          status: issueStatus, activeDownloadName: searchName, imageUrl: image,
+          status: issueStatus, issueNumber: type === 'issue' && body.issueNumber ? String(body.issueNumber) : null,
+          activeDownloadName: searchName, imageUrl: image,
           downloadLink: skipIndexers && issueStatus === 'PENDING_APPROVAL' ? 'DIRECT_GETCOMICS' : null
         }
       });
@@ -491,7 +490,8 @@ export async function POST(request: NextRequest) {
       }
 
       if (issueStatus === 'PENDING') {
-        searchAndDownload(newReq.id, searchName, year, safePublisher, isManga, skipIndexers).catch(e => Logger.log(getErrorMessage(e), 'error'));
+        // Someone is waiting on this one issue: the top tier (job-priority.ts).
+        searchAndDownload(newReq.id, searchName, year, safePublisher, isManga, skipIndexers, JOB_PRIORITY.REQUESTED).catch(e => Logger.log(getErrorMessage(e), 'error'));
       }
 
       evaluateTrophies(userId).catch(() => {});
@@ -512,7 +512,8 @@ export async function POST(request: NextRequest) {
 
 export async function PATCH(request: NextRequest) {
   const token = await getToken({ req: request });
-  if (!token || token.role !== 'ADMIN') return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!token) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (token.role !== 'ADMIN') return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
 
   const userId = (token.id || token.sub) as string;
 
@@ -557,8 +558,12 @@ export async function PATCH(request: NextRequest) {
                     }
                 });
                 if (downloadedIssuesCount === 0 && otherActiveReqs === 0) {
+                    // deleteMany, not delete: a bulk deny of several issues of one series runs these
+                    // PATCHes in parallel, each sees the others already CANCELLED, and each removes
+                    // the skeleton — a second `delete` threw P2025 and answered 500 for a denial
+                    // that had already been saved.
                     await prisma.issue.deleteMany({ where: { seriesId: series.id } });
-                    await prisma.series.delete({ where: { id: series.id } });
+                    await prisma.series.deleteMany({ where: { id: series.id } });
                 }
             }
         }
@@ -588,6 +593,9 @@ export async function PATCH(request: NextRequest) {
       let shouldNotifyApproval = true;
       let approvalTitle = searchName || reqRecord.volumeId || "Unknown Comic";
       let approvalDesc = description;
+      // Approving a whole series sends one PATCH per issue: those searches are a bulk ask, the same
+      // batch the "N Issues Approved" alert gathers below (job-priority.ts).
+      let approvedInBatch = false;
 
       if (reqRecord.volumeId && reqRecord.volumeId !== "0") {
           const stillPendingApproval = await prisma.request.count({
@@ -600,6 +608,7 @@ export async function PATCH(request: NextRequest) {
 
           if (stillPendingApproval > 0) {
               shouldNotifyApproval = false;
+              approvedInBatch = true;
           } else {
               const twoHoursBefore = new Date(reqRecord.createdAt.getTime() - 2 * 60 * 60 * 1000);
               const twoHoursAfter = new Date(reqRecord.createdAt.getTime() + 2 * 60 * 60 * 1000);
@@ -614,6 +623,7 @@ export async function PATCH(request: NextRequest) {
               });
 
               if (batchApprovedCount > 1) {
+                  approvedInBatch = true;
                   approvalTitle = `${seriesNameForBatch} - ${batchApprovedCount} Issues Approved`;
                   approvalDesc = `An admin has approved your request for ${batchApprovedCount} issues of ${seriesNameForBatch}. They will begin downloading shortly.\n\n${description}`;
               }
@@ -640,7 +650,7 @@ export async function PATCH(request: NextRequest) {
           ? seriesIsManga
           : await detectManga({ name: searchName, publisher: { name: publisher } });
 
-      searchAndDownload(id, searchName, year, publisher, isManga, skipIndexers).catch(e => Logger.log(getErrorMessage(e), 'error'));
+      searchAndDownload(id, searchName, year, publisher, isManga, skipIndexers, approvedInBatch ? JOB_PRIORITY.BULK : JOB_PRIORITY.REQUESTED).catch(e => Logger.log(getErrorMessage(e), 'error'));
     }
 
     evaluateTrophies(userId).catch(err => {
@@ -710,7 +720,7 @@ export async function DELETE(request: NextRequest) {
     // 2. KILL PENDING BACKGROUND JOBS IN BULLMQ
     try {
         const { omnibusQueue } = await import('@/lib/queue');
-        const existingJobs = await omnibusQueue.getJobs(['waiting', 'delayed', 'active', 'paused']);
+        const existingJobs = await omnibusQueue.getJobs(['waiting', 'delayed', 'active', 'paused', 'prioritized']);
         for (const job of existingJobs) {
             if (job.id === `SEARCH_${id}` || job.data?.requestId === id) {
                 // job.remove() works on waiting jobs. Active jobs will be caught by the status check in automation.ts

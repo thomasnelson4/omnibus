@@ -335,68 +335,13 @@ export function initCronJobs() {
                           }
                       }
 
-                      // 2. Fetch request and check retry cap
+                      // 2. Block the failed hash + release title and try the next release (or park
+                      // STALLED after three tries) - shared with the importer's refusal of an
+                      // unreadable archive (#240).
                       const req = await prisma.request.findUnique({ where: { id: match.id } });
-                      if (req && (req.retryCount || 0) < 3) {
-                          let currentFailed: string[] = [];
-                          try { currentFailed = JSON.parse((req as any).failedLinks || "[]"); } catch(e){ /* corrupted blocklist — start from an empty one */ }
-                          
-                          // Block BOTH the specific hash/url and the exact Release Title
-                          if (req.downloadLink && !currentFailed.includes(req.downloadLink)) currentFailed.push(req.downloadLink);
-                          if (torrent.name && !currentFailed.includes(torrent.name)) currentFailed.push(torrent.name);
-
-                          await prisma.request.update({
-                              where: { id: match.id },
-                              data: {
-                                  status: 'PENDING',
-                                  downloadLink: null,
-                                  clientDownloadId: null,
-                                  downloadClientId: null,
-                                  // Fresh re-queue = fresh client state; the old client-reported status
-                                  // (e.g. "Paused") must not bleed onto the new download attempt.
-                                  clientStatus: null,
-                                  clientStatusMessage: null,
-                                  retryCount: (req.retryCount || 0) + 1,
-                                  failedLinks: JSON.stringify(currentFailed)
-                              } as any
-                          });
-
-                          Logger.log(`[Cron] Re-queuing failed request "${req.activeDownloadName || req.id}" (Attempt ${(req.retryCount || 0) + 1}/3)`, 'info');
-                          
-                          // 3. Reconstruct Search Context safely
-                          const { searchAndDownload } = await import('@/lib/automation');
-                          const series = req.volumeId !== "0" ? await prisma.series.findFirst({ where: { metadataId: req.volumeId } }) : null;
-                          
-                          // Fallback year parsing if series isn't in DB
-                          let searchYear = series?.year?.toString() || "";
-                          if (!searchYear && req.activeDownloadName) {
-                              const yearMatch = req.activeDownloadName.match(/\b(19\d{2}|20\d{2})\b/);
-                              if (yearMatch) searchYear = yearMatch[1];
-                          }
-
-                          // Reconstruct clean query name to prevent dirty release groups from corrupting queries
-                          let cleanSearchName = (req as any).name || req.activeDownloadName || "Unknown";
-                          if (series) {
-                              const cleanTitleStr = (req.activeDownloadName || "").replace(/\.\w+$/, '');
-                              const issueMatch = cleanTitleStr.match(/(?:#|issue\s*#?|ch(?:apter)?\s*\.?)\s*0*(\d+(?:\.\d+)?[a-zA-Z]?)/i);
-                              const issueNum = issueMatch ? issueMatch[1] : "1";
-                              cleanSearchName = `${series.name} #${issueNum}`;
-                          }
-                          
-                          await searchAndDownload(
-                              req.id, 
-                              cleanSearchName, 
-                              searchYear, 
-                              series?.publisher || "Unknown", 
-                              series?.isManga || false, 
-                              false
-                          );
-                      } else if (req) {
-                          Logger.log(`[Cron] Request "${req.activeDownloadName || req.id}" failed 3 times. Marking as STALLED.`, 'error');
-                          await prisma.request.update({
-                              where: { id: match.id },
-                              data: { status: 'STALLED' }
-                          });
+                      if (req) {
+                          const { requeueWithNextRelease } = await import('@/lib/requeue');
+                          await requeueWithNextRelease(req as any, { title: torrent.name });
                       }
                       
                       const index = downloadingRequests.findIndex(r => r.id === match!.id);
@@ -414,6 +359,23 @@ export function initCronJobs() {
                   }
               }
           }
+      }
+
+      // #240 PR B: close the requests whose pack is sitting in the watched folder (IMPORTING) on
+      // what the sweep actually imported, instead of announcing them when they were routed — and
+      // re-check every request parked at NEEDS_REVIEW on the same pass (a review is a verdict about
+      // a moment: the sweep behind it, or an import by another route, can land it afterwards). Own
+      // lock so a slow cycle is never doubled up.
+      try {
+        if (await acquireLock('CRON_IMPORT_HANDOFF_RECONCILE', 55000)) {
+          const { reconcileImportHandoffs } = await import('@/lib/import-handoff');
+          const swept = await reconcileImportHandoffs();
+          if (swept.completed > 0 || swept.review > 0) {
+            Logger.log(`[Cron] Import handoff reconciled: ${swept.completed} completed (handoffs closed and reviews re-checked), ${swept.review} needs review, ${swept.waiting} still waiting on the sweep.`, 'info');
+          }
+        }
+      } catch (e: unknown) {
+        Logger.log(`[Cron] Import handoff reconciliation failed: ${getErrorMessage(e)}`, 'error');
       }
 
     } catch (error: unknown) {

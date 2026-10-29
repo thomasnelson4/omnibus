@@ -5,6 +5,7 @@ import { NextRequest } from 'next/server';
 import { prisma } from '@/lib/db';
 import { getToken } from 'next-auth/jwt';
 import { searchAndDownload } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 // Mock Dependencies
 vi.mock('next-auth/jwt', () => ({ getToken: vi.fn() }));
@@ -73,8 +74,10 @@ describe('API: Request Engine boundary', () => {
 
         expect(res.status).toBe(200);
         expect(data.status).toBe('PENDING');
-        // Ensure the downloader WAS triggered
+        // Ensure the downloader WAS triggered - at the top tier, because someone is waiting on this
+        // one issue: it goes ahead of bulk asks and of the Series Monitor's own searches.
         expect(searchAndDownload).toHaveBeenCalled();
+        expect(vi.mocked(searchAndDownload).mock.calls[0][6]).toBe(JOB_PRIORITY.REQUESTED);
         expect(prisma.request.create).toHaveBeenCalledWith(
             expect.objectContaining({
                 data: expect.objectContaining({ status: 'PENDING' })

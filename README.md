@@ -32,13 +32,22 @@ Built with Next.js 15, Tailwind v4, Prisma, a dedicated high-performance Rust en
 
 While I know AI-assisted ("vibe-coded") projects can sometimes be met with skepticism, I genuinely enjoyed the process of watching this come together into a highly usable tool. If you run into issues, have suggestions, or want to contribute, please let me know! I gladly welcome any help or insights to make Omnibus even better.
 
+> **New to Omnibus?** [Installation](#installation-docker) takes you from nothing to the Setup Wizard in five steps.
+
 ---
 
 ## Recent Highlights (October 2026)
 
 The last several releases added a lot. The biggest things to be aware of:
 
-* **Paperback Reads Omnibus:** Paperback for iPhone and iPad connects through its built-in source — Omnibus answers it with a Komga-compatible endpoint at `/komga`, so you get series, covers, page streaming (CBZ and CBR), search, Continue Reading and read-progress sync with nothing extra to install ([#206](https://github.com/hankscafe/omnibus/issues/206)).
+* **Requests That Close on What Reached Your Library (Community!):** A request remembers which issue it's for, so a pack is downloaded once instead of again on every monitor cycle. A pack handed to the watched folder leaves its requests at **Importing** until the sweep reports what landed — **Completed** with the "available" alert when the issue is in your library, **Needs Review** (with its own alert) when it went to /unmatched — and a Smart Matcher match closes it with the same alert. Built by [realAbitbol](https://github.com/realAbitbol) in [#246](https://github.com/hankscafe/omnibus/pull/246), [#247](https://github.com/hankscafe/omnibus/pull/247), [#248](https://github.com/hankscafe/omnibus/pull/248) and [#249](https://github.com/hankscafe/omnibus/pull/249) ([#240](https://github.com/hankscafe/omnibus/issues/240)).
+* **The Request You're Waiting On Goes First:** Scheduled jobs never wait behind a search backlog, and searches go in order of who is waiting — a single issue someone asked for, then whole-series requests and imports, then the Series Monitor's own searches — so a request made right after a monitor run starts within a search or two.
+* **Downloads That Arrive Whole:** A cut-off download resumes from the exact byte it stopped at, a corrupt one moves on to the next hoster, and an archive that can't be read is never imported — the release is blocked and the request searches again ([#240](https://github.com/hankscafe/omnibus/issues/240)).
+* **One Naming Rule, With Issue-Number Padding:** Pick none, 2 or 3 digits under **Settings → Library & Files → Issue Number Padding**, and every way a comic arrives names it exactly as Standardize does — with the issue's own year, not the series' ([#243](https://github.com/hankscafe/omnibus/issues/243), [#244](https://github.com/hankscafe/omnibus/issues/244)).
+* **A First Run That Knows What's Next:** A five-step [Installation](#installation-docker), a [First Steps](#first-steps) guide, and a live setup checklist on Home — library folder, metadata key, comics, Discover — with the button that does each step ([#245](https://github.com/hankscafe/omnibus/discussions/245)).
+* **Folder Paths Checked Before They Bite:** A Windows path under Docker, a stray space, or a folder nothing is mounted at is turned away when you save it, with the fix named — and the engine never files comics where an update would delete them.
+* **New Installs Run Their Jobs:** The library scan, metadata sync, Series Monitor, backups and Discover run on the schedule Admin → Jobs shows, without anyone pressing Save first.
+* **Paperback Reads Omnibus:** Paperback for iPhone and iPad connects through its Komga sources — the Komga extension on Paperback 0.9, the built-in source on 0.8 — and Omnibus answers them with a Komga-compatible endpoint at `/komga`, so you get series, covers, page streaming (CBZ and CBR) and search, and finished chapters sync back to On Deck once the source is linked as a tracker ([setup](#external-readers--opds-support), [#206](https://github.com/hankscafe/omnibus/issues/206)).
 * **KOReader Sync, End to End (Community!):** KOReader progress sync logs in for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213) by [realAbitbol](https://github.com/realAbitbol)), lands on the page you stopped on instead of one page late, and finds its issue by KOReader's own checksum for books downloaded from Omnibus — no "Send document metadata" or "Use server filenames" needed ([#211](https://github.com/hankscafe/omnibus/issues/211), [#217](https://github.com/hankscafe/omnibus/issues/217)).
 * **An OPDS Overhaul (Community!):** Search the catalog from your reading app; a home screen with Continue Reading, Recently Added, On Deck and Libraries; streamed issues resume on the page you last read; every cover loads, local and custom ones included; feeds carry real authors and dates and publish the address you actually reached, proxy or not; and downloads keep the file's real type and name and can resume. Built largely by [realAbitbol](https://github.com/realAbitbol) across [#212](https://github.com/hankscafe/omnibus/pull/212), [#234](https://github.com/hankscafe/omnibus/pull/234), [#235](https://github.com/hankscafe/omnibus/pull/235) and [#236](https://github.com/hankscafe/omnibus/pull/236).
 * **Metron, a Good Neighbor:** Every Metron request follows Metron's published best practices — one client paced by Metron's own rate-limit headers, a 429 pauses everything instead of being retried, each install runs its scheduled jobs at its own time of day instead of all at once, the Series Monitor asks only for what changed, and covers and per-issue credits are fetched only where someone will see them. Sign in with a Metron API token (encrypted, never logged), and System Health shows Metron's real limits with live countdowns ([#216](https://github.com/hankscafe/omnibus/issues/216)).
@@ -87,7 +96,8 @@ The last several releases added a lot. The biggest things to be aware of:
 
 ## Table of Contents
 - [Recent Highlights](#recent-highlights-october-2026)
-- [About Omnibus](#about-omnibus)
+- [Installation (Docker)](#installation-docker)
+- [First Steps](#first-steps)
 - [Features & Navigation](#features--navigation)
   - [Authentication & Security](#authentication--security)
   - [Homepage](#homepage)
@@ -104,9 +114,283 @@ The last several releases added a lot. The biggest things to be aware of:
   - [Custom Release Scoring & Formats](#custom-release-scoring--formats)
   - [Settings & Administration](#settings--administration)
   - [Additional Screenshots](#additional-screenshots)
-- [Installation (Docker)](#installation-docker)
+- [Metadata Sources, Licenses & Covers](#metadata-sources-licenses--covers)
 - [Acknowledgements](#acknowledgements)
 - [Contributors](#contributors)
+
+---
+
+## Installation (Docker)
+
+Omnibus runs as **three containers** that start together with Docker Compose:
+
+* **the web app** — the site you open in your browser;
+* **the Rust engine** — the heavy lifting: library scans, CBR/CBZ conversion, downloads, metadata sync, and search;
+* **Redis** — the background job queue.
+
+The database is a single SQLite file in your config folder, so there is no database server to run. (Very large library? PostgreSQL is optional — see [Choosing your database](UPGRADING.md#choosing-your-database-sqlite-or-postgresql).)
+
+> **Already running Omnibus?** To update, run `docker compose pull` and then `docker compose up -d`. Coming from v1.1.x, or using QNAP Container Station? Read [UPGRADING.md](UPGRADING.md) first.
+
+### Before you start
+
+* **Docker with Docker Compose** on the machine that will run Omnibus. Docker Desktop (Windows/macOS) includes Compose; on Linux, follow [Docker's install guide](https://docs.docker.com/engine/install/) and check that `docker compose version` works.
+* **A free ComicVine API key** — Omnibus' default source for covers, synopses, and issue lists. Create an account at [comicvine.gamespot.com](https://comicvine.gamespot.com/), then open [comicvine.gamespot.com/api](https://comicvine.gamespot.com/api/) to see your key. ([Metron.Cloud](https://metron.cloud/) is an optional second source.) Both have their own terms of use; see [Metadata Sources, Licenses & Covers](#metadata-sources-licenses--covers).
+* **Optional — add them whenever you like:** Prowlarr (indexer search), a download client (qBittorrent, SABnzbd, …), FlareSolverr. You don't need any of them to organize and read the comics you already have.
+
+### Step 1 — Make the folders
+
+Pick a home for Omnibus on your server, for example:
+
+```
+omnibus/
+├── docker-compose.yml   ← you'll create this in step 3
+├── config/              ← database, logs, cache, backups (Omnibus fills this)
+└── data/
+    ├── comics/          ← your comic library — copy existing comics here
+    └── downloads/       ← finished downloads land here
+```
+
+* Keep `config/` on a disk in the server itself, **not a network share** — the SQLite database can be corrupted over SMB/NFS. `data/` can live on a NAS share.
+* Keep `comics/` and `downloads/` inside the one `data/` folder so Omnibus moves files instantly instead of copying them.
+* Comics already somewhere else? Point the data mount (step 3) at the folder that holds them instead — e.g. `/mnt/media:/data` when your comics are in `/mnt/media/comics`.
+* On Linux, the web container runs as user ID 1000, which must be able to write to `config/` and `data/`. Create the folders as your regular user rather than with `sudo`: a folder Docker creates for you is owned by root, and the web app can't create its database there. (`sudo chown -R 1000:1000 config data` fixes that.)
+
+### Step 2 — Make a secret
+
+```bash
+openssl rand -base64 48
+```
+
+Copy the output (any random string of 40+ characters works too). This is your `NEXTAUTH_SECRET`: it signs logins **and** encrypts the passwords and API keys Omnibus saves. Keep a copy somewhere safe — without it, those saved values can't be read and backups can't be restored.
+
+### Step 3 — Create `docker-compose.yml`
+
+Save the file below as `docker-compose.yml` in your `omnibus` folder, then fill in the lines marked `CHANGE ME`:
+
+| Setting | What to put there |
+| --- | --- |
+| `NEXTAUTH_URL` | The address you'll type into your browser: your server's IP and port 3000, e.g. `http://192.168.1.50:3000` — no trailing slash. Behind a domain or reverse proxy? Use that address instead, e.g. `https://omnibus.example.com`. |
+| `NEXTAUTH_SECRET` | Your secret from step 2 — in **both** the `omnibus` and `omnibus-engine` services. |
+| `TZ` | Your [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), e.g. `Europe/London` — in both services. |
+| `volumes` | `./config` and `./data` work as written when the folders sit next to this file; otherwise use full paths. Keep the two lines **identical in both services**. |
+
+```yaml
+services:
+  omnibus:
+    image: ghcr.io/hankscafe/omnibus:latest
+    container_name: omnibus
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      omnibus-redis:
+        condition: service_healthy
+      omnibus-engine:
+        condition: service_started
+    environment:
+      # CHANGE ME: your timezone (the same value in the engine below)
+      - TZ=America/New_York
+
+      # CHANGE ME: the address you open Omnibus at. It must match exactly, with no trailing slash.
+      # On your network: your server's IP and port (e.g. http://192.168.1.50:3000)
+      # Behind a domain or reverse proxy: that address (e.g. https://omnibus.yourdomain.com)
+      - NEXTAUTH_URL=http://YOUR-SERVER-IP:3000
+
+      # CHANGE ME: paste your secret (generate one with: openssl rand -base64 48).
+      # !!NOTE!! - It also encrypts the passwords and API keys Omnibus saves. !!DO NOT LOSE THIS!!
+      # !!NOTE!! - Must be the SAME value as NEXTAUTH_SECRET in the omnibus-engine service below.
+      - NEXTAUTH_SECRET=
+
+      # --- ADVANCED SECURITY SETTINGS ---
+      # By default, Omnibus requires an HTTPS connection to use the "Login As" (Impersonation) feature
+      # to prevent session tokens from being intercepted over the network.
+      # If you are running Omnibus on a secure, private home network (LAN) without SSL,
+      # uncomment the line below to bypass this restriction at your own risk.
+      # - ALLOW_INSECURE_IMPERSONATION=true
+
+      # Everything below can stay as it is.
+
+      # The background job queue (the omnibus-redis service below)
+      - OMNIBUS_REDIS_URL=redis://omnibus-redis:6379/0
+
+      # The Rust engine (the omnibus-engine service below). Scans, conversions, downloads,
+      # metadata sync, and search all run there — without it those jobs fail with "fetch failed".
+      - OMNIBUS_ENGINE_URL=http://omnibus-engine:8000
+
+      # The database: a SQLite file in your config folder
+      - DATABASE_URL=file:/config/omnibus.db
+
+      # Folders inside the containers; they're created inside your config and data folders
+      - OMNIBUS_CACHE_DIR=/config/cache
+      - OMNIBUS_LOGS_DIR=/config/logs
+      - OMNIBUS_BACKUPS_DIR=/config/backups
+      - OMNIBUS_WATCHED_DIR=/data/watched
+      - OMNIBUS_AWAITING_MATCH_DIR=/data/unmatched
+
+      # OPTIONAL: default file-permission mask for everything Omnibus creates (the *arr convention).
+      # On NAS/shared storage, new folders are otherwise 0755 and read-only for your other accounts.
+      # 000 = world-writable (0777 folders), 002 = group-writable (0775). Also normalizes folders the
+      # Smart Matcher relocates. Set the SAME value on the engine service below. Unset = no change.
+      # - UMASK=002
+
+    volumes:
+      # <folder on your server>:<folder inside the container> — only ever change the LEFT side,
+      # and keep these lines identical in the omnibus-engine service below.
+      # Database, logs, cache, and backups. Local disk only, not a network share.
+      - ./config:/config
+      # Your comics and downloads (./data/comics, ./data/downloads). One mount = instant moves.
+      - ./data:/data
+
+      # Folders on separate drives? Replace the ./data line with one line per folder, all under
+      # /data, and copy the same lines to the engine below. Moves between separate mounts are
+      # copies, so they're slower.
+      # - /path/to/comics:/data/comics
+      # - /path/to/manga:/data/manga
+      # - /path/to/downloads:/data/downloads
+      # - /path/to/watched:/data/watched
+      # - /path/to/unmatched:/data/unmatched
+
+  # --- Rust engine: the heavy lifting (required) ---
+  # Library scans, CBR/CBZ conversion, downloads, metadata sync, search, and backups all run
+  # here. The web app forwards those jobs to it over Docker's internal network.
+  omnibus-engine:
+    image: ghcr.io/hankscafe/omnibus-engine:latest
+    container_name: omnibus-engine
+    restart: unless-stopped
+    environment:
+      # CHANGE ME: the same timezone as the web app
+      - TZ=America/New_York
+
+      # CHANGE ME: the SAME secret as the web app's NEXTAUTH_SECRET above.
+      # The engine refuses to start without a real secret.
+      - NEXTAUTH_SECRET=
+
+      # Everything below can stay as it is.
+
+      # The same SQLite database file as the web app (via the shared /config volume)
+      - DATABASE_URL=file:/config/omnibus.db
+      - OMNIBUS_ENGINE_BIND=0.0.0.0:8000
+
+      # The engine calls back to the web app to fire job-completion notifications.
+      - OMNIBUS_NODE_URL=http://omnibus:3000
+
+      # Identical to the web app so both containers resolve the same files
+      - OMNIBUS_BACKUPS_DIR=/config/backups
+      - OMNIBUS_CACHE_DIR=/config/cache
+      - OMNIBUS_WATCHED_DIR=/data/watched
+      - OMNIBUS_AWAITING_MATCH_DIR=/data/unmatched
+
+      # OPTIONAL: match the web app's UMASK (see above) so both containers create files the same way.
+      # - UMASK=002
+    # No ports: only the web app talks to the engine, over Docker's internal network.
+    # Publishing 8000 would expose the DB-/filesystem-mutating engine API to your LAN.
+    volumes:
+      # The SAME lines as the web app's volumes above: the engine reads and writes the same
+      # database and comic files at the same paths.
+      - ./config:/config
+      - ./data:/data
+
+  # --- Redis: the background job queue ---
+  omnibus-redis:
+    image: redis:7-alpine
+    container_name: omnibus-redis
+    restart: unless-stopped
+    # No ports: only the web app talks to Redis, over Docker's internal network.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+```
+
+> **Using Portainer, Synology Container Manager, Unraid, or another web UI that takes a compose file?** Paste the same file, but give the volumes **full paths** (e.g. `/volume1/docker/omnibus/config:/config`) — some of those tools resolve `./` somewhere other than you'd expect.
+
+This is the same stack as the repo's [`docker-compose.yml`](docker-compose.yml), written out with folder mounts instead of Docker-managed volumes. Use one or the other, not both.
+
+### Step 4 — Start it
+
+From your `omnibus` folder:
+
+```bash
+docker compose up -d
+```
+
+(Older Docker installs spell it `docker-compose up -d`.) Then check that all three containers are running:
+
+```bash
+docker compose ps
+```
+
+`omnibus`, `omnibus-engine`, and `omnibus-redis` should all show **Up**; the first start can take a minute while the database is created. If one keeps restarting, its log says why — for example `docker compose logs omnibus-engine`. A missing `NEXTAUTH_SECRET` is the usual cause.
+
+### Step 5 — Run the Setup Wizard
+
+Open your `NEXTAUTH_URL` in a browser. The wizard creates your admin account first, then asks for your ComicVine key. Every later step — indexers, download clients, hosters, network, users, filters, alerts, SSO — can be skipped with **Next** and set up any time in **Admin → Settings**.
+
+On the **Paths** step (*Storage Mappings*), enter folders the way the containers see them — inside `/data`, not the folder names on your server. With the layout from step 1:
+
+| Wizard field | Enter |
+| --- | --- |
+| Download Scan Root | `/data/downloads` |
+| Library Folders → Path | `/data/comics` |
+
+When you're done, the **System Health** card on the Admin page checks your setup — the engine connection, your ComicVine key, and whether the download folder is writable. Then head to [First Steps](#first-steps).
+
+### Behind a reverse proxy or Cloudflare Tunnel?
+
+Manual comic uploads are large requests, and proxies commonly cap request bodies:
+
+- **Cloudflare (including Tunnels):** free and pro plans cap each request at ~100MB, and this cannot be raised. Omnibus v1.3+ automatically slices manual uploads into ~48MB chunks, so uploads of any size work through a tunnel. On older versions, upload from your LAN address instead.
+- **nginx / Nginx Proxy Manager:** `client_max_body_size` defaults to just **1MB**. Add `client_max_body_size 2048m;` (NPM: Edit Proxy Host → Advanced) so single-request uploads and other large calls aren't rejected with HTTP 413.
+
+Omnibus' own upload limit is 2GB per file, adjustable with the `OMNIBUS_MAX_UPLOAD_MB` environment variable on the web container.
+
+---
+
+## First Steps
+
+Omnibus keeps your comic library organised, lets you read it, and can download new comics for you. You can only read comics that are **in your library**: the covers on the Home page are suggestions from ComicVine that you can request, not comics you have yet.
+
+### Read the comics you already have
+
+1. Copy a few comics (`.cbz`, `.cbr`, `.cb7`, `.zip`, `.rar`, `.epub`) into `data/comics/`, one folder per series — for example `data/comics/DC Comics/Absolute Batman (2024)/`.
+2. Open **Library** and press **Refresh**. Omnibus scans the folder and adds each series with its covers and details. A series it can't identify on its own is waiting for you in **Admin Dashboard → Smart Matcher**.
+3. Open a series and press **Read**. Your place is saved as you read.
+
+Library still empty? Check **Admin → Settings → Library & Files → Root Library Folders**: it should list `/data/comics`.
+
+To read on a phone or tablet instead, see [External Readers & OPDS Support](#external-readers--opds-support).
+
+### Get new comics
+
+1. On **Home**, search for a series. **Request Issue** gets one issue; **Request Series** (shown as **Request Missing** once you own part of the series) gets every issue you don't have, and offers to monitor the series so new issues are fetched as they come out. A series page has a **Monitor Series** button too.
+2. Follow it in **My Requests**. A request from a user who isn't allowed to auto-approve waits for an admin first.
+3. When the download finishes, Omnibus moves it into your library and it shows up in **Library**.
+
+Omnibus searches GetComics out of the box. Prowlarr, download clients (qBittorrent, SABnzbd, …) and FlareSolverr are optional and live in **Admin → Settings**.
+
+### Where your files go
+
+With the folder layout from [step 1](#step-1--make-the-folders):
+
+| What | Folder on your server |
+| --- | --- |
+| Your library, filed as `Publisher/Series (Year)/` | `data/comics/` |
+| Direct downloads while they arrive | `data/downloads/GetComics/` |
+| Torrent and usenet downloads | wherever your download client saves them (see below) |
+| Packs being split into single issues | `data/watched/` |
+| Files Omnibus couldn't identify — match them in **Smart Matcher** | `data/unmatched/` |
+
+### A download reached 100% but never shows up in Library?
+
+The download finished, but Omnibus couldn't move it into your library. Open **Admin → Logs** and look for lines starting with `[Importer]` from around the time it finished:
+
+* **"No Library Path found for this import"** — no library folder is set. Add `/data/comics` under **Admin → Settings → Library & Files → Root Library Folders**.
+* **"Permission denied"** — Omnibus isn't allowed to write to the folder. On Linux the web container runs as user ID 1000: `sudo chown -R 1000:1000 data`.
+* **"Source file not found … Check Path Mappings!"** (torrent / usenet) — your download client saved the file somewhere Omnibus can't see. Mount the downloads folder at the same path in both containers, or map it with the client's **Settings** button under **Admin → Settings → Downloads**.
+
+The **System Health** card on the Admin Dashboard checks the first two for you.
 
 ---
 
@@ -201,6 +485,7 @@ A meticulously organized, highly performant view of your physical files, built t
 * **In-App Metadata Editor:** Edit series-level and per-issue metadata (title, year, publisher, summary, creators, and more) right in the browser. Changes can optionally be written straight back into each archive's `ComicInfo.xml`, and a sync-lock keeps your manual edits from being overwritten by the next provider refresh.
 * **ComicInfo Defaults (Full Tag Set):** A tabbed editor — General / Credits / Story & Tags / Details — covers the complete ComicInfo schema: imprint, format, language, age rating, per-role credits, tags, story arcs, alternate series, community rating, black & white, and more. Available in both the Smart Matcher (set values at match time) and Edit Series Metadata (edit them any time after). Series-level values act as *defaults*: an issue's own provider or scanned data always wins, and the defaults fill the blanks. Scans read the tags back from files, so your values survive even a full database rebuild. Built for libraries the metadata providers don't cover.
 * **Series Groups, Imprints & Universes:** Organize related runs with the `{SeriesGroup}`, `{Imprint}`, and `{UniverseName}` naming variables — for example, `{Imprint}/{SeriesGroup}/{Series} ({Year})` places an Absolute Batman run under its publisher imprint and umbrella. `{Imprint}` uses the series' imprint, filled from ComicInfo `<Imprint>` when blank; when no imprint is available, that folder tier is omitted.
+* **One Naming Rule Everywhere:** Downloads, the watched folder, the Smart Matcher, manual links and Standardize all name a file the same way, so a file never gets renamed just because it came in through a different door. **Issue Number Padding** (Settings → Library & Files) sets how `{Issue}` is written — 3 digits (`#001`, the default), 2 digits (`#01`) or none (`#1`); decimals and letters keep their place (`#001.5`, `#001A`). Tokens work in any letter case, a year that isn't known is left out instead of printed as `(0000)`, and the live previews show exactly the names Omnibus will write.
 * **Cover Art Management:** Omnibus extracts a cover from the first page of each archive, lets you choose your preferred cover source, and allows admins to upload a custom cover for any series (locked so automated syncs never overwrite it).
 * **Advanced Search Syntax:** Use prefix modifiers in the search bar (e.g., `character:"Spider-Man"`, `team:"X-Men"`, `arc:"Secret Wars"`) to pinpoint exact crossovers and appearances across your entire collection.
 * **Multi-Library Routing:** Map distinct folders for standard Comics and Manga. Omnibus automatically detects Manga based on publishers, AniList cross-referencing, and tags to route them to the correct directory.
@@ -310,12 +595,14 @@ For security, external apps do not use your main account password.
    * **Username:** Your Omnibus username
    * **Password:** The API Key you just generated
 
-**Paperback (iOS / iPadOS):** Paperback doesn't read OPDS — its built-in "Paperback" source is a Komga client — so Omnibus answers it with a Komga-compatible endpoint instead. In Paperback, open the pre-installed **Paperback** source → **Server Settings** and enter:
-   * **Server URL:** `http://<your-omnibus-ip>:3000/komga`
-   * **Email:** Your Omnibus username
+**Paperback (iOS / iPadOS):** Paperback doesn't read OPDS — its Komga sources do the talking — so Omnibus answers them with a Komga-compatible endpoint. On **Paperback 0.9**, install the **Komga** extension from the default extension repository; on **Paperback 0.8**, use the pre-installed **Paperback** source. Open the source's server settings and enter:
+   * **Server URL** (**Base URL** on the Komga extension): `http://<your-omnibus-ip>:3000/komga`
+   * **Email / Username:** Your Omnibus username
    * **Password:** An API Key (generated the same way as above — never your account password)
 
-Tap **Try settings** to confirm the connection. Series, covers, page streaming (CBZ and CBR alike), search, the Recently added / Recently updated shelves, and marking issues read all work; an issue you finish in Paperback counts on your Omnibus profile like one finished in the web reader.
+Save the settings (on the 0.8 source, tap **Try settings**) to confirm the connection. Series, covers, page streaming (CBZ and CBR alike), search, and the Recently added / Recently updated shelves work right away. To send finished issues back to Omnibus, add the series to your Paperback **Library** and link the source as its **tracker** (from the series' tracking options). Paperback then reports each chapter you finish in the background; it counts on your Omnibus profile like one finished in the web reader, and **On Deck** offers the next issue. Paperback only reports finished chapters — never the page you're on — so a half-read issue doesn't appear in **Continue Reading**.
+
+> On Paperback 0.9 the pre-installed **Paperback** source can't be linked as a tracker ("Method `getMangaProgress` is not implemented"), so it never syncs read status — use the **Komga** extension there.
 
 ### Native e-Ink Sync (KOReader)
 Omnibus acts as a master "save state" for your physical e-ink devices (Kobo, Kindle, Pocketbook). Using our custom KOReader sync endpoints, your eReader will automatically ping Omnibus every time you turn a page, and you can view your real-time progress right on your Omnibus Profile!
@@ -454,7 +741,7 @@ Settings are organized into **8 task-focused tabs** — Metadata, Library & File
 * **Selectable Cloudflare Solver:** Route requests through a FlareSolverr, Byparr, **or** Trawl container to seamlessly bypass Cloudflare protection (403 Forbidden errors) on sites like GetComics, with a configurable solve timeout. A built-in circuit breaker detects a wedged/unresponsive solver (pausing solve attempts and raising a health-panel alert with the fix) instead of silently grinding every download into the manual queue. The download pipeline drives the solver the way battle-tested tools do — reusing solver sessions, streaming from the solver's landed URL, and resuming partial transfers — so gated links that used to need hand-holding now usually finish on their own. When a link still stays gated, Omnibus holds it for manual download — and you can hand the file back via Manual File Upload. Run any of the three solvers as its own container and point the Cloudflare Solver URL in Settings at it.
 * **Smart Matcher:** An AI-assisted tool that scans your "Unmatched" folders, queries your primary metadata provider (ComicVine or Metron), and suggests the correct linkage so you can clean up messy archives in seconds. If the auto-scan misses, **Search Match** lets you search the provider by name right in the matcher and pick the correct series from a results list — covers, publisher, year, and issue count included — with the classic exact-ID lookup one click deeper for admins who already have the ComicVine Volume ID or Metron Series ID. Includes bulk processing for whole folders at once, an inline metadata editor (Series Group / Universe, per-issue covers, and the full ComicInfo defaults tab set), archive-extracted cover previews, and overwrite-safety guards so a re-match never clobbers existing files. The matcher is **file-first**: your `ComicInfo.xml`/`series.json` values pre-fill the editor with provenance badges, provider data fills empty fields only on request, file-carried ids auto-resolve the exact series, and a keep-or-replace choice (keep is the default) decides whether Accept preserves or rewrites your curation. And when an auto-scan matches everything, a one-click **Accept All** applies every suggestion in a single pass. Auto-scan suggestions are scored by name with the year only breaking ties (and say "not found" rather than guess), the bulk mapping table shows each bound issue's cover from one provider call, **Ignore** keeps an item the provider will never have out of the matcher and out of automatic matching (with a "Show ignored" toggle), **Attach to Series** files a trade the provider doesn't know under its series as a collected edition, and a match that would land in another series' folder stops to ask — attach it there as a collected edition, or give it a folder name of its own.
 * **Match Confidence Modes & Background Sweep:** Choose how much matching automation you trust — **Trust** (auto-accept confident matches, with a tunable similarity threshold), **Confirm** (file IDs auto, suggestions need approval), **Auto** (only near-exact name matches), or **Custom** (fully manual). An hourly, ComicVine-budget-aware background sweep keeps retrying unmatched series so large imports finish matching themselves instead of stalling at the rate-limit wall — successful auto-matches light up the admin notification bell and a results card on the Smart Match page.
-* **Request Lifecycle Self-Healing:** Downloads that stall after repeated retries recover automatically, titles that aren't available on any source yet wait in a dedicated **Awaiting-Release** state (re-searched on a slow cadence, with per-request snooze) instead of counting as failures, and a periodic sweep revives dead requests — you never have to delete a request just to make it retry.
+* **Request Lifecycle Self-Healing:** Downloads that stall after repeated retries recover automatically, titles that aren't available on any source yet wait in a dedicated **Awaiting-Release** state (re-searched on a slow cadence, with per-request snooze) instead of counting as failures, and a periodic sweep revives dead requests — you never have to delete a request just to make it retry. A pack handed to the watched folder shows **Importing** until the sweep reports what landed, and a request whose issue didn't arrive is marked **Needs Review** instead of being announced as available.
 * **Search Quality Controls:** GetComics results advertise their download size in interactive search; releases over 400MB automatically prefer third-party mirrors over GetComics' throttled servers (never excluded, just re-ordered); rate limits are respected with real backoff and a health-panel warning; and an opt-in accepts undated scene releases when nothing dated exists (a release *with* a matching year always wins). Bulk packs/collections can be allowed and even prioritized for faster library building.
 * **Deep Diagnostics Engine:**
   * Ghost Records: Find and purge database entries pointing to files you deleted outside of Omnibus.
@@ -507,151 +794,27 @@ Settings are organized into **8 task-focused tabs** — Metadata, Library & File
 
 ---
 
-## Installation (Docker)
+## Metadata Sources, Licenses & Covers
 
-Omnibus deploys as **three containers**: the web app, the **Rust engine** (the heavy-lifting sidecar that runs library scans, CBR/CBZ conversion, downloads, metadata sync, and search), and Redis (the job queue). The database is still serverless SQLite living on your `/config` volume — no database server required. (Prefer PostgreSQL for a very large library? Use [docker-compose.postgres.yml](docker-compose.postgres.yml) from the repo instead.)
+Omnibus gets its metadata from two providers, each with its own terms. You use your own ComicVine key and your own Metron account, so their terms apply to you as their user.
 
-> **⚠️ Upgrading from v1.1.x?** v1.2.0 split Omnibus into two application containers: the web app now **requires** the `omnibus-engine` sidecar. If you pull the new image into your old compose file, every scan/conversion/metadata/search job fails with `fetch failed` and the health panel reports "Engine unreachable." Update your `docker-compose.yml` to the layout below — add the `omnibus-engine` service and the `OMNIBUS_ENGINE_URL` variable, and give the engine the **same** `NEXTAUTH_SECRET` and volume mounts as the web app. Your database and config carry over untouched; the schema upgrades itself on first boot.
+**ComicVine**
+* ComicVine's API is free for **non-commercial use only**; commercial use can get a key revoked.
+* ComicVine asks apps to link back to it on any page that uses its data. Omnibus does this in the footer of every page.
+* Its API page also asks apps not to edit its data or reproduce it on another medium. Omnibus lets you edit metadata and writes it into your own comic files (`ComicInfo.xml`) for your library; if you share files or data beyond your own use, read [ComicVine's terms](https://comicvine.gamespot.com/api/) first.
 
-1. Save the following as `docker-compose.yml`:
+**Metron**
+* Use your own Metron account with an API token (create one on [metron.cloud](https://metron.cloud/) under your profile; Metron is retiring password sign-in for its API). Never share one account between installs, and don't create extra accounts to get around the limits.
+* Each account gets 20 requests a minute and 5,000 a day. Omnibus paces itself by Metron's own rate-limit headers, so a big sync just takes longer.
+* **Need a higher limit?** A donation to Metron through [Open Collective](https://opencollective.com/metron) raises the daily limit of the account it's matched to, up to 25,000 requests a day. Use the email address confirmed on your Metron account, and don't contribute as Incognito, so the donation can be matched to it.
+* Metron's data is licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/), and Omnibus credits it in the footer of every page. Omnibus also writes metadata into your comic files (`ComicInfo.xml`, `series.json`): keeping them in your own library is fine, but if you share them publicly, the Metron data in them falls under the same license (credit Metron and share it under CC BY-SA 4.0).
 
-```yaml
-version: '3.8'
+**Covers**
+* Cover images belong to their publishers and creators. Neither ComicVine's terms nor Metron's license covers them, and Metron's fair-use basis for hosting them doesn't extend to other apps. Omnibus downloads covers to show them in your library; whether that's allowed where you live is your call.
 
-services:
-  omnibus:
-    image: ghcr.io/hankscafe/omnibus:latest
-    container_name: omnibus
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    depends_on:
-      - omnibus-redis
-      - omnibus-engine
-    environment:
-      - TZ=America/New_York
-      
-      # REQUIRED: The canonical URL of your Omnibus instance. NextAuth requires this to match exactly.
-      # Local access only: Set to your NAS IP and port (e.g., http://192.168.1.50:3000)
-      # External access: Set to your public domain (e.g., https://omnibus.yourdomain.com)
-      # NOTE: Do NOT include a trailing slash!
-      - NEXTAUTH_URL=http://<your-ip:port>
-      
-      # REQUIRED: Generate a random string for security
-      # !!NOTE!! - NEXTAUTH_SECRET also works as master database encryption key. !!DO NOT LOSE THIS!!
-      # !!NOTE!! - Must be the SAME value as NEXTAUTH_SECRET in the omnibus-engine service below.
-      - NEXTAUTH_SECRET=
+Metron's [Using Metron in Commercial Software](https://metron-project.github.io/blog/commercial-api-use) post has the details.
 
-      # --- ADVANCED SECURITY SETTINGS ---
-      # By default, Omnibus requires an HTTPS connection to use the "Login As" (Impersonation) feature 
-      # to prevent session tokens from being intercepted over the network.
-      # If you are running Omnibus on a secure, private home network (LAN) without SSL, 
-      # uncomment the line below to bypass this restriction at your own risk.
-      # - ALLOW_INSECURE_IMPERSONATION=true
-      
-      # REQUIRED: Connection URL for the background job queue
-      - OMNIBUS_REDIS_URL=redis://omnibus-redis:6379/0
-      
-      # REQUIRED: The Rust engine sidecar (service below). Scans, conversions, downloads,
-      # metadata sync, and search all run there — without it those jobs fail with "fetch failed".
-      - OMNIBUS_ENGINE_URL=http://omnibus-engine:8000
-      
-      # REQUIRED: Database connection string
-      - DATABASE_URL=file:/config/omnibus.db
-      
-      # PRE-STAGED PATHS: These automatically create subfolders inside your mapped /config volume below
-      - OMNIBUS_CACHE_DIR=/config/cache
-      - OMNIBUS_LOGS_DIR=/config/logs
-      - OMNIBUS_BACKUPS_DIR=/config/backups
-
-      # DROP FOLDERS: Set these inside your single data mount for fast atomic moves!
-      - OMNIBUS_WATCHED_DIR=/data/watched
-      - OMNIBUS_AWAITING_MATCH_DIR=/data/unmatched
-
-      # OPTIONAL: default file-permission mask for everything Omnibus creates (the *arr convention).
-      # On NAS/shared storage, new folders are otherwise 0755 and read-only for your other accounts.
-      # 000 = world-writable (0777 folders), 002 = group-writable (0775). Also normalizes folders the
-      # Smart Matcher relocates. Set the SAME value on the engine service below. Unset = no change.
-      # - UMASK=002
-
-    volumes:
-      # REQUIRED: Persistent storage for Database, Logs, Backups, Cache, and Uploaded Images
-      - /path/to/your/nas/config:/config
-      
-      # -------------------------------------------------------------------------
-      # OPTION 1: The Recommended Single Data Mount (Fast Atomic Moves)
-      # -------------------------------------------------------------------------
-      # Maps your entire media/download root to /data for optimal performance
-      - /path/to/your/nas/data:/data 
-      
-      # -------------------------------------------------------------------------
-      # OPTION 2: Separate Mounts (Slower copy/paste/delete operations)
-      # Uncomment these and remove Option 1 if your folders are on different drives
-      # -------------------------------------------------------------------------
-      # - /path/to/your/nas/comics:/comics
-      # - /path/to/your/nas/manga:/manga
-      # - /path/to/your/nas/downloads:/downloads
-      # - /path/to/your/nas/watched:/watched
-      # - /path/to/your/nas/unmatched:/unmatched
-
-  # --- Rust engine: REQUIRED since v1.2.0 ---
-  # The heavy-lifting sidecar: library scans, CBR/CBZ conversion, downloads, metadata sync,
-  # search, and backups all run here. The web app forwards those jobs to it over the internal
-  # Docker network.
-  omnibus-engine:
-    image: ghcr.io/hankscafe/omnibus-engine:latest
-    container_name: omnibus-engine
-    restart: unless-stopped
-    environment:
-      - TZ=America/New_York
-      
-      # Same SQLite database file as the web app (via the shared /config volume).
-      - DATABASE_URL=file:/config/omnibus.db
-      - OMNIBUS_ENGINE_BIND=0.0.0.0:8000
-      
-      # The engine calls back to the web app to fire job-completion notifications.
-      - OMNIBUS_NODE_URL=http://omnibus:3000
-      
-      # REQUIRED: MUST be the exact same value as the web app's NEXTAUTH_SECRET above.
-      # The engine refuses to start network-exposed without a real secret.
-      - NEXTAUTH_SECRET=
-      
-      # Keep these identical to the web app so both containers resolve the same files.
-      - OMNIBUS_BACKUPS_DIR=/config/backups
-      - OMNIBUS_CACHE_DIR=/config/cache
-      - OMNIBUS_WATCHED_DIR=/data/watched
-      - OMNIBUS_AWAITING_MATCH_DIR=/data/unmatched
-
-      # OPTIONAL: match the web app's UMASK (see above) so both containers create files the same way.
-      # - UMASK=002
-    # No ports exposed to the host: only the web container reaches the engine internally.
-    # Publishing 8000 would expose the DB-/filesystem-mutating engine API to your LAN.
-    volumes:
-      # MUST be the SAME mounts as the web app (the engine reads/writes the same database
-      # and comic files at the same paths).
-      - /path/to/your/nas/config:/config
-      - /path/to/your/nas/data:/data
-
-  omnibus-redis:
-    image: redis:alpine
-    container_name: omnibus-redis
-    restart: unless-stopped
-    # No ports exposed to the host machine to prevent conflicts. 
-    # Omnibus connects to this purely via Docker's internal network.
-```
 ---
-
-2. Run `docker-compose up -d`.
-3. Open your browser and navigate to your `NEXTAUTH_URL` to access the Setup Wizard!
-
-### Behind a reverse proxy or Cloudflare Tunnel?
-
-Manual comic uploads are large requests, and proxies commonly cap request bodies:
-
-- **Cloudflare (including Tunnels):** free and pro plans cap each request at ~100MB, and this cannot be raised. Omnibus v1.3+ automatically slices manual uploads into ~48MB chunks, so uploads of any size work through a tunnel. On older versions, upload from your LAN address instead.
-- **nginx / Nginx Proxy Manager:** `client_max_body_size` defaults to just **1MB**. Add `client_max_body_size 2048m;` (NPM: Edit Proxy Host → Advanced) so single-request uploads and other large calls aren't rejected with HTTP 413.
-
-Omnibus' own upload limit is 2GB per file, adjustable with the `OMNIBUS_MAX_UPLOAD_MB` environment variable on the web container.
 
 ## Acknowledgements
 
@@ -663,7 +826,7 @@ Omnibus stands on the shoulders of giants. This project was heavily inspired by 
 * **[Mylar3](https://github.com/mylar3/mylar3):** The absolute titan of comic tracking and downloading that paved the way.
 * **[ReadMeABook](https://github.com/kikootwo/ReadMeABook):** For the beautiful UI/UX inspiration and demonstrating what a modern web reader can look like.
 * **[ComicVine](https://comicvine.gamespot.com/):** For providing the API and metadata backbone that keeps our digital collections accurate and beautiful.
-* **[Metron](https://metron.cloud/):** For providing another source of metadata that has allowed for additional features (Release Calendar).
+* **[Metron](https://metron.cloud/):** For providing another source of metadata that has allowed for additional features (Release Calendar). Metron's data is licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 
 ---
 
@@ -678,17 +841,19 @@ Omnibus is built in the open, and it gets better every time someone sends a pull
 </a>
 
 * **[JoeJoeflyn](https://github.com/JoeJoeflyn)** — the comic panel-frame header navigation and app-wide button polish ([#186](https://github.com/hankscafe/omnibus/pull/186)), Omnibus' first merged community feature
-* **[realAbitbol](https://github.com/realAbitbol)** — OPDS feeds that publish the address your reader actually reached instead of the server's bind address ([#212](https://github.com/hankscafe/omnibus/pull/212), reported in [#210](https://github.com/hankscafe/omnibus/issues/210)), and KOReader progress sync that logs in and works end to end for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213), reported in [#211](https://github.com/hankscafe/omnibus/issues/211)), downloads with the real file type, a correct filename and resumable Range requests ([#234](https://github.com/hankscafe/omnibus/pull/234), reported in [#219](https://github.com/hankscafe/omnibus/issues/219) and [#220](https://github.com/hankscafe/omnibus/issues/220)), standards-conforming OPDS feeds with real authors and dates ([#235](https://github.com/hankscafe/omnibus/pull/235), reported in [#218](https://github.com/hankscafe/omnibus/issues/218)), and OPDS search, Continue Reading / Recently Added / On Deck / Libraries sections and page-stream resume ([#236](https://github.com/hankscafe/omnibus/pull/236), reported in [#221](https://github.com/hankscafe/omnibus/issues/221))
+* **[realAbitbol](https://github.com/realAbitbol)** — OPDS feeds that publish the address your reader actually reached instead of the server's bind address ([#212](https://github.com/hankscafe/omnibus/pull/212), reported in [#210](https://github.com/hankscafe/omnibus/issues/210)), and KOReader progress sync that logs in and works end to end for the first time ([#213](https://github.com/hankscafe/omnibus/pull/213), reported in [#211](https://github.com/hankscafe/omnibus/issues/211)), downloads with the real file type, a correct filename and resumable Range requests ([#234](https://github.com/hankscafe/omnibus/pull/234), reported in [#219](https://github.com/hankscafe/omnibus/issues/219) and [#220](https://github.com/hankscafe/omnibus/issues/220)), standards-conforming OPDS feeds with real authors and dates ([#235](https://github.com/hankscafe/omnibus/pull/235), reported in [#218](https://github.com/hankscafe/omnibus/issues/218)), OPDS search, Continue Reading / Recently Added / On Deck / Libraries sections and page-stream resume ([#236](https://github.com/hankscafe/omnibus/pull/236), reported in [#221](https://github.com/hankscafe/omnibus/issues/221)), requests that remember which issue they're for, so a pack is downloaded once instead of again on every monitor cycle ([#246](https://github.com/hankscafe/omnibus/pull/246), reported in [#240](https://github.com/hankscafe/omnibus/issues/240)), requests closed on what actually reached the library rather than on what was handed to the watched folder ([#247](https://github.com/hankscafe/omnibus/pull/247), reported in [#240](https://github.com/hankscafe/omnibus/issues/240)), handed-over files recorded before they land, so a sweep never meets one it wasn't told about ([#248](https://github.com/hankscafe/omnibus/pull/248), reported in [#240](https://github.com/hankscafe/omnibus/issues/240)), and scheduled jobs that no longer wait hours behind a backlog of searches ([#249](https://github.com/hankscafe/omnibus/pull/249), reported in [#240](https://github.com/hankscafe/omnibus/issues/240))
 * **[CaptainEpix](https://github.com/CaptainEpix)** — the `{Imprint}` naming token, which files a series under its publisher imprint the same way everywhere Omnibus names folders and files: imports, watched folders, the Smart Matcher and Standardize ([#214](https://github.com/hankscafe/omnibus/pull/214), proposed in [#207](https://github.com/hankscafe/omnibus/issues/207))
+* **[dissentingd](https://github.com/dissentingd)** — Windows checkouts that build working images ([#228](https://github.com/hankscafe/omnibus/pull/228), reported in [#223](https://github.com/hankscafe/omnibus/issues/223)), ComicVine's HTTP 420 burst limit handled as the rate limit it is at every call site ([#242](https://github.com/hankscafe/omnibus/pull/242), from [#227](https://github.com/hankscafe/omnibus/issues/227)), every issue's file path following its series when a match relocates the folder ([#230](https://github.com/hankscafe/omnibus/pull/230), reported in [#225](https://github.com/hankscafe/omnibus/issues/225)), a Smart Matcher sweep that reaches every unmatched series instead of stalling on the first hundred ([#231](https://github.com/hankscafe/omnibus/pull/231), reported in [#226](https://github.com/hankscafe/omnibus/issues/226)), book types read from a file's own `<Format>` tag ([#233](https://github.com/hankscafe/omnibus/pull/233), from [#163](https://github.com/hankscafe/omnibus/issues/163)), and genres free of ComicVine's cover and variant tags ([#241](https://github.com/hankscafe/omnibus/pull/241), from [#227](https://github.com/hankscafe/omnibus/issues/227))
 
 ### Bug Hunters & Field Testers
 
 Special thanks to the people whose reports and hands-on testing turned into real fixes and features:
 
-* **[anacronismo](https://github.com/anacronismo)** — tracked down the cover-corruption bug and field-verified the repair tooling ([#194](https://github.com/hankscafe/omnibus/issues/194), [#196](https://github.com/hankscafe/omnibus/issues/196)), kept the download and library pipelines honest with a string of sharp, log-attached reports ([#197](https://github.com/hankscafe/omnibus/issues/197), [#198](https://github.com/hankscafe/omnibus/issues/198), [#200](https://github.com/hankscafe/omnibus/issues/200), [#201](https://github.com/hankscafe/omnibus/issues/201), [#202](https://github.com/hankscafe/omnibus/issues/202)), then asked for Series-Annual Integration and field-tested it through five rounds ([#203](https://github.com/hankscafe/omnibus/issues/203)) and verified the half-issue fix ([#205](https://github.com/hankscafe/omnibus/issues/205)); in v1.4.6, the Series Monitor's same-name volume mix-up ([#208](https://github.com/hankscafe/omnibus/issues/208)), PixelDrain behind GetComics' redirect ([#209](https://github.com/hankscafe/omnibus/issues/209)), reading collected editions in the browser ([#215](https://github.com/hankscafe/omnibus/issues/215)) and the annual cover and metadata fixes ([#237](https://github.com/hankscafe/omnibus/issues/237), [#238](https://github.com/hankscafe/omnibus/issues/238))
+* **[anacronismo](https://github.com/anacronismo)** — tracked down the cover-corruption bug and field-verified the repair tooling ([#194](https://github.com/hankscafe/omnibus/issues/194), [#196](https://github.com/hankscafe/omnibus/issues/196)), kept the download and library pipelines honest with a string of sharp, log-attached reports ([#197](https://github.com/hankscafe/omnibus/issues/197), [#198](https://github.com/hankscafe/omnibus/issues/198), [#200](https://github.com/hankscafe/omnibus/issues/200), [#201](https://github.com/hankscafe/omnibus/issues/201), [#202](https://github.com/hankscafe/omnibus/issues/202)), then asked for Series-Annual Integration and field-tested it through five rounds ([#203](https://github.com/hankscafe/omnibus/issues/203)) and verified the half-issue fix ([#205](https://github.com/hankscafe/omnibus/issues/205)); in v1.4.6, the Series Monitor's same-name volume mix-up ([#208](https://github.com/hankscafe/omnibus/issues/208)), PixelDrain behind GetComics' redirect ([#209](https://github.com/hankscafe/omnibus/issues/209)), reading collected editions in the browser ([#215](https://github.com/hankscafe/omnibus/issues/215)) and the annual cover and metadata fixes ([#237](https://github.com/hankscafe/omnibus/issues/237), [#238](https://github.com/hankscafe/omnibus/issues/238)); in v1.4.9, the issue years in downloaded file names ([#243](https://github.com/hankscafe/omnibus/issues/243)) and the issue-number padding setting ([#244](https://github.com/hankscafe/omnibus/issues/244))
 * **[bpepple](https://github.com/bpepple)** — spotted from Metron's side the nightly burst every Omnibus install sent its servers at the same moment ([#216](https://github.com/hankscafe/omnibus/issues/216)), which became Metron best practices across the whole app
 * **[jdcrensh](https://github.com/jdcrensh)** — the hardlink import request ([#222](https://github.com/hankscafe/omnibus/issues/222)) whose investigation turned up a CBR conversion that could overwrite a CBZ you already had
-* **A Paperback user from the Discord** — tested Omnibus' Paperback support on a real iPhone through several rounds ([#206](https://github.com/hankscafe/omnibus/issues/206))
+* **[parkinsonanthony378-ui](https://github.com/parkinsonanthony378-ui)** — the "lost understanding how to set up" report ([#245](https://github.com/hankscafe/omnibus/discussions/245)) that rewrote the Installation guide and led to First Steps and the setup checklist
+* **Users from the Discord** — a Paperback user who tested Omnibus' Paperback support on a real iPhone through several rounds ([#206](https://github.com/hankscafe/omnibus/issues/206)) and tracked down why read status never synced from Paperback 0.9; a Surface Pro user whose "mkdir 'C:'" error became the folder-path checks; and a newcomer whose stuck download shaped First Steps and the setup checklist
 * **robotshavehearts2** — three thorough write-ups from a manual-matching, trade-heavy library that became fourteen betas: the Ignore state, collected editions and their coverage, the Missing Issues view, the For Your Library shelf, the folder-collision guard and local-only trades
 * **[de6oliveira-droid](https://github.com/de6oliveira-droid)** — the session-expiry report that turned the Smart Matcher's "Unauthorized Access" dead-end into a proper sign-in bounce ([#204](https://github.com/hankscafe/omnibus/issues/204))
 * **[BeepbopbeepityBop](https://github.com/BeepbopbeepityBop)** — the half-issue split, reported with a database analysis that nailed its exact shape ([#205](https://github.com/hankscafe/omnibus/issues/205))

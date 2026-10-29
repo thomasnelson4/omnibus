@@ -102,14 +102,14 @@ describe('attachAsCollected', () => {
         }));
         expect(mocks.engineFetchLong).toHaveBeenCalledWith('http://engine/api/metadata/attach-sync', expect.objectContaining({ body: JSON.stringify({ attachment_id: 'attX', claim: true }) }));
         // The file lands in the owner's folder under the collected pattern.
-        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga TPB/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz');
+        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga TPB/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz');
         // The owning row survives and BECOMES the provider book; the skeleton goes.
         expect(mocks.issueDelete).toHaveBeenCalledWith({ where: { id: 'sk1' } });
         expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'u1' },
             data: expect.objectContaining({
                 seriesId: 's1', attachedVolumeId: 'attX', metadataId: '900001', metadataSource: 'COMICVINE', matchState: 'MATCHED',
-                filePath: '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz', status: 'DOWNLOADED', name: 'Vol. 1: Chapter One',
+                filePath: '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz', status: 'DOWNLOADED', name: 'Vol. 1: Chapter One',
                 coversIssues: '1-6', // the sync's provider prefill travels with the identity
             }),
         }));
@@ -131,12 +131,32 @@ describe('attachAsCollected', () => {
         expect(result.moved).toBe(1);
         expect(mocks.moveFileSafe).toHaveBeenCalledWith(
             '/unmatched/Saga TPB/Saga v01.cbz',
-            `/comics/Image/Saga (2012)/Saga Vol. 01${suffix}.cbz`,
+            `/comics/Image/Saga (2012)/Saga Vol. 001${suffix}.cbz`,
         );
     });
 
+    // The naming cleanup (#244): a collected name expands every file token like every other path -
+    // {IssueTitle}, {SeriesGroup} and {UniverseName} used to stay in the name as literal text.
+    it('expands every file token in a collected name', async () => {
+        const result = await attachAsCollected({
+            ...input,
+            owner: { ...OWNER, seriesGroup: 'Saga Group', universe: 'Landfall' },
+            config: { collected_file_naming_pattern: '{Series} Vol. {Issue} - {IssueTitle} [{SeriesGroup}] ({UniverseName})' },
+        });
+        expect(result.moved).toBe(1);
+        expect(mocks.moveFileSafe).toHaveBeenCalledWith(
+            '/unmatched/Saga TPB/Saga v01.cbz',
+            '/comics/Image/Saga (2012)/Saga Vol. 001 - Vol. 1 Chapter One [Saga Group] (Landfall).cbz',
+        );
+    });
+
+    it('pads a collected number by the padding setting', async () => {
+        await attachAsCollected({ ...input, config: { issue_number_padding: 'none' } });
+        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga TPB/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 1 (2012).cbz');
+    });
+
     it('leaves a file whose collected name is already taken exactly where it is — row, folder and series untouched', async () => {
-        vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p).replace(/\\/g, '/') === '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz');
+        vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p).replace(/\\/g, '/') === '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz');
         mocks.issueCount.mockResolvedValue(1);
 
         const result = await attachAsCollected(input);
@@ -151,8 +171,8 @@ describe('attachAsCollected', () => {
     it('moves a folder that has no rows yet — just dropped into /unmatched — claiming the skeleton per file', async () => {
         const result = await attachAsCollected({ ...input, sourceSeriesId: null });
 
-        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga TPB/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz');
-        expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'sk1' }, data: expect.objectContaining({ filePath: '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz' }) }));
+        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga TPB/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz');
+        expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'sk1' }, data: expect.objectContaining({ filePath: '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz' }) }));
         expect(mocks.seriesDelete).not.toHaveBeenCalled();
         expect(result).toEqual(expect.objectContaining({ moved: 1, claimed: 1, absorbed: 0, conflicts: 0 }));
     });
@@ -162,10 +182,10 @@ describe('attachAsCollected', () => {
 
         const result = await attachAsCollected({ ...input, source: '/unmatched/Saga v01.cbz', sourceSeriesId: null });
 
-        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz');
+        expect(mocks.moveFileSafe).toHaveBeenCalledWith('/unmatched/Saga v01.cbz', '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz');
         expect(mocks.issueUpdate).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'sk1' },
-            data: expect.objectContaining({ filePath: '/comics/Image/Saga (2012)/Saga Vol. 01 (2012).cbz', status: 'DOWNLOADED' }),
+            data: expect.objectContaining({ filePath: '/comics/Image/Saga (2012)/Saga Vol. 001 (2012).cbz', status: 'DOWNLOADED' }),
         }));
         expect(mocks.issueDelete).not.toHaveBeenCalled();
         expect(mocks.seriesDelete).not.toHaveBeenCalled();

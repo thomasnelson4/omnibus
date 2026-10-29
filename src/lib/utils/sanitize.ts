@@ -1,4 +1,5 @@
 import sanitizeHtml from 'sanitize-html';
+import { sanitizeNamingPart } from '@/lib/utils/naming';
 
 /**
  * Robustly sanitizes HTML strings from external metadata providers.
@@ -11,15 +12,10 @@ import sanitizeHtml from 'sanitize-html';
  * all callers MUST use this so renames and imports produce identical paths.
  */
 export function sanitizeFilename(str: string): string {
-    const cleaned = str.replace(/[<>:"/\\|?*]/g, '').trim();
-    // Neutralize path traversal: strip leading/trailing dots so a value can't become a "." or ".." path
-    // segment once joined into a folder path. Untrusted ComicInfo metadata (series/publisher/universe)
-    // feeds this, and the folder-naming pattern inserts a separator between fields — so a bare ".." here
-    // would otherwise escape the library root. A value that was ONLY dots collapses to "_" rather than an
-    // empty (silently dropped) segment.
-    const safe = cleaned.replace(/^\.+/, '').replace(/\.+$/, '').trim();
-    if (!safe && cleaned) return '_';
-    return safe;
+    // One rule, kept in naming.ts (no imports, so the browser can use it too): strip illegal
+    // characters and neutralize path traversal - a value that is only dots becomes "_", so untrusted
+    // ComicInfo metadata can never become a "." or ".." segment of a folder path.
+    return sanitizeNamingPart(str);
 }
 
 // Wiki bases for resolving the RELATIVE hrefs providers embed in description HTML. ComicVine is

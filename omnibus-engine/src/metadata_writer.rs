@@ -1108,7 +1108,10 @@ mod tests {
         let theirs = dir.join("Batman 001.cbz.tmp");
         std::fs::write(&theirs, b"another writer's half-built archive").unwrap();
 
-        assert!(inject_xml_into_zip(cbz.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"));
+        assert_eq!(
+            inject_xml_into_zip(cbz.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"),
+            Some(EmbedOutcome::Written)
+        );
 
         assert_eq!(read_comicinfo_from_zip(&cbz).unwrap().as_deref(), Some("<ComicInfo>NEW</ComicInfo>"));
         assert_eq!(std::fs::read(&theirs).unwrap(), b"another writer's half-built archive", "the other writer's temp file is untouched");
@@ -1425,6 +1428,10 @@ mod tests {
         assert_eq!(parsed_bt["metadata"]["booktype"], "TPB");
         assert!(parsed_bt["omnibus"].get("booktype_guessed").is_none(), "a real bookType is not a guess:
 {raw_bt}");
+
+        // Back to a blank bookType: the LOCAL-edition block below pins the Komga fallback again,
+        // on the same fixture series.
+        sqlx::query(r#"UPDATE "Series" SET "bookType" = NULL WHERE id = 's203'"#).execute(&db.pool).await.unwrap();
 
         // #203 LOCAL: a local edition's books are recorded by NUMBER ("local:1"), never by a
         // provider id they don't have — that is what the local sync restores them from.

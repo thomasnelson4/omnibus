@@ -241,10 +241,17 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         mocks.findManySettings.mockResolvedValue([{ key: 'folder_naming_pattern', value: '{Series} ({Year})' }]);
         mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'X', year: 2016, publisher: 'Marvel', coverUrl: null });
         mocks.findManyIssues.mockResolvedValue(files.map((filePath, i) => ({ id: `issue_${i}`, filePath })));
-        vi.mocked(fs.existsSync).mockImplementation((p) => {
+        const present = (p: unknown) => {
             const normalized = String(p).replace(/\\/g, '/');
             if (normalized.startsWith('/unmatched/X/')) return conflicts.includes(normalized);
             return true;
+        };
+        vi.mocked(fs.existsSync).mockImplementation(present);
+        // The repoint commits its rows in one $transaction and chains .then() on the result.
+        mocks.transaction.mockImplementation((ops: unknown[]) => Promise.all(ops));
+        // The repoint probes the disk asynchronously (access), so both views must agree.
+        vi.mocked(fs.promises.access).mockImplementation(async (p: unknown) => {
+            if (!present(p)) throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
         });
         const res = await POST(createReq({ oldFolderPath: '/unmatched/X', metadataId: '987', metadataSource: 'METRON' }));
         expect(res.status).toBe(200);
@@ -492,7 +499,7 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         const onDisk = (...paths: string[]) => {
             const has = (p: any) => paths.includes(String(p));
             vi.mocked(fs.existsSync).mockImplementation(has);
-            vi.mocked(fs.promises.access).mockImplementation(async (p: any) => {
+            vi.mocked(fs.promises.access).mockImplementation(async (p: unknown) => {
                 if (!has(p)) throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
             });
         };

@@ -12,7 +12,8 @@ const mocks = vi.hoisted(() => ({
     readingListDeleteMany: vi.fn(),
     readingListCreate: vi.fn().mockResolvedValue({ id: 'list_mal' }),
     issueFindMany: vi.fn().mockResolvedValue([]),
-    readingListItemCreateMany: vi.fn()
+    readingListItemCreateMany: vi.fn(),
+    komgaLinkFindMany: vi.fn().mockResolvedValue([])
 }));
 
 vi.mock('@/lib/db', () => ({
@@ -22,7 +23,8 @@ vi.mock('@/lib/db', () => ({
         request: { findFirst: mocks.requestFindFirst, create: mocks.requestCreate },
         readingList: { deleteMany: mocks.readingListDeleteMany, create: mocks.readingListCreate },
         issue: { findMany: mocks.issueFindMany },
-        readingListItem: { createMany: mocks.readingListItemCreateMany }
+        readingListItem: { createMany: mocks.readingListItemCreateMany },
+        komgaReadListLink: { findMany: mocks.komgaLinkFindMany }
     }
 }));
 

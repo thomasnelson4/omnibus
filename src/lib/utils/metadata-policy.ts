@@ -19,7 +19,7 @@ export function guessBookTypeFromCvVolume(volume: {
     if (/graphic novel|\bOGN\b/i.test(name)) return 'GN';
     if (/\bTPB\b|trade paperback|\bHC\b|hardcover/i.test(name)) return 'TPB';
     const year = Number(volume.start_year);
-    if (volume.count_of_issues === 1 && Number.isInteger(year) && year > 0 && year < currentYear) return 'OneShot';
+    if (volume.count_of_issues === 1 && Number.isInteger(year) && year > 0 && year <= currentYear - 2) return 'OneShot';
     return null;
 }
 

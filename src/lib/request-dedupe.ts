@@ -144,8 +144,8 @@ export async function settleDuplicateOnLink(link: string | null | undefined, req
     const inFlight = siblings.find(s => s.status === IN_FLIGHT_REQUEST_STATUS);
     return {
       action: 'park',
-      clientDownloadId: inFlight?.clientDownloadId ?? null,
-      downloadClientId: inFlight?.downloadClientId ?? null,
+      clientDownloadId: inFlight?.clientDownloadId ?? undefined,
+      downloadClientId: inFlight?.downloadClientId ?? undefined,
     };
   };
 

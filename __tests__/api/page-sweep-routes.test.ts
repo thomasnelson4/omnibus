@@ -31,6 +31,7 @@ import { POST as enqueuePOST, GET as statusGET } from '@/app/api/library/issue/p
 import { POST as scanPOST } from '@/app/api/library/issue/pages/sweep/scan/route';
 import { POST as cancelPOST } from '@/app/api/library/issue/pages/sweep/cancel/route';
 import { auditLog } from '../helpers/setup-global';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 const fetchMock = vi.fn();
 global.fetch = fetchMock as any;
@@ -80,6 +81,9 @@ describe('POST /pages/sweep (enqueue)', () => {
             { issueId: 'i3', entryName: 'yy.jpg', label: 'Series #3' },
         ]);
         expect(opts.jobId).toMatch(/^PAGE_SWEEP_.+_0$/);
+        // The first chunk takes the same top tier as the chunks it chains (queue.ts), so the sweep
+        // alternates with the searches people asked for instead of jumping or trailing them.
+        expect(opts.priority).toBe(JOB_PRIORITY.REQUESTED);
         expect(auditLog).toHaveBeenCalledWith('PAGE_SWEEP_STARTED', expect.objectContaining({ matchedFiles: 2 }), 'admin1');
     });
 

@@ -6,7 +6,8 @@
 // way; finishing a chapter PATCHes /books/{id}/read-progress {page:1, completed:true}. Covers and
 // pages are delegated in-process to the routes that already serve them (the cover route and the
 // OPDS-PSE page streamer) — the middleware would 401 a Basic-only client on a redirect.
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { loggerLog, loggerGetLevel } from '../helpers/setup-global';
 import { GET as getSeriesBooks } from '@/app/komga/api/v1/series/[id]/books/route';
 import { GET as getSeriesThumb } from '@/app/komga/api/v1/series/[id]/thumbnail/route';
 import { GET as getBookPages } from '@/app/komga/api/v1/books/[id]/pages/route';
@@ -200,6 +201,46 @@ describe('Komga facade: GET /books/{id}/pages/{n}', () => {
         expect((await getBookPage(req('/books/iss_1/pages/x'), params({ id: 'iss_1', n: 'x' }))).status).toBe(404);
         expect(mocks.opdsPageGet).not.toHaveBeenCalled();
     });
+
+    // Paperback reports only finished chapters, so whether the pages it loads could stand in for
+    // reading progress depends on HOW it loads them - ahead of the reader, or all at once for an
+    // offline download. With the log level at debug, every page served through the facade is logged
+    // with its book, the reader and their app, so a reading session can be measured.
+    describe('debug log of every page served', () => {
+        afterEach(() => { loggerGetLevel.mockReturnValue('info'); });
+
+        it('at debug level, logs the page, the book, the reader and their app', async () => {
+            loggerGetLevel.mockReturnValue('debug');
+            mocks.prisma.issue.findUnique.mockResolvedValue(issue({ number: '3', pageCount: 24 }));
+
+            const res = await getBookPage(
+                req('/books/iss_1/pages/7', { headers: { 'user-agent': 'Paperback/0.8.11' } }),
+                params({ id: 'iss_1', n: '7' }),
+            );
+
+            expect(res.status).toBe(200);
+            expect(await res.text()).toBe('page-bytes');
+            expect(loggerLog).toHaveBeenCalledWith('[Komga] Page 7/24 of "Batman #3" (book iss_1) served to adam · Paperback/0.8.11', 'debug');
+        });
+
+        it('at info level, looks nothing up and logs nothing', async () => {
+            await getBookPage(req('/books/iss_1/pages/7'), params({ id: 'iss_1', n: '7' }));
+
+            expect(mocks.validateApiKey).not.toHaveBeenCalled();
+            expect(mocks.prisma.issue.findUnique).not.toHaveBeenCalled();
+            expect(loggerLog).not.toHaveBeenCalled();
+        });
+
+        it('logs nothing for a page that was refused', async () => {
+            loggerGetLevel.mockReturnValue('debug');
+            mocks.opdsPageGet.mockResolvedValue(new Response('Forbidden', { status: 403 }));
+
+            const res = await getBookPage(req('/books/iss_1/pages/7'), params({ id: 'iss_1', n: '7' }));
+
+            expect(res.status).toBe(403);
+            expect(loggerLog).not.toHaveBeenCalledWith(expect.stringContaining('[Komga] Page'), 'debug');
+        });
+    });
 });
 
 describe('Komga facade: thumbnails', () => {
@@ -287,6 +328,14 @@ describe('Komga facade: PATCH /books/{id}/read-progress', () => {
         mocks.prisma.readProgress.findUnique.mockResolvedValue({ currentPage: 20, totalPages: 24, isCompleted: false });
         await patch('iss_1', { page: 3 });
         expect(mocks.recordDailyReading).toHaveBeenCalledWith('user_1', 'iss_1', 0);
+    });
+
+    it('logs who reported which book, so a finished chapter that never syncs is visible', async () => {
+        await patch('iss_1', { page: 1, completed: true });
+        expect(loggerLog).toHaveBeenCalledWith('[Komga] adam finished "Batman #1" (book iss_1)', 'info');
+
+        await patch('iss_1', { page: 5 });
+        expect(loggerLog).toHaveBeenCalledWith('[Komga] adam is on page 5 of "Batman #1" (book iss_1)', 'info');
     });
 
     it('rejects a malformed body with 400, unknown books with 404, other libraries with 403, no key with 401', async () => {

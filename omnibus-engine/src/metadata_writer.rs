@@ -630,7 +630,11 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
     });
 
     let publisher: Option<String> = series.try_get::<Option<String>, _>("publisher").unwrap_or(None).filter(|s| !s.is_empty());
-    let book_type: Option<String> = series.try_get("bookType").unwrap_or(None);
+    // Komga's MylarMetadata declares `booktype` a non-null String — a null makes it reject the whole
+    // file — so an unclassified series still exports "Print". That value is our guess, not a fact:
+    // `omnibus.booktype_guessed` marks it so the scanner doesn't read it back in as a real bookType.
+    let book_type: Option<String> = series.try_get::<Option<String>, _>("bookType").unwrap_or(None).filter(|s| !s.is_empty());
+    let booktype_guessed = book_type.is_none();
     // #199: the Mylar 1.0.2 spec has always had these slots; now the Series columns can fill them.
     let imprint: Option<String> = series.try_get::<Option<String>, _>("imprint").unwrap_or(None).filter(|s| !s.is_empty());
     let age_rating: Option<String> = series.try_get::<Option<String>, _>("ageRating").unwrap_or(None).filter(|s| !s.is_empty());
@@ -717,10 +721,17 @@ pub(crate) async fn write_series_json(db: &Db, series_id: &str) -> bool {
             "status": if is_ended { "Ended" } else { "Continuing" }
         }
     });
-    // Only present when there IS something to record — an unattached series' file is byte-identical
-    // to what it was before Phase 1.
+    // Only present when there IS something to record — an unattached, classified series' file is
+    // byte-identical to what it was before Phase 1.
+    let mut omnibus_block = serde_json::Map::new();
     if !attached_volumes.is_empty() {
-        series_json["omnibus"] = serde_json::json!({ "attached_volumes": attached_volumes });
+        omnibus_block.insert("attached_volumes".to_string(), serde_json::Value::Array(attached_volumes));
+    }
+    if booktype_guessed {
+        omnibus_block.insert("booktype_guessed".to_string(), serde_json::Value::Bool(true));
+    }
+    if !omnibus_block.is_empty() {
+        series_json["omnibus"] = serde_json::Value::Object(omnibus_block);
     }
     if book_type_guessed {
         series_json["omnibus"]["booktype_guessed"] = serde_json::json!(true);
@@ -950,7 +961,7 @@ fn inject_xml_into_zip(file_path: &str, generated_xml: &str) -> Option<EmbedOutc
         }
     }
 
-    let tmp_path = path.with_extension("cbz.tmp");
+    let tmp_path = crate::converter::temp_sibling(path, "embed");
 
     let result = (|| -> anyhow::Result<()> {
         let file = File::open(path)?;
@@ -1077,6 +1088,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // Unique temp files: every embed of "X.cbz" used to build its new archive at the one shared
+    // "X.cbz.tmp" - two embeds of the same file (a sync's embed and a standalone one, or a convert
+    // of "X.cbr", which targets the same name) truncated and renamed each other's half-built archive.
+    #[test]
+    fn embed_never_touches_another_writers_temp_file() {
+        let dir = std::env::temp_dir().join(format!("omnibus_embed_tmp_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cbz = dir.join("Batman 001.cbz");
+        {
+            let mut zw = ZipWriter::new(File::create(&cbz).unwrap());
+            zw.start_file("01.jpg", FileOptions::default()).unwrap();
+            zw.write_all(b"page").unwrap();
+            zw.finish().unwrap();
+        }
+        // Another writer of the same file is mid-build under the name every writer used to share.
+        let theirs = dir.join("Batman 001.cbz.tmp");
+        std::fs::write(&theirs, b"another writer's half-built archive").unwrap();
+
+        assert_eq!(
+            inject_xml_into_zip(cbz.to_str().unwrap(), "<ComicInfo>NEW</ComicInfo>"),
+            Some(EmbedOutcome::Written)
+        );
+
+        assert_eq!(read_comicinfo_from_zip(&cbz).unwrap().as_deref(), Some("<ComicInfo>NEW</ComicInfo>"));
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"another writer's half-built archive", "the other writer's temp file is untouched");
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        left.sort();
+        assert_eq!(left, vec!["Batman 001.cbz", "Batman 001.cbz.tmp"], "no temp file of ours left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // #199: the full ComicInfo default set — issue-wins pairing, series-only tags, and the B&W
@@ -1372,6 +1415,23 @@ mod tests {
         assert_eq!(annual["source"], "COMICVINE");
         assert_eq!(annual["kind"], "ANNUAL");
         assert_eq!(annual["start_year"], 2012);
+
+        // No bookType on the row: Komga needs a non-null booktype, so "Print" goes out — marked as
+        // our guess so the next scan doesn't read it back in as a real classification.
+        assert_eq!(parsed["metadata"]["booktype"], "Print");
+        assert_eq!(parsed["omnibus"]["booktype_guessed"], true);
+        // A real bookType is exported as-is, with no guess mark.
+        sqlx::query(r#"UPDATE "Series" SET "bookType" = 'TPB' WHERE id = 's203'"#).execute(&db.pool).await.unwrap();
+        assert!(write_series_json(&db, "s203").await, "series.json rewrites with the real bookType");
+        let raw_bt = std::fs::read_to_string(folder.join("series.json")).expect("series.json");
+        let parsed_bt: serde_json::Value = serde_json::from_str(&raw_bt).expect("valid json");
+        assert_eq!(parsed_bt["metadata"]["booktype"], "TPB");
+        assert!(parsed_bt["omnibus"].get("booktype_guessed").is_none(), "a real bookType is not a guess:
+{raw_bt}");
+
+        // Back to a blank bookType: the LOCAL-edition block below pins the Komga fallback again,
+        // on the same fixture series.
+        sqlx::query(r#"UPDATE "Series" SET "bookType" = NULL WHERE id = 's203'"#).execute(&db.pool).await.unwrap();
 
         // #203 LOCAL: a local edition's books are recorded by NUMBER ("local:1"), never by a
         // provider id they don't have — that is what the local sync restores them from.

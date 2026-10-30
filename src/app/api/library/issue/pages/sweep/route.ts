@@ -13,6 +13,7 @@ import { AuditLogger } from '@/lib/audit-logger';
 import { Logger } from '@/lib/logger';
 import { getErrorMessage } from '@/lib/utils/error';
 import { omnibusQueue } from '@/lib/queue';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 import {
     readSweepResult, sweepIsActive, PageSweepJobData, PageSweepItem,
     PAGE_SWEEP_RESULT_KEY, PAGE_SWEEP_CANCEL_KEY,
@@ -94,7 +95,9 @@ export async function POST(request: Request) {
             type: 'PAGE_SWEEP', runId, sourceLabel, actorUserId: (session.user as any).id,
             total: items.length, items, processed: 0, removed: 0, failed: [], startedAt,
         };
-        await omnibusQueue.add('PAGE_SWEEP', data, { jobId: `PAGE_SWEEP_${runId}_0` });
+        // Every chunk of a sweep takes the top tier (job-priority.ts), the first one too: the sweep
+        // alternates with the searches people asked for and goes ahead of the bulk and background ones.
+        await omnibusQueue.add('PAGE_SWEEP', data, { jobId: `PAGE_SWEEP_${runId}_0`, priority: JOB_PRIORITY.REQUESTED });
 
         await AuditLogger.log('PAGE_SWEEP_STARTED', {
             source: sourceLabel, matchedFiles: items.length,

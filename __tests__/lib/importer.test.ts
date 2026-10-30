@@ -15,6 +15,14 @@ const mocks = vi.hoisted(() => ({
     findFirstClient: vi.fn(),
     getAllActiveDownloads: vi.fn(),
     updateRequest: vi.fn(),
+    updateManyRequest: vi.fn().mockResolvedValue({ count: 2 }),
+    recordHandoff: vi.fn().mockResolvedValue(1),
+    // #240 review: the per-file row written before its own move, and its two corrections.
+    recordPendingHandoff: vi.fn().mockResolvedValue(true),
+    dropPendingHandoff: vi.fn().mockResolvedValue(undefined),
+    rekeyPendingHandoff: vi.fn().mockResolvedValue(undefined),
+    // The magic-number fix, identity by default: one test renames through it.
+    fixMagicNumber: vi.fn((p: string) => p),
     createIssue: vi.fn(),
     upsertSeries: vi.fn(),
     updateSeries: vi.fn(),
@@ -26,13 +34,18 @@ const mocks = vi.hoisted(() => ({
     syncSeriesMetadata: vi.fn().mockResolvedValue(true),
     // global fetch (engine nested-pack offload)
     fetch: vi.fn(),
-    zipGetEntries: vi.fn().mockReturnValue([])
+    zipGetEntries: vi.fn().mockReturnValue([]),
+    // The ZIP index reader (end record + central directory only) - readable by default.
+    readZipEntryNames: vi.fn().mockResolvedValue(['01.jpg']),
+    requeue: vi.fn().mockResolvedValue('requeued'),
+    // The saved-folder check (its own real-fs tests live in stored-folder.test.ts) - fine by default.
+    storedFolderProblem: vi.fn().mockReturnValue(null),
 }));
 
 // 2. Deeply Mock Dependencies to save RAM and prevent OOM crashes
 vi.mock('@/lib/db', () => ({
     prisma: {
-        request: { findUnique: mocks.findUniqueRequest, update: mocks.updateRequest, updateMany: vi.fn().mockResolvedValue({ count: 1 }), count: vi.fn().mockResolvedValue(0) },
+        request: { findUnique: mocks.findUniqueRequest, update: mocks.updateRequest, updateMany: mocks.updateManyRequest, findMany: vi.fn().mockResolvedValue([]), count: vi.fn().mockResolvedValue(0) },
         systemSetting: { findMany: mocks.findManySettings, findUnique: vi.fn().mockResolvedValue(null) },
         library: { findMany: mocks.findManyLibraries },
         series: { findFirst: mocks.findFirstSeries, upsert: mocks.upsertSeries, update: mocks.updateSeries },
@@ -62,6 +75,23 @@ vi.mock('@/lib/queue', () => ({
     }
 }));
 
+// #240 PR B: the importer records the handoff and nothing else — the row-writing itself is unit
+// tested in import-handoff.test.ts, and the relative-path key is mocked to its basename here so the
+// assertions read as intent rather than as /tmp path arithmetic.
+vi.mock('@/lib/import-handoff', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/lib/import-handoff')>()),
+    newImportBatchId: () => 'batch_test',
+    watchedRelativePath: (_dir: string, filePath: string) => filePath.split(/[\\/]/).pop(),
+    recordImportHandoff: mocks.recordHandoff,
+    recordPendingHandoff: mocks.recordPendingHandoff,
+    dropPendingHandoff: mocks.dropPendingHandoff,
+    rekeyPendingHandoff: mocks.rekeyPendingHandoff,
+}));
+
+// Identity by default, so the batch tests keep the name the importer planned; one test renames a file
+// through it to prove the row follows.
+vi.mock('@/lib/utils/archive-signature', () => ({ fixMagicNumberSync: mocks.fixMagicNumber }));
+
 vi.mock('@/lib/utils/path-resolver', () => ({
     resolveRemotePath: vi.fn((path) => path),
     resolveClientPath: vi.fn(async (p, client) => client.remotePath && client.localPath ? p.replace(client.remotePath, client.localPath) : p)
@@ -75,6 +105,12 @@ vi.mock('@/lib/converter', () => ({ convertCbrToCbz: mocks.convertCbrToCbz }));
 vi.mock('@/lib/metadata-fetcher', () => ({ syncSeriesMetadata: mocks.syncSeriesMetadata }));
 vi.mock('adm-zip', () => ({ default: class AdmZipMock { getEntries() { return mocks.zipGetEntries(); } } }));
 vi.mock('axios');
+vi.mock('@/lib/utils/archive-pages', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/lib/utils/archive-pages')>()),
+    readZipEntryNames: mocks.readZipEntryNames,
+}));
+vi.mock('@/lib/requeue', () => ({ requeueWithNextRelease: mocks.requeue }));
+vi.mock('@/lib/utils/stored-folder', () => ({ storedFolderProblem: mocks.storedFolderProblem }));
 
 describe('File System: Importer Engine', () => {
     beforeEach(() => {
@@ -98,6 +134,38 @@ describe('File System: Importer Engine', () => {
         mocks.zipGetEntries.mockReturnValue([]);
         mocks.getAllActiveDownloads.mockResolvedValue([]);
         mocks.findFirstClient.mockResolvedValue(null);
+        mocks.storedFolderProblem.mockReset();
+        mocks.storedFolderProblem.mockReturnValue(null);
+    });
+
+    // beta.018 follow-up: a Root Path saved before Settings checked it (a Windows path under Docker,
+    // a leading space, a folder nothing is mounted at) surfaced only as a bare EACCES deep in the
+    // copy. The importer now names the library and the fix, and touches nothing.
+    it('refuses a library whose saved Root Path the server can\'t use, naming the library and the fix', async () => {
+        mocks.findUniqueRequest.mockResolvedValueOnce({
+            id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+        });
+        mocks.findFirstSeries.mockResolvedValueOnce({
+            id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false
+        });
+        mocks.findManyLibraries.mockResolvedValue([
+            { id: 'lib_1', name: 'Standard Comics', path: 'C:\\Comics', isManga: false, isDefault: true }
+        ]);
+        mocks.storedFolderProblem.mockImplementation((p: string) =>
+            p === 'C:\\Comics' ? '"C:\\Comics" is a Windows path, and Omnibus runs inside a Linux container that can\'t see it.' : null
+        );
+        vi.mocked(fs.copy).mockClear();
+        vi.mocked(fs.ensureDir).mockClear();
+
+        const result = await Importer.importRequest('req_1');
+
+        expect(result).toBe(false);
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('library "Standard Comics"'), 'error');
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('"C:\\Comics" is a Windows path'), 'error');
+        expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('Settings → Library & Files'), 'error');
+        expect(fs.copy).not.toHaveBeenCalled();
+        expect(vi.mocked(fs.ensureDir).mock.calls.some(([p]) => String(p).includes('C:\\Comics'))).toBe(false);
+        expect(mocks.createIssue).not.toHaveBeenCalled();
     });
 
     it('should stall the request if the downloaded file is missing from the hard drive', async () => {
@@ -137,7 +205,7 @@ describe('File System: Importer Engine', () => {
         // FIX: Omnibus COPIES torrent files to preserve seeding!
         expect(fs.copy).toHaveBeenCalledWith(
             expect.any(String),
-            expect.stringContaining('Batman #01.cbz'),
+            expect.stringContaining('Batman #001.cbz'),
             expect.any(Object)
         );
 
@@ -194,7 +262,7 @@ describe('File System: Importer Engine', () => {
             (prisma.issue.findMany as any).mockResolvedValue([issueRow({ filePath: null, status: 'WANTED', fileAddedAt: null })]);
             await Importer.importRequest('req_1');
             const data = (prisma.issue.update as any).mock.calls.at(-1)[0].data;
-            expect(data.filePath).toContain('Batman #01.cbz');
+            expect(data.filePath).toContain('Batman #001.cbz');
             expect(data.fileAddedAt).toBeInstanceOf(Date);
         });
 
@@ -205,10 +273,154 @@ describe('File System: Importer Engine', () => {
             (prisma.issue.findMany as any).mockResolvedValue([issueRow({ filePath: '/library/comics/DC Comics/Batman (2016)/Batman #01.cbr', status: 'DOWNLOADED', fileAddedAt: OLD })]);
             await Importer.importRequest('req_1');
             const data = (prisma.issue.update as any).mock.calls.at(-1)[0].data;
-            expect(data.filePath).toContain('Batman #01.cbz');
+            expect(data.filePath).toContain('Batman #001.cbz');
             expect('fileAddedAt' in data).toBe(false);
         });
     });
+
+    // The naming cleanup (#244): a download is named by the same rules as every other path - padded
+    // by the issue_number_padding setting (it used to pad a single digit only), and "$&" in a series
+    // name stays "$&" (string replacement turned it back into the token it replaced).
+    describe('naming (#244)', () => {
+        const download = (series: Record<string, unknown> = {}) => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+            });
+            mocks.findFirstSeries.mockResolvedValueOnce({
+                id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false, ...series
+            });
+        };
+        const copiedTo = () => String(vi.mocked(fs.copy).mock.calls.at(-1)?.[1]).replace(/\\/g, '/');
+
+        it.each([
+            { padding: 'none', name: 'Batman #1.cbz' },
+            { padding: '2', name: 'Batman #01.cbz' },
+            { padding: '3', name: 'Batman #001.cbz' },
+        ])('pads by the setting ($padding)', async ({ padding, name }) => {
+            mocks.findManySettings.mockResolvedValue([
+                { key: 'download_path', value: '/downloads' },
+                { key: 'issue_number_padding', value: padding },
+            ]);
+            download();
+            expect(await Importer.importRequest('req_1')).toBe(true);
+            expect(copiedTo()).toMatch(new RegExp(`/DC Comics/Batman \\(2016\\)/(\\d+_)?${name.replace(/[.#]/g, '\\$&')}$`));
+        });
+
+        it('keeps "$&" in a series name literal, in the folder and the file', async () => {
+            download({ name: 'Cash $& Carry' });
+            expect(await Importer.importRequest('req_1')).toBe(true);
+            expect(copiedTo()).toMatch(/\/DC Comics\/Cash \$& Carry \(2016\)\/(\d+_)?Cash \$& Carry #001\.cbz$/);
+        });
+    });
+
+    // A series row whose folderPath isn't strictly inside a library - a library root itself, or a
+    // folder elsewhere (a volume request could store one) - is never "standardized" by moving that
+    // folder into the library. The download lands in the pattern's folder instead.
+    describe('a series folder outside the library', () => {
+        it.each(['/library/comics', '/config', '/library/comics/DC Comics/../..'])('never moves %s', async (stored) => {
+            vi.mocked(fs.move).mockClear();
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+            });
+            mocks.findFirstSeries.mockResolvedValueOnce({
+                id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false, folderPath: stored
+            });
+
+            const result = await Importer.importRequest('req_1');
+
+            expect(result).toBe(true);
+            expect(vi.mocked(fs.move).mock.calls.filter(c => c[0] === stored)).toEqual([]);
+            expect(fs.copy).toHaveBeenLastCalledWith(
+                expect.any(String),
+                // (existsSync is true for every path here, so the collision prefix applies)
+                expect.stringMatching(/[\\/]library[\\/]comics[\\/]DC Comics[\\/]Batman \(2016\)[\\/](\d+_)?Batman #001\.cbz$/),
+                expect.any(Object)
+            );
+        });
+    });
+    // #243 (anacronismo): a monitored download of X-Men #38 - a series that started in 2024, an
+    // issue released in 2026 - was named "X-Men #38 (2024)" although the file pattern asks for
+    // {IssueYear}. The importer took the year from ComicInfo's <Volume> (the series' start year)
+    // and never looked at the issue's own row. {IssueYear} is now the issue's release date in the
+    // library, else the file's own <Year>, else the series year - the same year Standardize uses.
+    describe('{IssueYear} (#243)', () => {
+        const xmenDownload = () => {
+            mocks.findManySettings.mockResolvedValue([
+                { key: 'download_path', value: '/downloads' },
+                { key: 'folder_naming_pattern', value: '{Publisher}/{Series} ({Year})' },
+                { key: 'file_naming_pattern', value: '{Series} #{Issue} ({IssueYear})' },
+            ]);
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'X-Men #38 (2026).cbz', volumeId: 'cv_1', createdAt: new Date()
+            });
+            mocks.findFirstSeries.mockResolvedValueOnce({
+                id: 'series_x', name: 'X-Men', publisher: 'Marvel', year: 2024, libraryId: 'lib_1', isManga: false
+            });
+        };
+        const libraryRows = async (rows: Array<{ number: string; releaseDate: string | null; isAnnual?: boolean }>) => {
+            const { prisma } = await import('@/lib/db');
+            (prisma.issue.findMany as any).mockResolvedValue(rows.map((r, i) => ({
+                id: `iss_${i}`, seriesId: 'series_x', isAnnual: false, filePath: null, status: 'WANTED',
+                name: null, description: null, writers: null, artists: null, characters: null, ...r,
+            })));
+        };
+        const copiedTo = () => (fs.copy as any).mock.calls.at(-1)?.[1] as string;
+        afterEach(async () => {
+            const { prisma } = await import('@/lib/db');
+            (prisma.issue.findMany as any).mockResolvedValue([]);
+        });
+
+        it('uses the issue\'s release date in the library, not the series year from <Volume>', async () => {
+            xmenDownload();
+            mocks.parseComicInfo.mockResolvedValueOnce({ series: 'X-Men', number: '38', year: 2024 });
+            await libraryRows([{ number: '37', releaseDate: '2025-12-10' }, { number: '38', releaseDate: '2026-01-14' }]);
+
+            expect(await Importer.importRequest('req_1')).toBe(true);
+            expect(copiedTo()).toMatch(/Marvel[\\/]X-Men \(2024\)[\\/](?:\d+_)?X-Men #038 \(2026\)\.cbz$/);
+        });
+
+        it('the library\'s release date wins over the file\'s own <Year>, so Standardize never renames it again', async () => {
+            xmenDownload();
+            mocks.parseComicInfo.mockResolvedValueOnce({ series: 'X-Men', number: '38', year: 2024, issueYear: 2026 });
+            await libraryRows([{ number: '38', releaseDate: '2025-11-05' }]);
+
+            await Importer.importRequest('req_1');
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #038 \(2025\)\.cbz$/);
+        });
+
+        it('without a library row, uses the file\'s own ComicInfo <Year>', async () => {
+            xmenDownload();
+            mocks.parseComicInfo.mockResolvedValueOnce({ series: 'X-Men', number: '38', year: 2024, issueYear: 2026 });
+
+            await Importer.importRequest('req_1');
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #038 \(2026\)\.cbz$/);
+        });
+
+        it('with neither, falls back to the series year', async () => {
+            xmenDownload();
+            mocks.parseComicInfo.mockResolvedValueOnce(null);
+
+            await Importer.importRequest('req_1');
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men #038 \(2024\)\.cbz$/);
+        });
+
+        it('an annual takes its year from the annual\'s row, never the main run\'s same number', async () => {
+            xmenDownload();
+            mocks.findUniqueRequest.mockReset();
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'X-Men Annual #1 (2025).cbz', volumeId: 'cv_1', createdAt: new Date()
+            });
+            mocks.parseComicInfo.mockResolvedValueOnce({ series: 'X-Men', number: '1', year: 2024, format: 'Annual' });
+            await libraryRows([
+                { number: '1', releaseDate: '2024-07-10', isAnnual: false },
+                { number: '1', releaseDate: '2025-08-20', isAnnual: true },
+            ]);
+
+            await Importer.importRequest('req_1');
+            expect(copiedTo()).toMatch(/(?:\d+_)?X-Men Annual #001 \(2025\)\.cbz$/);
+        });
+    });
+
     it.each([null, '', '   '])('adopts ComicInfo Imprint over stored %j and saves it for later naming', async (imprint) => {
         mocks.findManySettings.mockResolvedValue([
             { key: 'download_path', value: '/downloads' },
@@ -229,7 +441,7 @@ describe('File System: Importer Engine', () => {
         expect(result).toBe(true);
         expect(fs.copy).toHaveBeenCalledWith(
             expect.any(String),
-            expect.stringMatching(/Absolute[\\/]DC Comics[\\/]Batman \(2016\)[\\/](?:\d+_)?Absolute Batman #01\.cbz$/),
+            expect.stringMatching(/Absolute[\\/]DC Comics[\\/]Batman \(2016\)[\\/](?:\d+_)?Absolute Batman #001\.cbz$/),
             expect.any(Object),
         );
         expect(mocks.updateSeries).toHaveBeenCalledWith(expect.objectContaining({
@@ -257,14 +469,20 @@ describe('File System: Importer Engine', () => {
         expect(extractBody.path).toContain('Big Pack.cbz');
         expect(extractBody.dest_dir).toBeTruthy();
         expect(mocks.zipGetEntries).not.toHaveBeenCalled();
-        // Batch routing completed: request closed out and the watched-folder sync queued.
-        expect(mocks.updateRequest).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ status: 'COMPLETED' })
+        // Batch ROUTED, not closed (#240 PR B): the request waits at IMPORTING, the files are handed
+        // over to the sweep under their watched-folder names, and the sync is queued under the batch.
+        expect(mocks.updateManyRequest).toHaveBeenCalledWith({
+            where: { id: { in: ['req_1'] } },
+            data: expect.objectContaining({ status: 'IMPORTING' })
+        });
+        expect(mocks.recordHandoff).toHaveBeenCalledWith(expect.objectContaining({
+            batchId: 'batch_test',
+            requestIds: ['req_1'],
+            relativePaths: ['a.cbz', 'b.cbz']
         }));
-        expect(omnibusQueue.add).toHaveBeenCalledWith('WATCHED_FOLDER_SYNC', expect.any(Object), expect.any(Object));
-        expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({
-            title: expect.stringContaining('2 Files')
-        }));
+        expect(omnibusQueue.add).toHaveBeenCalledWith('WATCHED_FOLDER_SYNC', expect.any(Object), { jobId: 'batch_test' });
+        // Nothing is announced at routing time any more — the bell no longer lies about the import.
+        expect(notifierSendAlert).not.toHaveBeenCalled();
     });
 
     it('falls back to local AdmZip batch extraction when the engine is down', async () => {
@@ -272,7 +490,9 @@ describe('File System: Importer Engine', () => {
             id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Big Pack.cbz'
         });
 
-        // Engine unreachable (default fetch rejection) → local AdmZip detection + extraction.
+        // Engine unreachable (default fetch rejection) → the ZIP's index finds the nested comic
+        // (#240: without loading the pack into memory), then the local AdmZip extraction runs.
+        mocks.readZipEntryNames.mockResolvedValueOnce(['nested/a.cbz', 'readme.txt']);
         mocks.zipGetEntries.mockReturnValue([
             { entryName: 'nested/a.cbz', isDirectory: false, getData: () => Buffer.from('a') },
             { entryName: 'readme.txt', isDirectory: false, getData: () => Buffer.from('junk') },
@@ -283,12 +503,237 @@ describe('File System: Importer Engine', () => {
         expect(result).toBe(true);
         // Only the nested comic was written to the watched folder.
         expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledTimes(1);
-        expect(mocks.updateRequest).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ status: 'COMPLETED' })
+        expect(mocks.updateManyRequest).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status: 'IMPORTING' })
         }));
-        expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({
-            title: expect.stringContaining('1 Files')
+        // The destination keeps a collision prefix when the watched folder already holds that name,
+        // and the handoff key follows the file it actually wrote. #240 review: it is written per file,
+        // BEFORE the extraction writes it.
+        expect(mocks.recordPendingHandoff).toHaveBeenCalledTimes(1);
+        expect(mocks.recordPendingHandoff).toHaveBeenCalledWith(expect.objectContaining({
+            batchId: 'batch_test',
+            requestIds: ['req_1'],
+            relativePath: expect.stringMatching(/a\.cbz$/)
         }));
+        // …and it is written before the extraction writes the file it names.
+        expect(mocks.recordPendingHandoff.mock.invocationCallOrder[0])
+            .toBeLessThan(vi.mocked(fs.writeFileSync).mock.invocationCallOrder[0]);
+        expect(notifierSendAlert).not.toHaveBeenCalled();
+    });
+
+    // ==== #240 review: the row must exist BEFORE the file it names does. ====
+    // The importer moved the whole pack into the watched folder and only then wrote the handoff rows,
+    // so a sweep that started inside that window imported files whose row appeared a moment later — a
+    // row nothing can ever settle. The request then reads as "the batch never reported back" and an
+    // unnumbered request (a whole-pack link, with no issue to look up in the library) closes
+    // NEEDS_REVIEW over files that are already imported. The row goes in first now, per file, before
+    // that file's own move.
+
+    function armFolderBatch(entries: string[]) {
+        mocks.findUniqueRequest.mockResolvedValueOnce({
+            id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Invincible Vol. 1-25'
+        });
+        // A DDL pack: the source is found under the GetComics folder (not at the client root), so the
+        // importer MOVES the files and isFromClient stays false — the case where the file leaves the
+        // download folder as it is routed. Windows builds that path with backslashes (path.join), so
+        // normalise the separator first: matching on the raw string made existsSync answer false there
+        // and every folder-batch test bailed out before routing.
+        vi.mocked(fs.existsSync).mockImplementation(((p: string) =>
+            String(p).replace(/\\/g, '/').endsWith('GetComics/Invincible Vol. 1-25')
+        ) as unknown as typeof fs.existsSync);
+        // That source resolves to a FOLDER holding several archives (a scene pack), not to an archive.
+        vi.mocked(fs.statSync).mockImplementation(((p: string) => ({
+            isDirectory: () => !/\.[a-z0-9]{2,4}$/i.test(p),
+            size: 1000000
+        })) as unknown as typeof fs.statSync);
+        vi.mocked(fs.promises.readdir).mockResolvedValue(
+            entries.map(name => ({ name, isDirectory: () => false })) as unknown as never
+        );
+    }
+
+    function releaseFolderBatchMocks() {
+        vi.mocked(fs.existsSync).mockReset();
+        vi.mocked(fs.existsSync).mockReturnValue(true);
+        vi.mocked(fs.statSync).mockReturnValue({ isDirectory: () => false, size: 1000000 } as unknown as ReturnType<typeof fs.statSync>);
+        vi.mocked(fs.promises.readdir).mockResolvedValue([] as unknown as never);
+    }
+
+    it("writes each file's handoff row before the file itself lands in the watched folder", async () => {
+        armFolderBatch(['Invincible 01.cbz', 'Invincible 02.cbz']);
+
+        const result = await Importer.importRequest('req_1');
+
+        expect(result).toBe(true);
+        // One row per file, under the name the sweep will read.
+        expect(mocks.recordPendingHandoff.mock.calls.map(c => c[0].relativePath))
+            .toEqual(['Invincible 01.cbz', 'Invincible 02.cbz']);
+        expect(mocks.recordPendingHandoff).toHaveBeenCalledWith(expect.objectContaining({
+            batchId: 'batch_test',
+            requestIds: ['req_1']
+        }));
+        // The order that closes the race: the first row exists before the first file is moved, and each
+        // row before its own file.
+        const rowOrder = mocks.recordPendingHandoff.mock.invocationCallOrder;
+        const moveOrder = vi.mocked(fs.move).mock.invocationCallOrder;
+        expect(rowOrder[0]).toBeLessThan(moveOrder[0]);
+        expect(rowOrder[1]).toBeLessThan(moveOrder[1]);
+        // Both files were handed over, so nothing is withdrawn.
+        expect(mocks.dropPendingHandoff).not.toHaveBeenCalled();
+        expect(omnibusQueue.add).toHaveBeenCalledWith('WATCHED_FOLDER_SYNC', expect.any(Object), { jobId: 'batch_test' });
+
+        releaseFolderBatchMocks();
+    });
+
+    it('withdraws the row of a file the move could not route, instead of leaving a stall to report', async () => {
+        armFolderBatch(['Invincible 01.cbz', 'Invincible 02.cbz']);
+        vi.mocked(fs.move).mockImplementationOnce(async () => {
+            throw new Error('EXDEV: cross-device link not permitted');
+        });
+
+        const result = await Importer.importRequest('req_1');
+
+        // The pack still went over (one file), so the request is handed off…
+        expect(result).toBe(true);
+        expect(omnibusQueue.add).toHaveBeenCalledWith('WATCHED_FOLDER_SYNC', expect.any(Object), { jobId: 'batch_test' });
+        // …but the file that never landed has no row left behind it.
+        expect(mocks.recordPendingHandoff).toHaveBeenCalledTimes(2);
+        expect(mocks.dropPendingHandoff).toHaveBeenCalledTimes(1);
+        expect(mocks.dropPendingHandoff).toHaveBeenCalledWith('batch_test', 'Invincible 01.cbz');
+
+        releaseFolderBatchMocks();
+    });
+
+    it('re-keys a row when the signature fix renamed the file after it landed', async () => {
+        armFolderBatch(['Fake.cbr', 'Real.cbz']);
+        // The extension lies: the fix renames it, so the engine will read the corrected name.
+        mocks.fixMagicNumber.mockImplementationOnce((p: string) => p.replace(/\.cbr$/, '.cbz'));
+
+        const result = await Importer.importRequest('req_1');
+
+        expect(result).toBe(true);
+        expect(mocks.rekeyPendingHandoff).toHaveBeenCalledTimes(1);
+        expect(mocks.rekeyPendingHandoff).toHaveBeenCalledWith('batch_test', 'Fake.cbr', 'Fake.cbz');
+
+        releaseFolderBatchMocks();
+    });
+
+    it('takes a request that parks on the link while the pack is being routed into the same batch', async () => {
+        armFolderBatch(['Invincible 01.cbz', 'Invincible 02.cbz']);
+        mocks.findUniqueRequest.mockReset();
+        mocks.findUniqueRequest.mockResolvedValue({
+            id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Invincible Vol. 1-25', downloadLink: 'https://host/pack'
+        });
+        // The link is read before the first file moves, because the rows need the batch id and the
+        // request ids. A request that parks on that link *while* the pack is being routed is not in
+        // that first read — and since #240 PR B nothing else closes a parked request, so it would sit
+        // at DOWNLOADING and, for a torrent, the cron's client loop could match the finished torrent
+        // and route the pack a second time.
+        const { prisma } = await import('@/lib/db');
+        const onTheLink: { id: string }[] = [{ id: 'req_1' }];
+        vi.mocked(prisma.request.findMany).mockImplementation((async () => [...onTheLink]) as never);
+        vi.mocked(fs.move).mockImplementationOnce((async () => {
+            onTheLink.push({ id: 'req_late' });
+        }) as never);
+
+        expect(await Importer.importRequest('req_1')).toBe(true);
+
+        const toImporting = mocks.updateManyRequest.mock.calls
+            .map(([args]) => args as { where: { id: { in: string[] } }; data: { status?: string } })
+            .filter(a => a.data.status === 'IMPORTING');
+        expect(toImporting.flatMap(a => a.where.id.in)).toContain('req_late');
+        // They need no rows of their own: the reconciler's joined-batch path already waits on the
+        // newest batch on their link, so the rows keep the list the routing started with.
+        expect(mocks.recordPendingHandoff).toHaveBeenCalledWith(expect.objectContaining({
+            requestIds: ['req_1']
+        }));
+
+        vi.mocked(prisma.request.findMany).mockResolvedValue([] as never);
+        releaseFolderBatchMocks();
+    });
+
+    // ==== #240 finding 4: a 1.2 GB pack cut short was imported as ONE issue with 0 pages. The engine
+    // listing failed, the AdmZip fallback (which loads the whole pack into memory) threw, the error
+    // was swallowed, and the file went down the single-issue path. An archive that can't be read is
+    // now refused: never imported, the release is blocked, and the request searches again. ====
+    describe('unreadable archives (#240)', () => {
+        const unreadable = () => mocks.readZipEntryNames.mockRejectedValueOnce(new Error('EOCD signature not found'));
+
+        it('refuses a ZIP whose index can\'t be read: no issue, no move, and the release is blocked for a re-search', async () => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Big Pack (2024).cbz', downloadLink: 'abc123hash', retryCount: 0, volumeId: 'cv_1'
+            });
+            unreadable();
+
+            expect(await Importer.importRequest('req_1')).toBe(false);
+
+            expect(mocks.createIssue).not.toHaveBeenCalled();
+            expect(fs.copy).not.toHaveBeenCalled();
+            expect(fs.move).not.toHaveBeenCalled();
+            expect(mocks.requeue).toHaveBeenCalledWith(expect.objectContaining({ id: 'req_1' }), { title: 'Big Pack (2024).cbz' });
+            expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining("can't be read"), 'error');
+            // A download client's file is left where it is (a torrent may still be seeding it).
+            expect(fs.remove).not.toHaveBeenCalled();
+        });
+
+        it('deletes our own direct-download temp file when refusing it, so a folder search never picks it up again', async () => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Big Pack (2024).cbz', downloadLink: 'https://getcomics.org/dls/x', retryCount: 0
+            });
+            // Only the GetComics copy exists (the engine's DDL target), not one in the download root.
+            vi.mocked(fs.existsSync).mockImplementation((p: any) => {
+                const s = String(p).replace(/\\/g, '/');
+                return !(s.endsWith('/Big Pack (2024).cbz') && !s.includes('/GetComics/'));
+            });
+            unreadable();
+
+            expect(await Importer.importRequest('req_1')).toBe(false);
+
+            expect(fs.remove).toHaveBeenCalledWith(expect.stringMatching(/GetComics[\\/]Big Pack \(2024\)\.cbz$/));
+            expect(mocks.requeue).toHaveBeenCalled();
+            expect(mocks.createIssue).not.toHaveBeenCalled();
+        });
+
+        it('an admin\'s uploaded file that can\'t be read is reported - not deleted, not re-searched', async () => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({ id: 'req_1', status: 'PENDING', activeDownloadName: 'X-Men 038.cbz' });
+            unreadable();
+
+            expect(await Importer.importRequest('req_1', { sourcePathOverride: '/downloads/X-Men 038.cbz' })).toBe(false);
+
+            expect(mocks.requeue).not.toHaveBeenCalled();
+            expect(fs.remove).not.toHaveBeenCalled();
+            expect(mocks.createIssue).not.toHaveBeenCalled();
+        });
+
+        it('a readable ZIP is checked from its index alone - the file is never loaded into memory', async () => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+            });
+            mocks.findFirstSeries.mockResolvedValueOnce({
+                id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false
+            });
+
+            expect(await Importer.importRequest('req_1')).toBe(true);
+
+            expect(mocks.readZipEntryNames).toHaveBeenCalled();
+            expect(mocks.createIssue).toHaveBeenCalled();
+            expect(mocks.zipGetEntries).not.toHaveBeenCalled();
+            expect(mocks.requeue).not.toHaveBeenCalled();
+        });
+
+        it('when the engine lists the archive, its answer is trusted and the index isn\'t read again', async () => {
+            mocks.findUniqueRequest.mockResolvedValueOnce({
+                id: 'req_1', status: 'DOWNLOADING', activeDownloadName: 'Batman 01.cbz', volumeId: 'cv_123', createdAt: new Date()
+            });
+            mocks.findFirstSeries.mockResolvedValueOnce({
+                id: 'series_1', name: 'Batman', publisher: 'DC Comics', year: 2016, libraryId: 'lib_1', isManga: false
+            });
+            mocks.fetch.mockResolvedValueOnce({ ok: true, json: async () => ({ count: 0, entries: [] }) });
+
+            expect(await Importer.importRequest('req_1')).toBe(true);
+
+            expect(mocks.readZipEntryNames).not.toHaveBeenCalled();
+            expect(mocks.createIssue).toHaveBeenCalled();
+        });
     });
 
     // ==== Issue #174: RAR packs (the dominant Usenet/scene container) must be batch-split too. ====
@@ -309,9 +754,13 @@ describe('File System: Importer Engine', () => {
         expect(mocks.fetch).toHaveBeenCalledTimes(2);
         // AdmZip can't read RAR — it must never be consulted for a .cbr pack.
         expect(mocks.zipGetEntries).not.toHaveBeenCalled();
-        expect(mocks.updateRequest).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ status: 'COMPLETED' })
+        expect(mocks.updateManyRequest).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status: 'IMPORTING' })
         }));
+        expect(mocks.recordHandoff).toHaveBeenCalledWith(expect.objectContaining({
+            relativePaths: ['Batman 89 Echoes 001.cbz']
+        }));
+        expect(notifierSendAlert).not.toHaveBeenCalled();
         expect(omnibusQueue.add).toHaveBeenCalledWith('WATCHED_FOLDER_SYNC', expect.any(Object), expect.any(Object));
     });
 
@@ -346,9 +795,12 @@ describe('File System: Importer Engine', () => {
         expect(result).toBe(false);
         // The reason must be the REAL one — not a path-mapping/permissions red herring.
         expect(loggerLog).toHaveBeenCalledWith(expect.stringContaining('could not be split'), 'error');
-        expect(mocks.updateRequest).not.toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ status: 'COMPLETED' })
+        // Nothing was handed over: the request is not marked IMPORTING and no handoff row exists —
+        // a request that would wait forever on an import that was never queued (#240 PR B).
+        expect(mocks.updateManyRequest).not.toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status: 'IMPORTING' })
         }));
+        expect(mocks.recordHandoff).not.toHaveBeenCalled();
     });
 
     it('splits a pack that arrives inside a download-client job folder (SAB case, issue #174)', async () => {

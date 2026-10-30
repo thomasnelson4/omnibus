@@ -123,7 +123,7 @@ describe('GET /api/admin/config masks the Komga API key', () => {
     it('is admin-only', async () => {
         mocks.getServerSession.mockResolvedValue({ user: { id: 'u1', role: 'USER' } });
         const res = await GET(new Request('http://localhost/api/admin/config'));
-        expect(res.status).toBe(401);
+        expect(res.status).toBe(403);
         expect(mocks.settingFindMany).not.toHaveBeenCalled();
     });
 });

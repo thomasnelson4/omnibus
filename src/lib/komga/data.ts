@@ -253,6 +253,11 @@ type IssueWithSeries = Prisma.IssueGetPayload<{ include: { series: { select: { i
 
 export type IssueLookup = { ok: true; issue: IssueWithSeries } | { ok: false; status: 404 | 403 };
 
+/** "Batman #3": how a book is named in the facade's log lines. */
+export function bookLabel(issue: { number: string | null; series?: { name: string } | null }): string {
+    return `${issue.series?.name ?? 'Unknown series'} #${issue.number ?? '?'}`;
+}
+
 /** An issue with a file the caller may see (by its series' library). */
 export async function findAccessibleIssue(id: string, libs: AccessibleLibraries): Promise<IssueLookup> {
     const issue = await prisma.issue.findUnique({

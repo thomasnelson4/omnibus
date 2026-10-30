@@ -412,19 +412,49 @@ export default function SmartMatchPage() {
         let matchCount = 0;
         try {
             for (const series of visibleUnmatched) {
+                // An ignored series is visible only while the toggle is on; scanning it would put a
+                // suggestion back on a row the admin has already dealt with.
                 if (series.isIgnored) continue;
+                // Only an ERROR is retried. A suggestion is already handled, and a NOT_FOUND would
+                // come back the same: the server caches the decision for its TTL, empty verdicts
+                // included, so re-asking only spends the provider budget again.
+                if (suggestions[series.id] && suggestions[series.id] !== 'ERROR') continue;
+
                 try {
+                    // The decision service owns the search: it derives the query from the item's
+                    // evidence, ranks candidates and returns a verifiable fingerprint. The browser
+                    // never searches the provider itself — that was the cover storm (#199) and the
+                    // source of the client-side confidence drift.
                     const decision = await scanItem(series);
                     if (decision.selected) matchCount++;
+                    // A throttled/deferred verdict is about the provider, not this row: pause the
+                    // whole scan instead of burning the remaining rows against the same wall.
                     if (['rate_limited', 'deferred'].includes(decision.status)) {
-                        toast({ title: 'Scan paused', description: decision.reasons.join(' '), variant: 'destructive' });
+                        toast({
+                            title: 'Scan paused',
+                            description: (decision.reasons || []).join(' ') || 'The metadata provider asked us to slow down. Try again later.',
+                            variant: 'destructive',
+                        });
                         break;
                     }
-                } catch {
+                } catch (e: any) {
+                    // A failed request is ERROR, never NOT_FOUND (review of #231): the next scan
+                    // retries it, whereas a genuine no-match is cached and skipped.
                     setSuggestions(prev => ({ ...prev, [series.id]: 'ERROR' }));
+                    const message = e?.message || '';
+                    if (message === 'FATAL_RATE_LIMIT' || message.includes('429')) {
+                        toast({
+                            title: 'Rate Limit Exceeded',
+                            description: 'Omnibus has hit the API limits. Pausing the smart scan to protect your connection. Please attempt the scan again later to continue.',
+                            variant: 'destructive',
+                        });
+                        break;
+                    }
                 }
             }
-        } finally { setIsScanning(false); }
+        } finally {
+            setIsScanning(false);
+        }
         toast({ title: 'Scan complete', description: `Found candidates for ${matchCount} entries. Only convincing matches can be accepted automatically.` });
     };
 

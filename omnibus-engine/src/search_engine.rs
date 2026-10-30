@@ -106,6 +106,43 @@ pub async fn get_custom_acronyms(db: &sqlx::AnyPool) -> anyhow::Result<HashMap<S
     Ok(ac_map)
 }
 
+/// The acronym table compiled once for a search: each acronym matched as a whole word, case-
+/// insensitively, longest first (so a longer acronym wins over one it contains), replaced by its
+/// lowercase full name. Query generation uses it to search the full name too; the relevance
+/// filters run it over BOTH the request and every result title, so "TMNT: The Last Ronin" and
+/// "Teenage Mutant Ninja Turtles - The Last Ronin" compare as the same series.
+pub(crate) struct AcronymExpander {
+    pairs: Vec<(Regex, String)>,
+}
+
+impl AcronymExpander {
+    pub(crate) fn new(acronyms: &HashMap<String, String>) -> Self {
+        let mut entries: Vec<(&str, &str)> = acronyms
+            .iter()
+            .map(|(ac, full)| (ac.trim(), full.trim()))
+            .filter(|(ac, full)| !ac.is_empty() && !full.is_empty())
+            .collect();
+        entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(b.0)));
+        let pairs = entries
+            .into_iter()
+            .filter_map(|(ac, full)| {
+                Regex::new(&format!(r"(?i)\b{}\b", regex::escape(ac)))
+                    .ok()
+                    .map(|re| (re, full.to_lowercase()))
+            })
+            .collect();
+        Self { pairs }
+    }
+
+    pub(crate) fn expand(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for (re, full) in &self.pairs {
+            out = re.replace_all(&out, regex::NoExpand(full)).into_owned();
+        }
+        out
+    }
+}
+
 /// Insertion-ordered de-dup push (replaces the old HashSet so query order is deterministic —
 /// the Prowlarr loop returns on the first non-empty query, so order is load-bearing).
 fn add_query(vec: &mut Vec<String>, seen: &mut HashSet<String>, val: String) {
@@ -159,6 +196,7 @@ pub fn generate_search_queries(
     use_packs: bool,
 ) -> Vec<String> {
     let search_name = normalize_request_name(name);
+    let expander = AcronymExpander::new(acronyms);
 
     // Two insertion-ordered groups, each de-duped within itself (parity with Node's two Sets).
     let mut primary: Vec<String> = Vec::new();
@@ -198,11 +236,7 @@ pub fn generate_search_queries(
             if !year.is_empty() { add_query(&mut primary, &mut primary_seen, format!("{} {}", main_broad_clean, year)); }
             add_query(&mut primary, &mut primary_seen, main_broad_clean.clone());
 
-            let mut main_expanded = main_broad_clean.clone();
-            for (ac, full) in acronyms {
-                let re_ac = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(ac))).unwrap();
-                main_expanded = re_ac.replace_all(&main_expanded, full).to_string();
-            }
+            let main_expanded = expander.expand(&main_broad_clean);
             if main_expanded.to_lowercase() != main_broad_clean.to_lowercase() {
                 if !year.is_empty() { add_query(&mut primary, &mut primary_seen, format!("{} {}", main_expanded, year)); }
                 add_query(&mut primary, &mut primary_seen, main_expanded);
@@ -222,11 +256,7 @@ pub fn generate_search_queries(
         add_query(&mut secondary, &mut secondary_seen, dashed);
     }
 
-    let mut expanded = broad_clean.clone();
-    for (ac, full) in acronyms {
-        let re_ac = Regex::new(&format!(r"(?i)\b{}\b", regex::escape(ac))).unwrap();
-        expanded = re_ac.replace_all(&expanded, full).to_string();
-    }
+    let expanded = expander.expand(&broad_clean);
     if expanded.to_lowercase() != broad_clean.to_lowercase() {
         if !year.is_empty() { add_query(&mut secondary, &mut secondary_seen, format!("{} {}", expanded, year)); }
         add_query(&mut secondary, &mut secondary_seen, expanded);
@@ -596,8 +626,8 @@ pub async fn filter_and_score(
     series_year: Option<String>,
     skip_relevance: bool,
     allow_packs_override: Option<bool>,
+    acronyms: &HashMap<String, String>,
 ) -> anyhow::Result<Option<ProwlarrResult>> {
-
     let junk_words_str = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'filter_junk_words'"#)
         .fetch_optional(db).await?.unwrap_or_else(|| "preview, sample, ashcan, cropped, scanned, fixed, incomplete, damaged, partial, promo, teaser".to_string());
     let exclude_groups_str = sqlx::query_scalar::<_, String>(r#"SELECT value FROM "SystemSetting" WHERE key = 'filter_exclude_groups'"#)
@@ -642,8 +672,14 @@ pub async fn filter_and_score(
     // Normalize ("#1: Book One" -> "#1", "….cbz" -> "…") so a subtitle keyword or a leaked file
     // extension doesn't trip TPB/omnibus detection or get enforced as a required title word.
     let core_query = normalize_request_name(target_query);
-    let clean_original = core_query.replace(&[':', '-', '&'][..], " ")
+    let clean = |s: &str| s.replace(&[':', '-', '&'][..], " ")
         .split_whitespace().collect::<Vec<&str>>().join(" ").to_lowercase();
+    let clean_original = clean(&core_query);
+    // The series words are compared acronym-expanded on both sides (each release title gets the same
+    // treatment below), so "TMNT: The Last Ronin" and "Teenage Mutant Ninja Turtles - The Last Ronin"
+    // name one series. Number, year, edition and variant checks keep the raw name.
+    let expander = AcronymExpander::new(acronyms);
+    let clean_cmp = clean(&expander.expand(&core_query));
 
     let stop_words: HashSet<&str> = ["the", "a", "an", "of", "and", "or", "vol", "volume", "issue", "black", "white", "blood"].into_iter().collect();
 
@@ -658,7 +694,7 @@ pub async fn filter_and_score(
     let pack_terms = ["story arc", "pack", "complete", "collection", "bundle", "run", "chronological"];
     let is_looking_for_annual = clean_original.contains("annual");
 
-    let original_query_words: Vec<String> = clean_original.chars().map(|c| if c.is_alphanumeric() { c } else { ' ' })
+    let original_query_words: Vec<String> = clean_cmp.chars().map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect::<String>().split_whitespace()
         .filter(|&w| !stop_words.contains(w))
         .map(|s| s.to_string()).collect();
@@ -672,7 +708,7 @@ pub async fn filter_and_score(
     // Reverse-guard query words (#202): numeric-inclusive, built by the SAME pipeline as the title
     // side so "Batman '66" requests keep their 66. The match-ratio list above stays alpha-only — its
     // math is deliberately untouched by #202.
-    let reverse_guard_words = guard_query_words(&clean_original);
+    let reverse_guard_words = guard_query_words(&clean_cmp);
 
     // The reverse-guard noise set now lives in reverse_noise_set() (shared with the GetComics filter).
 
@@ -762,15 +798,17 @@ pub async fn filter_and_score(
         // "Vol. 1-9") but still rejects foreign words ("Arkham City Game Spin-Offs"). Applies to
         // Prowlarr (beta.068) AND Anna's Archive — GetComics results run the same guards inside
         // getcomics::search (they bypass this filter via skip_relevance).
+        // Series-word comparisons from here on read the acronym-expanded title.
+        let title_cmp = expander.expand(&title_lower);
         if req_num.is_some() && !reverse_guard_words.is_empty() {
             if !is_pack {
-                let extra = off_series_extra_words(&title_lower, &reverse_guard_words);
+                let extra = off_series_extra_words(&title_cmp, &reverse_guard_words);
                 if !extra.is_empty() {
                     log::debug!("[Automation Debug] Discarding off-series release \"{}\" — extra series words {:?} not in requested \"{}\".", res.title, extra, clean_original);
                     return None;
                 }
             } else {
-                let extra = off_series_pack_extra_words(&title_lower, &reverse_guard_words);
+                let extra = off_series_pack_extra_words(&title_cmp, &reverse_guard_words);
                 if !extra.is_empty() {
                     log::debug!("[Automation Debug] Discarding off-series PACK \"{}\" — extra series words {:?} not in requested \"{}\".", res.title, extra, clean_original);
                     return None;
@@ -780,7 +818,7 @@ pub async fn filter_and_score(
 
         // Core-title match-ratio reverse-validation — Prowlarr only (H-12).
         if !is_ddl && !significant_query_words.is_empty() {
-            let stripped_title = re_brackets_parens_strip().replace_all(&title_lower, "").to_string();
+            let stripped_title = re_brackets_parens_strip().replace_all(&title_cmp, "").to_string();
             let result_words: Vec<String> = stripped_title.chars()
                 .map(|c| if c.is_alphanumeric() { c } else { ' ' })
                 .collect::<String>()
@@ -800,7 +838,7 @@ pub async fn filter_and_score(
             }
         }
         for w in &words_to_enforce {
-            if !w.chars().all(char::is_numeric) && !title_lower.contains(w) { return None; }
+            if !w.chars().all(char::is_numeric) && !title_cmp.contains(w) { return None; }
         }
 
         Some(year_unconfirmed)
@@ -1296,7 +1334,7 @@ mod tests {
     const WRONG_YEAR: &str = "Batman 89 Echoes 003 (1989) (Digital)";
 
     async fn run_filter(pool: &sqlx::AnyPool, results: Vec<ProwlarrResult>) -> Option<ProwlarrResult> {
-        filter_and_score(pool, results, REQ, false, Some("2024".into()), None, false, Some(false))
+        filter_and_score(pool, results, REQ, false, Some("2024".into()), None, false, Some(false), &HashMap::new())
             .await.unwrap()
     }
 
@@ -1365,5 +1403,104 @@ mod tests {
             res_p(high, 50, 0, "torrent"),
         ]).await;
         assert_eq!(got.map(|r| r.title), Some(high.to_string()));
+    }
+
+    // ==== Acronyms on both sides of the Prowlarr relevance filter (the TMNT miss). The request's own
+    // words ("tmnt last ronin 1") made the off-series guard and the match ratio reject a release that
+    // spells the series out. Both sides are compared acronym-expanded now; the year, issue-number and
+    // collected-edition checks still read the raw titles.
+    fn tmnt_acronyms() -> HashMap<String, String> {
+        HashMap::from([("tmnt".to_string(), "teenage mutant ninja turtles".to_string())])
+    }
+
+    async fn run_tmnt(pool: &sqlx::AnyPool, results: Vec<ProwlarrResult>, acronyms: &HashMap<String, String>) -> Option<ProwlarrResult> {
+        filter_and_score(pool, results, "TMNT: The Last Ronin #1", false, Some("2020".into()), None, false, Some(false), acronyms)
+            .await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_acronym_request_keeps_the_release_that_spells_the_name_out() {
+        let pool = mem_pool(&[]).await;
+        let spelled = "Teenage Mutant Ninja Turtles - The Last Ronin 001 (2020) (Digital) (Zone-Empire)";
+
+        let kept = run_tmnt(&pool, vec![res_p(spelled, 5, 0, "torrent")], &tmnt_acronyms()).await;
+        assert_eq!(kept.map(|r| r.title), Some(spelled.to_string()));
+
+        // Without the acronym table nothing is expanded, so the release stays foreign to the request.
+        assert!(run_tmnt(&pool, vec![res_p(spelled, 5, 0, "torrent")], &HashMap::new()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_acronym_never_lets_a_sibling_series_release_through() {
+        let pool = mem_pool(&[]).await;
+        let sibling = "TMNT - Saturday Morning Adventures 001 (2020) (Digital)";
+        assert!(run_tmnt(&pool, vec![res_p(sibling, 5, 0, "torrent")], &tmnt_acronyms()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_spelled_out_request_keeps_the_release_that_uses_the_acronym() {
+        let pool = mem_pool(&[]).await;
+        let short = "TMNT - The Last Ronin 001 (2020) (Digital)";
+        let kept = filter_and_score(&pool, vec![res_p(short, 5, 0, "torrent")], "Teenage Mutant Ninja Turtles: The Last Ronin #1",
+            false, Some("2020".into()), None, false, Some(false), &tmnt_acronyms()).await.unwrap();
+        assert_eq!(kept.map(|r| r.title), Some(short.to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_acronym_request_without_an_issue_number_passes_the_match_ratio() {
+        // No issue number = no off-series guard, so the match ratio is the check that would reject.
+        let pool = mem_pool(&[]).await;
+        let spelled = "Teenage Mutant Ninja Turtles - The Last Ronin (2020) (Digital)";
+        let kept = filter_and_score(&pool, vec![res_p(spelled, 5, 0, "torrent")], "TMNT: The Last Ronin",
+            false, Some("2020".into()), None, false, Some(false), &tmnt_acronyms()).await.unwrap();
+        assert_eq!(kept.map(|r| r.title), Some(spelled.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_spelled_out_request_keeps_an_acronym_release_through_the_match_ratio() {
+        // Bare scene tags (no brackets) are extra words for the ratio; compared raw, "tmnt" matched
+        // nothing and the release fell below it.
+        let pool = mem_pool(&[]).await;
+        let scene = "TMNT - The Last Ronin 2020 Digital Zone-Empire";
+        let kept = filter_and_score(&pool, vec![res_p(scene, 5, 0, "torrent")], "Teenage Mutant Ninja Turtles: The Last Ronin",
+            false, Some("2020".into()), None, false, Some(false), &tmnt_acronyms()).await.unwrap();
+        assert_eq!(kept.map(|r| r.title), Some(scene.to_string()));
+    }
+
+    #[tokio::test]
+    async fn packs_match_across_the_acronym_both_ways() {
+        let pool = mem_pool(&[("allow_bulk_packs", "true")]).await;
+        for (request, pack) in [
+            ("TMNT: The Last Ronin #1", "Teenage Mutant Ninja Turtles - The Last Ronin Complete Collection (2020)"),
+            ("Teenage Mutant Ninja Turtles: The Last Ronin #1", "TMNT - The Last Ronin Complete Collection (2020)"),
+        ] {
+            let kept = filter_and_score(&pool, vec![res_p(pack, 5, 0, "torrent")], request,
+                false, Some("2020".into()), Some("2020".into()), false, None, &tmnt_acronyms()).await.unwrap();
+            assert_eq!(kept.map(|r| r.title), Some(pack.to_string()), "{}", request);
+        }
+    }
+
+    // Characterization: query generation already searched the spelled-out name (the miss was in the
+    // filters); pinned here because it now shares AcronymExpander with them.
+    #[test]
+    fn an_acronym_request_also_searches_the_spelled_out_name() {
+        let queries = generate_search_queries("TMNT: The Last Ronin #1", "2020", &tmnt_acronyms(), false, false);
+        assert!(queries.iter().any(|q| q == "teenage mutant ninja turtles The Last Ronin 1"), "{:?}", queries);
+        assert!(queries.iter().any(|q| q == "teenage mutant ninja turtles 2020"), "{:?}", queries);
+        assert!(queries.iter().any(|q| q == "TMNT The Last Ronin 1"), "{:?}", queries);
+    }
+
+    #[test]
+    fn acronyms_expand_as_whole_words_in_any_case_and_literally() {
+        let table = HashMap::from([
+            ("tmnt".to_string(), "teenage mutant ninja turtles".to_string()),
+            ("ff".to_string(), "future $1 foundation".to_string()),
+            (" ".to_string(), "never".to_string()),
+        ]);
+        let expander = AcronymExpander::new(&table);
+        assert_eq!(expander.expand("TMNT: The Last Ronin"), "teenage mutant ninja turtles: The Last Ronin");
+        assert_eq!(expander.expand("tmntx Tmnt"), "tmntx teenage mutant ninja turtles", "whole words only");
+        assert_eq!(expander.expand("FF 2"), "future $1 foundation 2", "the full name is inserted as written");
+        assert_eq!(AcronymExpander::new(&HashMap::new()).expand("TMNT 1"), "TMNT 1");
     }
 }

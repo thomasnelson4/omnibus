@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { Checkbox } from "@/components/ui/checkbox"
 import { useToast } from "@/components/ui/use-toast"
+import { restoreCompleteToast } from "@/lib/restore-warnings"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
@@ -29,6 +30,7 @@ const DISCORD_EVENTS = [
   { id: "pending_request", label: "Pending Request", desc: "Includes requester username, cover image, and synopsis." },
   { id: "request_approved", label: "Request Approved", desc: "Includes admin username, cover image, and synopsis." },
   { id: "comic_available", label: "Comic Available", desc: "Includes requester username, cover image, and synopsis." },
+  { id: "import_needs_review", label: "Import Needs Review", desc: "Alerts when a download finished but its issue did not reach the library." },
   { id: "download_failed", label: "Comic Download Failed", desc: "Alerts when Prowlarr or the download client fails." },
   { id: "pending_account", label: "Pending Account", desc: "Includes new user's username, email, and registration date." },
   { id: "account_approved", label: "Account Approved", desc: "Alerts when an admin approves a new user account." },
@@ -194,7 +196,9 @@ export default function SetupWizard() {
           const data = await res.json();
 
           if (res.ok) {
-              toast({ title: "Restore Complete", description: "Your server has been fully configured from backup!" });
+              // Folders the server can't use don't stop a restore - it says which ones to fix
+              // (restore-warnings.ts). Client navigation keeps the toast on screen.
+              toast(restoreCompleteToast(data.warnings, "Your server has been fully configured from backup!"));
               router.push('/login');
           } else {
               throw new Error(data.error || "Failed to restore");
@@ -500,7 +504,9 @@ export default function SetupWizard() {
               toast({ title: "Setup Complete!", description: "Welcome to Omnibus." });
               router.push('/login'); 
           } else {
-              toast({ title: "Save Failed", variant: "destructive" });
+              // The server says why (e.g. a library path it can't use - fixed back on Storage).
+              const errData = await res.json().catch(() => null);
+              toast({ title: "Save Failed", description: errData?.error, variant: "destructive" });
           }
       } catch (e) {
           toast({ title: "Error", variant: "destructive" });
@@ -882,6 +888,7 @@ export default function SetupWizard() {
 
                         <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
                             <Label className="uppercase text-xs text-muted-foreground tracking-widest font-bold mb-3 block">Library Folders</Label>
+                            <p className="text-[10px] text-muted-foreground -mt-2 mb-3">Enter each folder as Omnibus sees it. In Docker, use the container side of a volume in your compose file (e.g. /data/comics), not a Windows path like C:\Comics.</p>
                             <div className="space-y-3">
                                 {libraries.map((lib, i) => (
                                     <div key={lib.id} className="p-4 border rounded-lg bg-slate-50 dark:bg-slate-950/50 relative">

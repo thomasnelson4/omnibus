@@ -11,7 +11,8 @@ import { moveFileSafe } from '@/lib/utils/safe-fs';
 import { countArchivePages } from '@/lib/utils/archive-pages';
 import { recordLibraryChange } from '@/lib/komga/changes';
 import { carriedStamp } from '@/lib/file-added';
-import { replaceNamingToken, sanitizeNamingPart } from '@/lib/utils/naming';
+import { issueFileName, issuePaddingFromSetting, issueTitleForName } from '@/lib/utils/naming';
+import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
 
 export async function POST(request: NextRequest) {
     try {
@@ -61,55 +62,25 @@ export async function POST(request: NextRequest) {
         const settings = await prisma.systemSetting.findMany();
         const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
 
-        // 3. Prepare the naming variables
-        const safePublisher = series.publisher ? series.publisher.replace(/[<>:"/\\|?*]/g, '').trim() : "Other";
-        const safeName = series.name ? series.name.replace(/[<>:"/\\|?*]/g, '').trim() : "Unknown Series";
-        const safeYear = series.year ? series.year.toString() : "";
-        const safeImprint = series.imprint ? sanitizeNamingPart(series.imprint) : "";
-        
-        const issueNumStr = targetIssue.number;
-        let formattedNum = issueNumStr;
-        if (issueNumStr && !issueNumStr.includes('.') && issueNumStr.length === 1) {
-            formattedNum = `0${issueNumStr}`;
-        }
-
-        // --- NEW: Calculate Issue Year from the target issue's release date (fallback to Volume Year) ---
-        const issueYear = targetIssue.releaseDate ? targetIssue.releaseDate.toString().split('-')[0] : safeYear;
-
-        // #203 Phase 1: linking a file to an ANNUAL issue names it the Mylar way (engine parity:
-        // renamer.rs ANNUAL_FILE_PATTERN), outranking the manga template.
+        // 3. Name the file with the shared naming rules (src/lib/utils/naming.ts) - the name Standardize
+        //    would give it. #203 Phase 1: an ANNUAL takes the Mylar shape, outranking the manga template.
         const filePatternToUse = (targetIssue as any).isAnnual
-            ? "{Series} Annual #{Issue} ({IssueYear})"
+            ? ANNUAL_FILE_PATTERN
             : series.isManga
                 ? (config.manga_file_naming_pattern || "{Series} Vol. {Issue}")
                 : (config.file_naming_pattern || "{Series} #{Issue}");
-
-        // --- NEW: Add Issue Title extraction & cleanup ---
-        let cleanIssueName = targetIssue.name || "";
-        if (safeName && cleanIssueName.startsWith(`${safeName} #${targetIssue.number}: `)) {
-            cleanIssueName = cleanIssueName.replace(`${safeName} #${targetIssue.number}: `, '');
-        } else if (safeName && cleanIssueName === `${safeName} #${targetIssue.number}`) {
-            cleanIssueName = "";
-        }
-
-        // 4. Generate the new file name (Added {VolumeYear} and {IssueYear} tags)
-        let newFileName = filePatternToUse
-            .replace(/{Publisher}/gi, safePublisher)
-            .replace(/{Series}/gi, safeName)
-            .replace(/{Year}/gi, safeYear)
-            .replace(/{VolumeYear}/gi, safeYear)
-            .replace(/{IssueYear}/gi, issueYear)
-            .replace(/{Issue}/gi, formattedNum || "")
-            .replace(/{IssueTitle}/gi, cleanIssueName.replace(/[<>:"/\\|?*]/g, '').trim()) // <-- ADD THIS
-            .replace(/{UniverseName}/gi, ""); // <-- ADD THIS
-
-        newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-            .replace(/\(\s*\)/g, '')
-            .replace(/\[\s*\]/g, '')
-            .replace(/\s*-\s*-/g, ' - ')
-            .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
-            .replace(/\s+/g, ' ')
-            .trim() + ext;
+        const stem = issueFileName(filePatternToUse, {
+            publisher: series.publisher,
+            series: series.name,
+            seriesYear: series.year,
+            issueNumber: targetIssue.number,
+            releaseDate: targetIssue.releaseDate,
+            issueTitle: issueTitleForName(targetIssue.name, series.name, targetIssue.number),
+            universe: (series as any).universe,
+            seriesGroup: (series as any).seriesGroup,
+            imprint: series.imprint,
+        }, issuePaddingFromSetting(config.issue_number_padding));
+        const newFileName = (stem ?? path.basename(oldFilePath, ext)) + ext;
 
         const newFilePath = path.join(activeFolderPath, newFileName);
         let finalFilePath = newFilePath;

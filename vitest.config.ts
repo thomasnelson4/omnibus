@@ -3,11 +3,16 @@ import tsconfigPaths from 'vite-tsconfig-paths';
 import react from '@vitejs/plugin-react'; // Ensure you have this installed
 
 export default defineConfig({
+  // Node 25+ defines a global `localStorage`, and Vitest's jsdom environment then declines to copy
+  // jsdom's own over it (vitest-dev/vitest#10867) — every jsdom suite sees `localStorage` as
+  // undefined while `sessionStorage` still works. Turning Node's Web Storage off in the workers
+  // restores the DOM implementation.
   plugins: [
     react(), // Required for processing JSX/TSX in components
     tsconfigPaths()
   ],
   test: {
+    execArgv: ['--no-experimental-webstorage'],
     exclude: ['**/node_modules/**', '**/dist/**', '**/.claude/**'],
     // Server-side default (beta.014 test refactor): jsdom is opt-in per file via a
     // `// @vitest-environment jsdom` docblock — only the DOM/component suites need it. Under the

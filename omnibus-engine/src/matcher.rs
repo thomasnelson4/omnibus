@@ -18,6 +18,7 @@
 
 use crate::db::Db;
 use sqlx::Row;
+use std::path::Path;
 
 /// Aggregate result of one sweep pass: the human-readable summary for the JobLog, plus the count
 /// of series the sweep actually matched (drives "only notify when something happened").
@@ -107,35 +108,82 @@ pub async fn record_sweep_result(db: &Db, value: serde_json::Value) {
 /// placeholder metadataId, so without this clause the very next sweep would pick it up and
 /// auto-match it anyway, which is precisely the nagging the state exists to end.
 ///
-/// Stable ordering plus a persisted keyset cursor gives unresolved rows behind the first 100
-/// a turn. Cursor values use the same text cast as ordering on both supported DB backends.
+/// The sweep walks the candidates in "id" order from a cursor (the last id a run handled, kept in
+/// SystemSetting) instead of always taking the oldest 100 by "updatedAt": a row the sweep can't
+/// resolve (left for the admin, or deferred on the budget) is never written back, so with the
+/// oldest-first order the same unresolved 100 came back every run and nothing behind them ever got
+/// a turn. $1 and $2 are both the cursor id (placeholders are never reused, db.rs); NULL starts
+/// from the beginning. A series created behind the cursor waits at most one lap, which is fine for
+/// an hourly job. "updatedAt" isn't read at all: the Any driver has no mapping for Prisma's
+/// DateTime columns.
 pub(crate) fn unmatched_candidates_sql() -> &'static str {
     r#"SELECT id, name, year, "folderPath", CAST("updatedAt" AS TEXT) AS sweep_updated_at FROM "Series"
        WHERE ("matchState" IS NULL OR "matchState" <> 'IGNORED')
          AND ("matchState" = 'UNMATCHED' OR "metadataId" IS NULL OR "metadataId" LIKE 'unmatched%')
-       ORDER BY CAST("updatedAt" AS TEXT) ASC, "id" ASC LIMIT 100"#
+         AND ($1 IS NULL OR "id" > $2)
+       ORDER BY "id" ASC LIMIT 100"#
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct SweepCursor {
-    updated_at: String,
-    id: String,
+const SWEEP_PAGE: usize = 100;
+const SWEEP_CURSOR_KEY: &str = "unmatched_sweep_cursor";
+
+async fn get_sweep_cursor(db: &Db) -> Option<String> {
+    sqlx::query_scalar(r#"SELECT value FROM "SystemSetting" WHERE key = $1"#)
+        .bind(SWEEP_CURSOR_KEY)
+        .fetch_optional(&db.pool)
+        .await
+        .ok()
+        .flatten()
 }
 
-async fn sweep_candidates(db: &Db) -> anyhow::Result<Vec<sqlx::any::AnyRow>> {
-    let cursor = sqlx::query_scalar::<_, String>(
-        r#"SELECT value FROM "SystemSetting" WHERE key = 'unmatched_sweep_cursor'"#,
-    ).fetch_optional(&db.pool).await?.and_then(|s| serde_json::from_str::<SweepCursor>(&s).ok());
-    if let Some(cursor) = cursor {
-        let sql = unmatched_candidates_sql().replace("ORDER BY", r#"AND (
-            CAST("updatedAt" AS TEXT) > $1 OR
-            (CAST("updatedAt" AS TEXT) = $1 AND id > $2)) ORDER BY"#);
-        let rows = sqlx::query(&sql).bind(cursor.updated_at).bind(cursor.id)
-            .fetch_all(&db.pool).await?;
-        if !rows.is_empty() { return Ok(rows); }
+async fn set_sweep_cursor(db: &Db, id: &str) {
+    if let Err(e) = sqlx::query(
+        r#"INSERT INTO "SystemSetting" (key, value) VALUES ($1, $2)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#,
+    )
+    .bind(SWEEP_CURSOR_KEY)
+    .bind(id)
+    .execute(&db.pool)
+    .await
+    {
+        log::warn!("[Matcher] Could not persist the sweep cursor: {:?}", e);
     }
-    // At the end (or after deletions), wrap so earlier unresolved/new rows are retried too.
-    Ok(sqlx::query(unmatched_candidates_sql()).fetch_all(&db.pool).await?)
+}
+
+/// The end of the unmatched set was reached: the next run wraps back to the start.
+async fn clear_sweep_cursor(db: &Db) {
+    let _ = sqlx::query(r#"DELETE FROM "SystemSetting" WHERE key = $1"#)
+        .bind(SWEEP_CURSOR_KEY)
+        .execute(&db.pool)
+        .await;
+}
+
+async fn fetch_unmatched_candidates(db: &Db, cursor: Option<&str>) -> anyhow::Result<Vec<sqlx::any::AnyRow>> {
+    Ok(sqlx::query(unmatched_candidates_sql())
+        .bind(cursor)
+        .bind(cursor)
+        .fetch_all(&db.pool)
+        .await?)
+}
+
+#[derive(Debug, PartialEq)]
+enum CursorMove {
+    Keep,
+    Set(String),
+    Clear,
+}
+
+/// Where the cursor goes after a run over `page_ids`. It parks on the last row the run actually
+/// handled: a row deferred on the budget (or by a 429) and everything after it come first next run
+/// rather than waiting a full lap. Only a page handled to the end moves on, and a short page means
+/// the end of the set was reached, so the next run wraps.
+fn next_sweep_cursor(page_ids: &[String], first_deferred: Option<usize>) -> CursorMove {
+    match first_deferred {
+        Some(0) => CursorMove::Keep,
+        Some(i) => CursorMove::Set(page_ids[i - 1].clone()),
+        None if page_ids.len() < SWEEP_PAGE => CursorMove::Clear,
+        None => page_ids.last().map(|id| CursorMove::Set(id.clone())).unwrap_or(CursorMove::Clear),
+    }
 }
 
 pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
@@ -146,6 +194,7 @@ pub async fn run_unmatched_sweep(db: Db) -> anyhow::Result<SweepOutcome> {
     run_unmatched_sweep_at(db, service.as_ref()).await
 }
 
+/// The sweep with an explicit service binding, so tests never reach a guessed localhost endpoint.
 async fn run_unmatched_sweep_at(db: Db, service: Option<&MatchService>) -> anyhow::Result<SweepOutcome> {
     let get_setting = |key: &'static str| {
         let pool = db.pool.clone();
@@ -168,9 +217,21 @@ async fn run_unmatched_sweep_at(db: Db, service: Option<&MatchService>) -> anyho
         })).await;
         return Ok(SweepOutcome { summary: msg, matched: 0 });
     }
+    let threshold = get_setting("matcher_auto_threshold").await
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.90)
+        .clamp(0.5, 1.0);
+    let cv_key = crate::secret_crypto::decrypt_setting(&db.pool, get_setting("cv_api_key").await).await
+        .filter(|k| !k.trim().is_empty());
 
-
-    let rows = sweep_candidates(&db).await?;
+    let cursor = get_sweep_cursor(&db).await;
+    let mut rows = fetch_unmatched_candidates(&db, cursor.as_deref()).await?;
+    // The cursor was sitting at (or past) the end of the set — wrap back to the start rather than
+    // reporting "nothing to do" for the rest of this run just because of where we'd gotten to.
+    if rows.is_empty() && cursor.is_some() {
+        clear_sweep_cursor(&db).await;
+        rows = fetch_unmatched_candidates(&db, None).await?;
+    }
 
     let total = rows.len();
     if total == 0 {
@@ -191,64 +252,175 @@ async fn run_unmatched_sweep_at(db: Db, service: Option<&MatchService>) -> anyho
     let mut deferred = 0usize; // budget hit — retried automatically next run
     let mut searches_this_run = 0usize;
     let mut audit: Vec<SweepAudit> = Vec::new(); // Tier-2 history, flushed after the pass
+    let search_allowed = matches!(mode.as_str(), "trust" | "auto") && cv_key.is_some();
+    let mut first_deferred: Option<usize> = None;
 
-    let mut last_attempted = None;
-
-    for (index, row) in rows.iter().enumerate() {
-        if searches_this_run >= 30 {
-            // Budget spent before this row was examined: the cursor stays on the previous row so
-            // the next run resumes exactly here, and every remaining row counts as deferred.
-            deferred += total - index;
-            break;
-        }
+    for (idx, row) in rows.iter().enumerate() {
         let sid: String = row.get("id");
-        last_attempted = Some(SweepCursor {
-            updated_at: row.get("sweep_updated_at"), id: sid.clone(),
-        });
         let name: String = row.get("name");
-        let remaining = 30 - searches_this_run;
-        let response = request_decision(&client, &sid, remaining.min(16), None, service).await;
-        match response {
-            Ok(decision) => {
-                searches_this_run += decision.requests;
-                if matches!(decision.status.as_str(), "rate_limited" | "deferred") {
-                    deferred += 1;
-                    break;
+        let year: i32 = row.try_get("year").unwrap_or(0);
+        let folder: String = row.try_get("folderPath").unwrap_or_default();
+
+        let calls = crate::api_usage::cv_calls_last_hour(&db.pool).await;
+        let allow_api = !budget_exhausted(calls, 200, 30);
+
+        // 1. Free file evidence (series.json / ComicInfo — incl. files tagged after the original
+        //    scan, and libraries scanned by builds that predate the file-evidence readers).
+        if !folder.trim().is_empty() {
+            if let Some((source, id, cv_id, metron_id)) =
+                crate::scanner::folder_match_evidence(&db, &client, Path::new(&folder), allow_api).await
+            {
+                if apply_match(&db, &sid, &name, &source, &id, cv_id, metron_id, None).await {
+                    by_file += 1;
+                    audit.push(SweepAudit {
+                        related_item: name.clone(),
+                        status: "COMPLETED",
+                        message: format!("Matched from embedded file metadata → {} id {} (zero API cost).", source, id),
+                    });
+                } else {
+                    for_admin += 1; // id collision with another series — needs a human
+                    audit.push(SweepAudit {
+                        related_item: name.clone(),
+                        status: "FAILED",
+                        message: format!(
+                            "File metadata resolves to {} id {}, but it could not be applied (usually another series already holds that id) — left for the Smart Matcher.",
+                            source, id
+                        ),
+                    });
                 }
-                if let Some((source, id)) = accepted_identity(&decision, remaining) {
-                    // Re-read server-owned source/settings fingerprints immediately before apply.
-                    let fresh = request_decision(&client, &sid, 0, Some(&decision.fingerprint), service).await;
-                    if !matches!(fresh, Ok(ref d) if d.fingerprint == decision.fingerprint && accepted_identity(d, remaining).is_some()) {
-                        for_admin += 1;
-                        continue;
+                continue;
+            }
+        }
+
+        // 2. The shared Smart Match service, when the deployment has one: Node owns the matching
+        //    algorithms (evidence pipeline), and the engine only transports the versioned contract
+        //    and applies a fresh, server-authorized identity. A deployment without the service
+        //    keeps the in-engine provider search below.
+        if let Some(service) = service {
+            if searches_this_run >= 30 {
+                deferred += 1;
+                first_deferred.get_or_insert(idx);
+                continue;
+            }
+            let remaining = (30 - searches_this_run).min(16);
+            match request_decision(&client, &sid, remaining, None, Some(service)).await {
+                Ok(decision) => {
+                    searches_this_run += decision.requests.min(remaining);
+                    if matches!(decision.status.as_str(), "rate_limited" | "deferred") {
+                        // The service is out of budget, not this row's fault: everything from here
+                        // waits for the next run, and the cursor must not advance past it.
+                        deferred += 1;
+                        first_deferred.get_or_insert(idx);
+                        break;
                     }
-                    let embedded = decision.candidates.iter().any(|c| c.exact);
-                    let cv_id = if source == "COMICVINE" { id.parse().ok() } else { None };
-                    let metron_id = if source == "METRON" { id.parse().ok() } else { None };
-                    if apply_match(&db, &sid, &name, &source, &id, cv_id, metron_id, &row.get::<String, _>("sweep_updated_at")).await {
-                        if embedded { by_file += 1; } else { by_search += 1; }
-                        audit.push(SweepAudit { related_item: name, status: "COMPLETED",
-                            message: format!("Matched by shared evidence pipeline → {source} id {id}: {}", decision.reasons.join("; ")) });
+                    if let Some((source, id)) = accepted_identity(&decision, remaining) {
+                        // Re-read the server-owned fingerprint immediately before the write: a
+                        // settings/source change between decision and apply invalidates it.
+                        let fresh = request_decision(&client, &sid, 0, Some(&decision.fingerprint), Some(service)).await;
+                        if !matches!(fresh, Ok(ref d) if d.fingerprint == decision.fingerprint && accepted_identity(d, remaining).is_some()) {
+                            for_admin += 1;
+                            continue;
+                        }
+                        let embedded = decision.candidates.iter().any(|c| c.exact);
+                        let cv_id = if source == "COMICVINE" { id.parse().ok() } else { None };
+                        let metron_id = if source == "METRON" { id.parse().ok() } else { None };
+                        let stamp: String = row.try_get("sweep_updated_at").unwrap_or_default();
+                        if apply_match(&db, &sid, &name, &source, &id, cv_id, metron_id, Some(&stamp)).await {
+                            if embedded { by_file += 1; } else { by_search += 1; }
+                            audit.push(SweepAudit {
+                                related_item: name.clone(),
+                                status: "COMPLETED",
+                                message: format!("Matched by the shared evidence pipeline → {source} id {id}: {}", decision.reasons.join("; ")),
+                            });
+                        } else {
+                            for_admin += 1;
+                            audit.push(SweepAudit {
+                                related_item: name.clone(),
+                                status: "FAILED",
+                                message: "A validated match could not be applied (id collision, or the row changed/was locked first) — left for admin review.".to_string(),
+                            });
+                        }
                     } else {
                         for_admin += 1;
-                        audit.push(SweepAudit { related_item: name, status: "FAILED",
-                            message: "Validated match could not be applied (collision or changed/locked source); left for admin review.".to_string() });
                     }
-                } else { for_admin += 1; }
+                }
+                Err(e) => {
+                    // Without a decision there is nothing trustworthy to apply; retry next run.
+                    log::warn!("[Matcher] Shared matching service unavailable: {e}; leaving series unchanged.");
+                    deferred += 1;
+                    first_deferred.get_or_insert(idx);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // 3. Provider name-search, only under an auto-accepting confidence mode.
+        if !search_allowed {
+            for_admin += 1;
+            continue;
+        }
+        if !allow_api || searches_this_run >= 30 {
+            deferred += 1;
+            first_deferred.get_or_insert(idx);
+            continue;
+        }
+        searches_this_run += 1;
+        match cv_search_best(&db, &client, cv_key.as_deref().unwrap_or(""), &name, year).await {
+            Ok(Some((vol_id, vol_name, start_year))) => {
+                let sim = name_similarity(&name, &vol_name);
+                let year_matches = year > 0 && start_year.map(|sy| (sy - year).abs() <= 1).unwrap_or(false);
+                if auto_accept(&mode, sim, year_matches, threshold) {
+                    if apply_match(&db, &sid, &name, "COMICVINE", &vol_id.to_string(), Some(vol_id), None, None).await {
+                        log::info!("[Matcher] Auto-matched \"{}\" -> CV volume {} (\"{}\" sim {:.2}, year ok: {}).", name, vol_id, vol_name, sim, year_matches);
+                        by_search += 1;
+                        audit.push(SweepAudit {
+                            related_item: name.clone(),
+                            status: "COMPLETED",
+                            message: format!(
+                                "Auto-matched by search → ComicVine volume {} \"{}\" (similarity {:.2}, year {}, mode {}).",
+                                vol_id, vol_name, sim, if year_matches { "agrees" } else { "unconfirmed" }, mode
+                            ),
+                        });
+                    } else {
+                        for_admin += 1;
+                        audit.push(SweepAudit {
+                            related_item: name.clone(),
+                            status: "FAILED",
+                            message: format!(
+                                "Search found ComicVine volume {} \"{}\" (similarity {:.2}), but it could not be applied (usually another series already holds that id) — left for the Smart Matcher.",
+                                vol_id, vol_name, sim
+                            ),
+                        });
+                    }
+                } else {
+                    log::debug!("[Matcher Debug] Best CV candidate for \"{}\" was \"{}\" (sim {:.2}, year ok: {}) — below the {} bar; leaving for the Smart Matcher.", name, vol_name, sim, year_matches, mode);
+                    for_admin += 1;
+                }
+            }
+            Ok(None) => {
+                for_admin += 1;
             }
             Err(e) => {
-                log::warn!("[Matcher] Shared matching service unavailable: {e}; leaving series unchanged.");
-                deferred += 1;
-                break;
+                let msg = e.to_string();
+                if msg.contains("429") {
+                    log::warn!("[Matcher] ComicVine rate-limited mid-sweep — halting; remaining series retry next run.");
+                    deferred += 1;
+                    first_deferred.get_or_insert(idx);
+                    break;
+                }
+                log::warn!("[Matcher] CV search failed for \"{}\": {} — leaving for the Smart Matcher.", name, msg);
+                for_admin += 1;
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
     }
 
-    // Advance only to the last row examined, never past rows skipped by a rate-limit break.
-    if let Some(cursor) = last_attempted {
-        sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ('unmatched_sweep_cursor', $1)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#)
-            .bind(serde_json::to_string(&cursor)?).execute(&db.pool).await?;
+    let page_ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
+    match next_sweep_cursor(&page_ids, first_deferred) {
+        CursorMove::Keep => {}
+        CursorMove::Set(id) => set_sweep_cursor(&db, &id).await,
+        CursorMove::Clear => clear_sweep_cursor(&db).await,
     }
 
     // Tier-2 history lands before the summary so Job History shows the per-series rows the
@@ -273,8 +445,14 @@ async fn run_unmatched_sweep_at(db: Db, service: Option<&MatchService>) -> anyho
 
 /// Applies a match, guarding the (metadataSource, metadataId) unique — a second series already
 /// holding the id is a duplicate the admin must merge, not something to clobber.
+/// Applies a match, guarding the (metadataSource, metadataId) unique — a second series already
+/// holding the id is a duplicate the admin must merge, not something to clobber.
+///
+/// `expected_updated_at` adds the shared-service CAS: the decision was made over an earlier read,
+/// so the row must still be untouched (`updatedAt` unchanged), still unlocked
+/// (`hasCustomMetadata = false`) and still unmatched/IGNORED-free or the write is refused.
 #[allow(clippy::too_many_arguments)]
-async fn apply_match(db: &Db, series_id: &str, series_name: &str, source: &str, id: &str, cv_id: Option<i32>, metron_id: Option<i32>, updated_at: &str) -> bool {
+async fn apply_match(db: &Db, series_id: &str, series_name: &str, source: &str, id: &str, cv_id: Option<i32>, metron_id: Option<i32>, expected_updated_at: Option<&str>) -> bool {
     let taken: Option<String> = sqlx::query_scalar(
         r#"SELECT id FROM "Series" WHERE "metadataSource" = $1 AND "metadataId" = $2 AND id <> $3"#,
     )
@@ -287,22 +465,31 @@ async fn apply_match(db: &Db, series_id: &str, series_name: &str, source: &str, 
         log::warn!("[Matcher] \"{}\" resolves to {} id {}, but another series already holds it — leaving unmatched for admin review.", series_name, source, id);
         return false;
     }
-    match sqlx::query(
-        r#"UPDATE "Series" SET "metadataId" = $1, "metadataSource" = $2, "matchState" = 'MATCHED',
-           "cvId" = COALESCE($3, "cvId"), "metronId" = COALESCE($4, "metronId") WHERE id = $5
-           AND CAST("updatedAt" AS TEXT) = $6 AND "hasCustomMetadata" = false
+    // A decision made over an earlier read is only valid while the row is untouched and still a
+    // candidate: same "updatedAt", unlocked, not IGNORED, still unmatched/placeholder.
+    const CAS_GUARD: &str = r#" AND CAST("updatedAt" AS TEXT) = $6 AND "hasCustomMetadata" = false
            AND ("matchState" IS NULL OR "matchState" <> 'IGNORED')
-           AND ("matchState" = 'UNMATCHED' OR "metadataId" IS NULL OR "metadataId" LIKE 'unmatched%')"#,
-    )
-    .bind(id).bind(source).bind(cv_id).bind(metron_id).bind(series_id).bind(updated_at)
-    .execute(&db.pool)
-    .await
-    {
-        Ok(result) if result.rows_affected() == 1 => {
-            log::info!("[Matcher] Matched \"{}\" -> {} id {} from embedded file metadata.", series_name, source, id);
+           AND ("matchState" = 'UNMATCHED' OR "metadataId" IS NULL OR "metadataId" LIKE 'unmatched%')"#;
+    let sql = format!(
+        r#"UPDATE "Series" SET "metadataId" = $1, "metadataSource" = $2, "matchState" = 'MATCHED',
+           "cvId" = COALESCE($3, "cvId"), "metronId" = COALESCE($4, "metronId") WHERE id = $5{}"#,
+        if expected_updated_at.is_some() { CAS_GUARD } else { "" }
+    );
+    let query = sqlx::query(&sql)
+        .bind(id).bind(source).bind(cv_id).bind(metron_id).bind(series_id);
+    let result = match expected_updated_at {
+        Some(stamp) => query.bind(stamp).execute(&db.pool).await,
+        None => query.execute(&db.pool).await,
+    };
+    match result {
+        Ok(done) if done.rows_affected() == 1 => {
+            log::info!("[Matcher] Matched \"{}\" -> {} id {}.", series_name, source, id);
             true
         }
-        Ok(_) => false,
+        Ok(_) => {
+            log::warn!("[Matcher] \"{}\" changed or was locked between decision and write; leaving it for admin review.", series_name);
+            false
+        }
         Err(e) => {
             log::error!("[Matcher] Failed to apply match for \"{}\": {:?}", series_name, e);
             false
@@ -310,8 +497,126 @@ async fn apply_match(db: &Db, series_id: &str, series_name: &str, source: &str, 
     }
 }
 
-// Matching algorithms live in Node's pure smart-match modules. Rust only transports the
-// versioned contract and applies a fresh, server-authorized identity without moving files.
+/// Best ComicVine volume candidate for a series name: one /search/ call, results ranked by
+/// name_similarity plus the year term (see pick_best). Returns (volume_id, volume_name, start_year).
+async fn cv_search_best(db: &Db, client: &reqwest::Client, api_key: &str, name: &str, year: i32) -> anyhow::Result<Option<(i32, String, Option<i32>)>> {
+    let req = client
+        .get("https://comicvine.gamespot.com/api/search/")
+        .query(&[
+            ("api_key", api_key),
+            ("format", "json"),
+            ("query", name),
+            ("resources", "volume"),
+            ("limit", "10"),
+            ("field_list", "id,name,start_year"),
+        ])
+        .header("User-Agent", "Omnibus/1.0")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let full_url = req.url().to_string();
+
+    // Shared response cache: a hit costs zero budget, so a cached sweep re-run is free.
+    let json: serde_json::Value = match crate::metadata_cache::get(db, "comicvine", &full_url).await {
+        Some(hit) => hit,
+        None => {
+            let resp = client.execute(req).await?;
+            crate::api_usage::log(&db.pool, "comicvine", "https://comicvine.gamespot.com/api/search/").await;
+            if crate::metadata::is_cv_rate_limited(resp.status()) {
+                crate::metadata::mark_flag(db, "cv_rate_limit_time").await;
+                anyhow::bail!("ComicVine rate limited (429/420) on matcher search");
+            }
+            let j: serde_json::Value = resp.json().await?;
+            crate::metadata_cache::put(db, "comicvine", &full_url, &j).await;
+            j
+        }
+    };
+    let results = json["results"].as_array().cloned().unwrap_or_default();
+    let candidates: Vec<(i32, String, Option<i32>)> = results.iter().filter_map(|r| {
+        let id = r["id"].as_i64().map(|v| v as i32)?;
+        let vol_name = r["name"].as_str().unwrap_or("").to_string();
+        if vol_name.is_empty() { return None; }
+        let start_year = r["start_year"].as_str().and_then(|s| s.trim().parse::<i32>().ok())
+            .or_else(|| r["start_year"].as_i64().map(|v| v as i32));
+        Some((id, vol_name, start_year))
+    }).collect();
+    Ok(pick_best(name, year, candidates))
+}
+
+/// The year's contribution to a candidate's score — a tiebreaker-plus, deliberately small next to
+/// a full-name match: exact +0.10, off by one +0.05 (ComicVine's start_year and a folder's year
+/// disagree by one all the time), further off −0.05, either side unknown 0. EXACT twin of
+/// smart-match-search.ts yearTerm: the sweep and the Smart Matcher must rank identically, or the
+/// sweep would auto-match what the UI would reject.
+///
+/// The magnitudes keep the year's whole reach (0.15) under a one-token name difference on a
+/// two-token name (0.2), so a folder whose year is wrong by three still resolves to the exact name
+/// rather than a same-year near-miss such as its own annual.
+pub(crate) fn year_term(candidate_year: Option<i32>, wanted_year: i32) -> f64 {
+    let Some(cy) = candidate_year.filter(|y| *y > 0) else { return 0.0 };
+    if wanted_year <= 0 { return 0.0; }
+    match (cy - wanted_year).abs() {
+        0 => 0.10,
+        1 => 0.05,
+        _ => -0.05,
+    }
+}
+
+/// Pure ranking over already-parsed candidates (id, name, start_year): the name dominates unless
+/// names tie, and then the year decides. Extracted from cv_search_best so it can be tested without
+/// HTTP. Ties keep the provider's order (stable: only a strictly better score replaces the best).
+pub(crate) fn pick_best(name: &str, year: i32, candidates: Vec<(i32, String, Option<i32>)>) -> Option<(i32, String, Option<i32>)> {
+    let mut best: Option<(i32, String, Option<i32>, f64)> = None;
+    for (id, vol_name, start_year) in candidates {
+        let score = name_similarity(name, &vol_name) + year_term(start_year, year);
+        if best.as_ref().map(|(_, _, _, b)| score > *b).unwrap_or(true) {
+            best = Some((id, vol_name, start_year, score));
+        }
+    }
+    best.map(|(id, n, y, _)| (id, n, y))
+}
+
+/// Name similarity in [0, 1]: case-insensitive token Dice coefficient over alphanumeric words.
+/// Symbols fold to spaces, so "Hack/Slash" == "Hack Slash" == "hack slash" (the slash-title case
+/// from discussion #177). Token-based, order-insensitive.
+pub(crate) fn name_similarity(a: &str, b: &str) -> f64 {
+    let tokens = |s: &str| -> Vec<String> {
+        s.to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect::<String>()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let ta = tokens(a);
+    let tb = tokens(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let common = ta.iter().filter(|t| tb.contains(t)).count();
+    (2.0 * common as f64) / (ta.len() + tb.len()) as f64
+}
+
+/// The confidence policy: should a name-search candidate be applied WITHOUT admin confirmation?
+pub(crate) fn auto_accept(mode: &str, similarity: f64, year_matches: bool, threshold: f64) -> bool {
+    match mode {
+        "trust" => similarity >= threshold,
+        "auto" => similarity >= 0.97 && year_matches,
+        _ => false, // confirm / custom / unknown: never auto-apply a guess
+    }
+}
+
+/// True when the sweep should stop searching to protect the ComicVine budget: calls made in the
+/// rolling window have reached `limit - reserve`. Counting is shared with the health check's
+/// cv_api_usage accounting.
+pub(crate) fn budget_exhausted(calls_last_window: usize, limit: usize, reserve: usize) -> bool {
+    calls_last_window + reserve >= limit
+}
+
+
+// Matching algorithms live in Node's pure smart-match modules (src/lib/smart-match/*). Rust only
+// transports the versioned contract and applies a fresh, server-authorized identity without moving
+// files — the same contract the fork and the shared service have always spoken.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MatchDecision {
@@ -329,12 +634,21 @@ struct MatchDecision {
     #[serde(default)]
     reasons: Vec<String>,
 }
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MatchIdentity { id: String, metadata_source: String }
-#[derive(serde::Deserialize)]
-struct MatchCandidate { #[serde(default)] exact: bool }
 
+#[derive(serde::Deserialize)]
+struct MatchCandidate {
+    /// True when the evidence came from the file itself (series.json/ComicInfo), not a search.
+    #[serde(default)]
+    exact: bool,
+}
+
+/// The subset of a decision the engine is allowed to act on. Deliberately strict: an unknown
+/// algorithm version, a stale/absent fingerprint, a low-confidence verdict, an over-budget request
+/// or a non-numeric provider id are all refusals, never "best effort" applies.
 fn accepted_identity(decision: &MatchDecision, remaining: usize) -> Option<(String, String)> {
     if !decision.safe_to_accept || !decision.auto_accept || decision.status != "high"
         || decision.confidence != "high" || decision.algorithm_version != "evidence-1"
@@ -347,10 +661,11 @@ fn accepted_identity(decision: &MatchDecision, remaining: usize) -> Option<(Stri
     Some((selected.metadata_source.clone(), selected.id.clone()))
 }
 
+/// Where the shared matching service lives. Only ever built from the deployment environment (see
+/// `run_unmatched_sweep`), never guessed inside a test.
 struct MatchService { url: String, secret: String }
 
 async fn request_decision(client: &reqwest::Client, series_id: &str, max_requests: usize, expected: Option<&str>, service: Option<&MatchService>) -> anyhow::Result<MatchDecision> {
-    // Respect the shared deployment boundary; never guess a localhost service in pure tests.
     let service = service.ok_or_else(|| anyhow::anyhow!("Shared matching URL/secret is not configured"))?;
     let url = format!("{}/api/internal/smart-match", service.url.trim_end_matches('/'));
     let response = client.post(url).header("X-Internal-Secret", &service.secret)
@@ -360,79 +675,9 @@ async fn request_decision(client: &reqwest::Client, series_id: &str, max_request
     Ok(response.json().await?)
 }
 
-/// True when the sweep should stop searching to protect the ComicVine budget: calls made in the
-/// rolling window have reached `limit - reserve`. Counting is shared with the health check's
-/// cv_api_usage accounting.
-#[allow(dead_code)] // only the test module calls this after the fork reworked the sweep flow
-pub(crate) fn budget_exhausted(calls_last_window: usize, limit: usize, reserve: usize) -> bool {
-    calls_last_window + reserve >= limit
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn unresolved_sweep_advances_through_tied_backlog_and_wraps() {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1)
-            .connect("sqlite::memory:").await.unwrap();
-        let db = Db { pool, dialect: crate::db::Dialect::Sqlite };
-        sqlx::query(r#"CREATE TABLE "SystemSetting" (key TEXT PRIMARY KEY, value TEXT NOT NULL)"#)
-            .execute(&db.pool).await.unwrap();
-        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, year INTEGER,
-            "folderPath" TEXT, "matchState" TEXT, "metadataId" TEXT, "updatedAt" INTEGER)"#)
-            .execute(&db.pool).await.unwrap();
-        for i in 1..=150 {
-            sqlx::query(r#"INSERT INTO "Series" VALUES ($1, 'Unmatched', 2024, '', 'UNMATCHED', NULL, 1000)"#)
-                .bind(format!("s{i:03}")).execute(&db.pool).await.unwrap();
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let service = MatchService { url: format!("http://{}", listener.local_addr().unwrap()), secret: "fixture-secret".to_string() };
-        let router = axum::Router::new().route("/api/internal/smart-match", axum::routing::post(|| async {
-            axum::Json(serde_json::json!({ "status": "medium", "confidence": "medium", "autoAccept": false,
-                "safeToAccept": false, "fingerprint": "a".repeat(64), "algorithmVersion": "evidence-1", "requests": 0, "selected": null }))
-        }));
-        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
-        let first = run_unmatched_sweep_at(db.clone(), Some(&service)).await.unwrap();
-        assert_eq!(first.matched, 0);
-        assert!(first.summary.contains("100 left for the Smart Matcher"));
-        let next = sweep_candidates(&db).await.unwrap();
-        assert_eq!(next.len(), 50);
-        assert_eq!(next[0].get::<String, _>("id"), "s101");
-        run_unmatched_sweep_at(db.clone(), Some(&service)).await.unwrap();
-        let wrapped = sweep_candidates(&db).await.unwrap();
-        assert_eq!(wrapped[0].get::<String, _>("id"), "s001");
-        // A malformed cursor from an older build must not prevent a fresh pass.
-        sqlx::query(r#"UPDATE "SystemSetting" SET value = 'invalid' WHERE key = 'unmatched_sweep_cursor'"#)
-            .execute(&db.pool).await.unwrap();
-        assert_eq!(sweep_candidates(&db).await.unwrap().len(), 100);
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn applying_shared_decision_guards_changed_ignored_locked_and_colliding_rows() {
-        sqlx::any::install_default_drivers();
-        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
-        let db = Db { pool, dialect: crate::db::Dialect::Sqlite };
-        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, "metadataSource" TEXT, "metadataId" TEXT,
-            "matchState" TEXT, "cvId" INTEGER, "metronId" INTEGER, "updatedAt" TEXT, "hasCustomMetadata" BOOLEAN)"#)
-            .execute(&db.pool).await.unwrap();
-        for (sid, state, locked, metadata) in [("ok", "UNMATCHED", false, None), ("ignored", "IGNORED", false, None),
-            ("locked", "UNMATCHED", true, None), ("changed", "UNMATCHED", false, None), ("taken", "MATCHED", false, Some("99"))] {
-            sqlx::query(r#"INSERT INTO "Series" VALUES ($1,'COMICVINE',$2,$3,NULL,NULL,'1000',$4)"#)
-                .bind(sid).bind(metadata).bind(state).bind(locked).execute(&db.pool).await.unwrap();
-        }
-        for (sid, stamp, target) in [("ignored", "1000", "1"), ("locked", "1000", "1"), ("changed", "999", "1"), ("ok", "1000", "99")] {
-            assert!(!apply_match(&db, sid, "Batman", "COMICVINE", target, Some(1), None, stamp).await);
-        }
-        assert!(apply_match(&db, "ok", "Batman", "METRON", "7", None, Some(7), "1000").await);
-        let row = sqlx::query(r#"SELECT "metadataSource", "metadataId", "matchState" FROM "Series" WHERE id='ok'"#).fetch_one(&db.pool).await.unwrap();
-        assert_eq!(row.get::<String, _>("metadataSource"), "METRON");
-        assert_eq!(row.get::<String, _>("metadataId"), "7");
-        assert_eq!(row.get::<String, _>("matchState"), "MATCHED");
-        assert!(!apply_match(&db, "ok", "Batman", "METRON", "8", None, Some(8), "1000").await);
-    }
 
     /// The sweep must leave IGNORED series alone — they still carry a null/placeholder metadataId,
     /// so the pre-IGNORED query would have re-offered them on every run (field report from
@@ -447,9 +692,10 @@ mod tests {
         let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
         let db = crate::db::Db::connect(&db_url, 2).await.expect("connect file-backed sqlite");
 
+        // "updatedAt" as Prisma creates it on SQLite: DATETIME holding INTEGER epoch-ms.
         sqlx::query(
             r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, year INTEGER, "folderPath" TEXT,
-               "matchState" TEXT, "metadataId" TEXT, "updatedAt" TEXT)"#,
+               "matchState" TEXT, "metadataId" TEXT, "updatedAt" DATETIME NOT NULL)"#,
         )
         .execute(&db.pool).await.expect("create schema");
 
@@ -460,7 +706,7 @@ mod tests {
             ("s_ignored", Some("IGNORED"), None),                       // hand-curated: leave it alone
             ("s_matched", Some("MATCHED"), Some("42821")),
         ] {
-            sqlx::query(r#"INSERT INTO "Series" (id, name, year, "folderPath", "matchState", "metadataId", "updatedAt") VALUES ($1, $1, 2024, '/c', $2, $3, '2026-08-27')"#)
+            sqlx::query(r#"INSERT INTO "Series" (id, name, year, "folderPath", "matchState", "metadataId", "updatedAt") VALUES ($1, $1, 2024, '/c', $2, $3, 1787961600000)"#)
                 .bind(id).bind(state).bind(meta)
                 .execute(&db.pool).await.expect("seed series");
         }
@@ -474,19 +720,153 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn shared_contract_refuses_unsafe_old_and_over_budget_decisions() {
-        let valid = serde_json::json!({ "status": "high", "confidence": "high", "safeToAccept": true,
-            "autoAccept": true, "fingerprint": "a".repeat(64), "algorithmVersion": "evidence-1", "requests": 2,
-            "selected": { "id": "123", "metadataSource": "METRON" } });
-        let parse = |v| serde_json::from_value::<MatchDecision>(v).unwrap();
-        assert_eq!(accepted_identity(&parse(valid.clone()), 30), Some(("METRON".to_string(), "123".to_string())));
-        for (field, value) in [("status", serde_json::json!("ambiguous")), ("safeToAccept", serde_json::json!(false)),
-            ("algorithmVersion", serde_json::json!("legacy")), ("requests", serde_json::json!(31))] {
-            let mut invalid = valid.clone(); invalid[field] = value;
-            assert!(accepted_identity(&parse(invalid), 30).is_none());
+    async fn sweep_fixture(tag: &str, mode: &str, rows: usize) -> (crate::db::Db, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("omnibus_matchsweep_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create fixture dir");
+        let db_file = base.join("sweep.db");
+        std::fs::File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = crate::db::Db::connect(&db_url, 2).await.expect("connect file-backed sqlite");
+        // "updatedAt" as Prisma creates it on SQLite: DATETIME holding INTEGER epoch-ms. A fixture
+        // with a TEXT column and ISO strings hid that the Any driver can't read this column at all.
+        sqlx::query(
+            r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, year INTEGER, "folderPath" TEXT,
+               "matchState" TEXT, "metadataId" TEXT, "updatedAt" DATETIME NOT NULL)"#,
+        )
+        .execute(&db.pool).await.expect("create Series schema");
+        sqlx::query(r#"CREATE TABLE "SystemSetting" (key TEXT PRIMARY KEY, value TEXT)"#)
+            .execute(&db.pool).await.expect("create SystemSetting schema");
+        sqlx::query(r#"CREATE TABLE "JobLog" (id TEXT PRIMARY KEY, "jobType" TEXT, status TEXT, "durationMs" INTEGER, message TEXT, "relatedItem" TEXT, "createdAt" INTEGER, attempts INTEGER)"#)
+            .execute(&db.pool).await.expect("create JobLog schema");
+        sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ('matcher_mode', $1)"#)
+            .bind(mode).execute(&db.pool).await.expect("seed matcher_mode");
+        // Every row shares one updatedAt (a bulk import), and ids sort predictably ("row000"..).
+        for i in 0..rows {
+            sqlx::query(r#"INSERT INTO "Series" (id, name, year, "folderPath", "matchState", "metadataId", "updatedAt") VALUES ($1, $1, 2024, '', 'UNMATCHED', NULL, 1787961600000)"#)
+                .bind(format!("row{i:03}"))
+                .execute(&db.pool).await.expect("seed series");
         }
-        assert!(accepted_identity(&parse(valid), 1).is_none());
+        (db, base)
+    }
+
+    /// Review of #231: 150 unmatched rows, no file evidence, confirm mode (so every row lands on
+    /// for_admin and nothing is ever written back for it). The second run must reach rows 101-150,
+    /// and the third wraps to the start.
+    #[tokio::test]
+    async fn sweep_cursor_reaches_the_back_half_then_wraps() {
+        let (db, base) = sweep_fixture("cursor", "confirm", 150).await;
+
+        let outcome1 = run_unmatched_sweep(db.clone()).await.expect("first sweep run");
+        assert_eq!(outcome1.matched, 0, "no file evidence and confirm mode auto-accepts nothing");
+        assert!(outcome1.summary.contains("100 left for the Smart Matcher"), "{}", outcome1.summary);
+        assert_eq!(get_sweep_cursor(&db).await.as_deref(), Some("row099"), "a full page moves the cursor to its last row");
+
+        let outcome2 = run_unmatched_sweep(db.clone()).await.expect("second sweep run");
+        assert!(outcome2.summary.contains("50 left for the Smart Matcher"), "{}", outcome2.summary);
+        assert!(get_sweep_cursor(&db).await.is_none(), "a short page is the end of the set: wrap next run");
+
+        let outcome3 = run_unmatched_sweep(db.clone()).await.expect("third sweep run");
+        assert!(outcome3.summary.contains("100 left for the Smart Matcher"), "{}", outcome3.summary);
+        assert_eq!(get_sweep_cursor(&db).await.as_deref(), Some("row099"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A run that hits the search budget has handled none of the rows it deferred, so the cursor
+    /// must not move past them: here the budget is already spent, every row is deferred, and the
+    /// cursor stays where the previous run left it.
+    #[tokio::test]
+    async fn sweep_cursor_does_not_skip_rows_deferred_on_the_budget() {
+        let (db, base) = sweep_fixture("budget", "trust", 150).await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let usage = serde_json::json!({ "/search": vec![now; 200] }).to_string();
+        sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ('cv_api_usage', $1), ('cv_api_key', 'plaintext-test-key'), ($2, 'row049')"#)
+            .bind(&usage).bind(SWEEP_CURSOR_KEY)
+            .execute(&db.pool).await.expect("seed budget, key and cursor");
+
+        let outcome = run_unmatched_sweep(db.clone()).await.expect("sweep run");
+        assert!(outcome.summary.contains("100 deferred to the next run"), "{}", outcome.summary);
+        assert_eq!(get_sweep_cursor(&db).await.as_deref(), Some("row049"), "deferred rows come first next run");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn next_sweep_cursor_parks_on_the_last_row_handled() {
+        let page: Vec<String> = (0..100).map(|i| format!("row{i:03}")).collect();
+        // Budget hit partway through a page: park just before the first deferred row.
+        assert_eq!(next_sweep_cursor(&page, Some(30)), CursorMove::Set("row029".to_string()));
+        // The very first row deferred (or a 429 on it): nothing handled, the cursor stays.
+        assert_eq!(next_sweep_cursor(&page, Some(0)), CursorMove::Keep);
+        // A full page handled to the end moves on; a short one wraps.
+        assert_eq!(next_sweep_cursor(&page, None), CursorMove::Set("row099".to_string()));
+        assert_eq!(next_sweep_cursor(&page[..50], None), CursorMove::Clear);
+        assert_eq!(next_sweep_cursor(&page[..50], Some(10)), CursorMove::Set("row009".to_string()));
+    }
+
+    // Suggestion ranking (robotshavehearts2's "way off" auto-matches): the year is a
+    // tiebreaker-plus, never a sort key. Twin cases live in smart-match-prefill-helpers.test.ts.
+    #[test]
+    fn year_term_rewards_agreement_modestly_and_ignores_unknowns() {
+        assert_eq!(year_term(Some(2024), 2024), 0.10);
+        assert_eq!(year_term(Some(2023), 2024), 0.05);
+        assert_eq!(year_term(Some(2016), 2011), -0.05);
+        assert_eq!(year_term(None, 2024), 0.0);
+        assert_eq!(year_term(Some(2024), 0), 0.0);
+        assert_eq!(year_term(Some(0), 2024), 0.0);
+    }
+
+    #[test]
+    fn pick_best_lets_the_name_dominate_and_the_year_break_ties() {
+        let c = |id: i32, n: &str, y: Option<i32>| (id, n.to_string(), y);
+        // The field report's shape: every 2024 volume used to be pulled ahead of the exact name.
+        let cands = vec![
+            c(1, "X-Men: From the Ashes Infinity Comic", Some(2024)),
+            c(2, "X-Men Annual", Some(2024)),
+            c(3, "X-Men", Some(2024)),
+            c(4, "X-Men", Some(1991)),
+        ];
+        assert_eq!(pick_best("X-Men", 2024, cands.clone()).map(|b| b.0), Some(3));
+        // A wrong folder year must not hand the win to a same-year wrong name.
+        let cands2 = vec![c(1, "Batman Eternal", Some(2014)), c(2, "Batman", Some(2011)), c(3, "Batman", Some(2016))];
+        assert_eq!(pick_best("Batman", 2014, cands2.clone()).map(|b| b.0), Some(2));
+        // Among equal names, off-by-one beats far-off.
+        assert_eq!(pick_best("Batman", 2012, cands2).map(|b| b.0), Some(2));
+        // Plain series over its annual when both share the year.
+        assert_eq!(pick_best("Batman", 2012, vec![c(1, "Batman Annual", Some(2012)), c(2, "Batman", Some(2012))]).map(|b| b.0), Some(2));
+        // Nothing to rank → nothing.
+        assert!(pick_best("Batman", 2012, vec![]).is_none());
+    }
+
+    #[test]
+    fn name_similarity_folds_symbols_and_scores_tokens() {
+        // Exact + case-insensitive.
+        assert_eq!(name_similarity("Wolverine", "wolverine"), 1.0);
+        // The slash-title report from discussion #177: symbols fold to spaces.
+        assert_eq!(name_similarity("Hack/Slash", "Hack Slash"), 1.0);
+        assert_eq!(name_similarity("Batman & Robin", "Batman Robin"), 1.0);
+        // A prefixed sibling scores well under 1.0 (2 common of 1+2 tokens = 0.666…).
+        let sib = name_similarity("Wolverine", "Savage Wolverine");
+        assert!(sib > 0.6 && sib < 0.7, "got {sib}");
+        // Disjoint titles score 0.
+        assert_eq!(name_similarity("Batman", "Superman"), 0.0);
+        // Empty input never divides by zero.
+        assert_eq!(name_similarity("", "Batman"), 0.0);
+    }
+
+    #[test]
+    fn auto_accept_honors_confidence_modes() {
+        // trust: admin-tunable threshold.
+        assert!(auto_accept("trust", 0.92, false, 0.90));
+        assert!(!auto_accept("trust", 0.85, true, 0.90));
+        // auto: near-exact AND the year must agree.
+        assert!(auto_accept("auto", 0.98, true, 0.90));
+        assert!(!auto_accept("auto", 0.98, false, 0.90));
+        assert!(!auto_accept("auto", 0.92, true, 0.90));
+        // confirm / custom: a guess is never applied silently.
+        assert!(!auto_accept("confirm", 1.0, true, 0.90));
+        assert!(!auto_accept("custom", 1.0, true, 0.90));
     }
 
     #[test]
@@ -554,4 +934,104 @@ mod tests {
             .fetch_one(&db.pool).await.unwrap();
         assert_eq!(n, 0, "a quiet sweep must not write audit rows");
     }
+    // The contract is a security boundary, not a hint: anything the service sends that is not a
+    // fresh, high-confidence, in-budget, versioned verdict is refused.
+    #[test]
+    fn shared_contract_refuses_unsafe_old_and_over_budget_decisions() {
+        let valid = serde_json::json!({ "status": "high", "confidence": "high", "safeToAccept": true,
+            "autoAccept": true, "fingerprint": "a".repeat(64), "algorithmVersion": "evidence-1", "requests": 2,
+            "selected": { "id": "123", "metadataSource": "METRON" } });
+        let parse = |v| serde_json::from_value::<MatchDecision>(v).unwrap();
+        assert_eq!(accepted_identity(&parse(valid.clone()), 30), Some(("METRON".to_string(), "123".to_string())));
+
+        let refusal = |patch: serde_json::Value| {
+            let mut v = valid.clone();
+            for (k, val) in patch.as_object().unwrap() { v[k] = val.clone(); }
+            assert_eq!(accepted_identity(&parse(v), 30), None);
+        };
+        refusal(serde_json::json!({ "safeToAccept": false }));
+        refusal(serde_json::json!({ "autoAccept": false }));
+        refusal(serde_json::json!({ "status": "medium" }));
+        refusal(serde_json::json!({ "confidence": "medium" }));
+        refusal(serde_json::json!({ "algorithmVersion": "evidence-0" }));
+        refusal(serde_json::json!({ "fingerprint": "short" }));
+        refusal(serde_json::json!({ "selected": { "id": "-1", "metadataSource": "METRON" } }));
+        refusal(serde_json::json!({ "selected": { "id": "uuid", "metadataSource": "COMICVINE" } }));
+        refusal(serde_json::json!({ "selected": { "id": "123", "metadataSource": "LOCAL" } }));
+        refusal(serde_json::json!({ "selected": null }));
+        // Over the caller's remaining budget is a refusal even when the contract is otherwise valid.
+        assert_eq!(accepted_identity(&parse(valid.clone()), 1), None);
+        assert_eq!(accepted_identity(&parse(valid.clone()), 16), Some(("METRON".to_string(), "123".to_string())));
+    }
+
+    // The CAS apply: a row that changed, is locked, is IGNORED or already holds the id must never be
+    // overwritten by a decision computed from an earlier read.
+    #[tokio::test]
+    async fn applying_shared_decision_guards_changed_ignored_locked_and_colliding_rows() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let db = Db { pool, dialect: crate::db::Dialect::Sqlite };
+        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, "metadataSource" TEXT, "metadataId" TEXT,
+            "matchState" TEXT, "cvId" INTEGER, "metronId" INTEGER, "updatedAt" TEXT, "hasCustomMetadata" BOOLEAN)"#)
+            .execute(&db.pool).await.unwrap();
+        for (sid, state, locked, metadata) in [("ok", "UNMATCHED", false, None), ("ignored", "IGNORED", false, None),
+            ("locked", "UNMATCHED", true, None), ("changed", "UNMATCHED", false, None), ("taken", "MATCHED", false, Some("99"))] {
+            sqlx::query(r#"INSERT INTO "Series" VALUES ($1,'COMICVINE',$2,$3,NULL,NULL,'1000',$4)"#)
+                .bind(sid).bind(metadata).bind(state).bind(locked).execute(&db.pool).await.unwrap();
+        }
+        for (sid, stamp, target) in [("ignored", "1000", "1"), ("locked", "1000", "1"), ("changed", "999", "1"), ("ok", "1000", "99")] {
+            assert!(!apply_match(&db, sid, "Batman", "COMICVINE", target, Some(1), None, Some(stamp)).await);
+        }
+        assert!(apply_match(&db, "ok", "Batman", "METRON", "7", None, Some(7), Some("1000")).await);
+        let row = sqlx::query(r#"SELECT "metadataSource", "metadataId", "matchState" FROM "Series" WHERE id='ok'"#).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("metadataSource"), "METRON");
+        assert_eq!(row.get::<String, _>("metadataId"), "7");
+        assert_eq!(row.get::<String, _>("matchState"), "MATCHED");
+        // Already matched: it is no longer a candidate, so a second decision is refused.
+        assert!(!apply_match(&db, "ok", "Batman", "METRON", "8", None, Some(8), Some("1000")).await);
+    }
+
+    /// A service deployment must still page through the backlog: the cursor advances over a full
+    /// page, a short page wraps, and a malformed stored cursor never blocks a fresh pass.
+    #[tokio::test]
+    async fn service_sweep_advances_through_the_backlog_and_wraps() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::any::AnyPoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.unwrap();
+        let db = Db { pool, dialect: crate::db::Dialect::Sqlite };
+        sqlx::query(r#"CREATE TABLE "SystemSetting" (key TEXT PRIMARY KEY, value TEXT NOT NULL)"#)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query(r#"CREATE TABLE "Series" (id TEXT PRIMARY KEY, name TEXT, year INTEGER,
+            "folderPath" TEXT, "matchState" TEXT, "metadataId" TEXT, "updatedAt" INTEGER)"#)
+            .execute(&db.pool).await.unwrap();
+        for i in 1..=150 {
+            sqlx::query(r#"INSERT INTO "Series" VALUES ($1, 'Unmatched', 2024, '', 'UNMATCHED', NULL, 1000)"#)
+                .bind(format!("s{i:03}")).execute(&db.pool).await.unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let service = MatchService { url: format!("http://{}", listener.local_addr().unwrap()), secret: "fixture-secret".to_string() };
+        let router = axum::Router::new().route("/api/internal/smart-match", axum::routing::post(|| async {
+            axum::Json(serde_json::json!({ "status": "medium", "confidence": "medium", "autoAccept": false,
+                "safeToAccept": false, "fingerprint": "a".repeat(64), "algorithmVersion": "evidence-1", "requests": 0, "selected": null }))
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let first = run_unmatched_sweep_at(db.clone(), Some(&service)).await.unwrap();
+        assert_eq!(first.matched, 0);
+        assert!(first.summary.contains("100 left for the Smart Matcher"), "{}", first.summary);
+        let next = fetch_unmatched_candidates(&db, get_sweep_cursor(&db).await.as_deref()).await.unwrap();
+        assert_eq!(next.len(), 50);
+        assert_eq!(next[0].get::<String, _>("id"), "s101");
+        run_unmatched_sweep_at(db.clone(), Some(&service)).await.unwrap();
+        let wrapped = fetch_unmatched_candidates(&db, get_sweep_cursor(&db).await.as_deref()).await.unwrap();
+        assert_eq!(wrapped[0].get::<String, _>("id"), "s001");
+        // A malformed cursor from an older build must not prevent a fresh pass: it is only ever a
+        // lexicographic bound, so the page still comes back.
+        sqlx::query(r#"INSERT INTO "SystemSetting" (key, value) VALUES ('unmatched_sweep_cursor', 'not-json')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"#)
+            .execute(&db.pool).await.unwrap();
+        let fresh = fetch_unmatched_candidates(&db, get_sweep_cursor(&db).await.as_deref()).await.unwrap();
+        assert_eq!(fresh.len(), 100);
+        server.abort();
+    }
+
 }

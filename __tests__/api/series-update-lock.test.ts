@@ -133,9 +133,9 @@ describe('POST /api/library/update — no-op saves are inert (issue #194 (f), se
         expect(mocks.queueAdd).not.toHaveBeenCalled();
     });
 
-    it('#199: clearing a stored ComicInfo default counts as a change and stores null', async () => {
+    it.each(['', '   '])('#199: clearing a stored ComicInfo default (%j) counts as a change and stores null', async (blank) => {
         mocks.seriesFindFirst.mockResolvedValue({ ...record(), imprint: 'Vertigo' });
-        const res = await POST(req(editorBody({ imprint: '   ' })));
+        const res = await POST(req(editorBody({ imprint: blank })));
         const json = await res.json();
 
         expect(json.changed).toBe(true);

@@ -7,6 +7,7 @@ import { Logger } from '@/lib/logger';
 import crypto from 'crypto';
 import { getErrorMessage } from '@/lib/utils/error';
 import { AuditLogger } from '@/lib/audit-logger';
+import { storedFolderProblem } from '@/lib/utils/stored-folder';
 
 export async function POST(request: Request) {
     try {
@@ -61,6 +62,22 @@ export async function POST(request: Request) {
         }
 
         if (!backup.data) return NextResponse.json({ error: "Invalid backup format" }, { status: 400 });
+
+        // The folders Settings trims are trimmed here too, before anything is written (beta.018
+        // follow-up): a backup made before Settings trimmed them can carry " /data/comics", which is
+        // a relative path.
+        const trimmed = (v: unknown) => (typeof v === 'string' ? v.trim() : v);
+        const isRow = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
+        const data = backup.data;
+        if (Array.isArray(data.libraries)) {
+            data.libraries = data.libraries.map((lib: unknown) => (isRow(lib) ? { ...lib, path: trimmed(lib.path) } : lib));
+        }
+        if (Array.isArray(data.downloadClients)) {
+            data.downloadClients = data.downloadClients.map((c: unknown) => (isRow(c) && 'localPath' in c ? { ...c, localPath: trimmed(c.localPath) } : c));
+        }
+        if (Array.isArray(data.settings)) {
+            data.settings = data.settings.map((s: unknown) => (isRow(s) && s.key === 'download_path' ? { ...s, value: trimmed(s.value) } : s));
+        }
 
         await prisma.$transaction(async (tx) => {
             const restoreTable = async (dataArray: any[], model: any, pk: string = 'id') => {
@@ -122,8 +139,30 @@ export async function POST(request: Request) {
             { message: "State overwritten from backup." }, 
             session?.user ? (session.user as any).id : 'System'
         );
-        
-        return NextResponse.json({ success: true });
+
+        // A folder the server can't use doesn't block the restore: a backup moved from a native
+        // Windows install to Docker has C:\ paths everywhere (libraries, series folders, issue files)
+        // and has to come in before they can be fixed. Say which ones, the way Settings would.
+        const warnings: string[] = [];
+        for (const lib of Array.isArray(data.libraries) ? data.libraries : []) {
+            const problem = storedFolderProblem(lib?.path, { example: '/data/comics' });
+            if (problem) warnings.push(`Root Path of library "${lib?.name || 'Unnamed'}": ${problem}`);
+        }
+        const downloadPath = (Array.isArray(data.settings) ? data.settings : []).find((s: unknown) => isRow(s) && s.key === 'download_path')?.value;
+        if (typeof downloadPath === 'string' && downloadPath.trim()) {
+            const problem = storedFolderProblem(downloadPath, { example: '/data/downloads' });
+            if (problem) warnings.push(`Download Scan Root: ${problem}`);
+        }
+        for (const client of Array.isArray(data.downloadClients) ? data.downloadClients : []) {
+            if (typeof client?.localPath !== 'string' || !client.localPath.trim()) continue;
+            const problem = storedFolderProblem(client.localPath, { example: '/data/downloads' });
+            if (problem) warnings.push(`Local Path of download client "${client.name || 'Unnamed'}": ${problem}`);
+        }
+        if (warnings.length > 0) {
+            Logger.log(`[Database Restore] Restored, but these folders need fixing in Settings → Library & Files: ${warnings.join(' ')}`, 'warn');
+        }
+
+        return NextResponse.json({ success: true, warnings });
 
     } catch (error: unknown) {
         Logger.log(`[Database Restore] Error: ${getErrorMessage(error)}`, 'error');

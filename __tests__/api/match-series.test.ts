@@ -1,9 +1,12 @@
 // __tests__/api/match-series.test.ts
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { POST } from '@/app/api/library/match-series/route';
 import fs from 'fs';
 import axios from 'axios';
 import { makePostJson } from '../helpers/request';
+import { pinPlatform } from '../helpers/platform';
+import { notifierSendAlert } from '../helpers/setup-global';
+import { Logger } from '@/lib/logger';
 
 // 1. Hoist the mocks
 const mocks = vi.hoisted(() => ({
@@ -77,6 +80,7 @@ vi.mock('fs', () => ({
         existsSync: vi.fn().mockReturnValue(true),
         mkdirSync: vi.fn(),
         promises: {
+            access: vi.fn().mockResolvedValue(undefined),
             stat: vi.fn().mockResolvedValue({ isFile: () => false }),
             readdir: vi.fn().mockResolvedValue([]),
             rename: vi.fn().mockResolvedValue(true),
@@ -112,6 +116,7 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         // clearAllMocks resets call history but NOT implementations — restore the fs.existsSync default
         // so a per-test mockImplementation can't leak into later tests.
         vi.mocked(fs.existsSync).mockReturnValue(true);
+        vi.mocked(fs.promises.access).mockResolvedValue(undefined);
         // Setup default path access
         process.env.OMNIBUS_AWAITING_MATCH_DIR = '/unmatched';
         mocks.findManyLibraries.mockResolvedValue([{ id: 'lib_1', path: '/comics', isDefault: true }]);
@@ -165,7 +170,30 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         }));
         expect(res.status).toBe(200);
         expect(mocks.moveFileSafe.mock.calls.map(c => String(c[1]).replace(/\\/g, '/')).at(-1))
-            .toBe('/comics/DC Comics/Batman (2016)/Batman #01.cbz');
+            .toBe('/comics/DC Comics/Batman (2016)/Batman #001.cbz');
+    });
+
+    // The naming cleanup (#244): a matched file is named by the same rules as every other path. The
+    // Smart Matcher used to leave {IssueTitle} in the name as literal text and pad only one digit.
+    it.each([
+        { padding: undefined, expected: 'Batman #001 - The Court of Owls.cbz' },
+        { padding: '2', expected: 'Batman #01 - The Court of Owls.cbz' },
+        { padding: 'none', expected: 'Batman #1 - The Court of Owls.cbz' },
+    ])('names a matched file with its issue title and the padding setting ($padding)', async ({ padding, expected }) => {
+        mocks.findManySettings.mockResolvedValue([
+            { key: 'file_naming_pattern', value: '{Series} #{Issue} - {IssueTitle}' },
+            ...(padding ? [{ key: 'issue_number_padding', value: padding }] : []),
+        ]);
+        vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p) === '/unmatched/Batman 001.cbz');
+        vi.mocked(fs.promises.stat).mockResolvedValueOnce({ isFile: () => true } as any);
+        vi.mocked(fs.promises.readdir).mockResolvedValueOnce(['Batman 001.cbz'] as any);
+        const res = await POST(createReq({
+            oldFolderPath: '/unmatched/Batman 001.cbz', metadataId: '1234',
+            name: 'Batman', year: 2016, publisher: 'DC Comics', exactIssueNumber: '1', issueTitle: 'The Court of Owls',
+        }));
+        expect(res.status).toBe(200);
+        expect(mocks.moveFileSafe.mock.calls.map(c => String(c[1]).replace(/\\/g, '/')).at(-1))
+            .toBe(`/comics/DC Comics/Batman (2016)/${expected}`);
     });
 
     it('should query ComicVine by default if metadataSource is not provided', async () => {
@@ -213,10 +241,17 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         mocks.findManySettings.mockResolvedValue([{ key: 'folder_naming_pattern', value: '{Series} ({Year})' }]);
         mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'X', year: 2016, publisher: 'Marvel', coverUrl: null });
         mocks.findManyIssues.mockResolvedValue(files.map((filePath, i) => ({ id: `issue_${i}`, filePath })));
-        vi.mocked(fs.existsSync).mockImplementation((p) => {
+        const present = (p: unknown) => {
             const normalized = String(p).replace(/\\/g, '/');
             if (normalized.startsWith('/unmatched/X/')) return conflicts.includes(normalized);
             return true;
+        };
+        vi.mocked(fs.existsSync).mockImplementation(present);
+        // The repoint commits its rows in one $transaction and chains .then() on the result.
+        mocks.transaction.mockImplementation((ops: unknown[]) => Promise.all(ops));
+        // The repoint probes the disk asynchronously (access), so both views must agree.
+        vi.mocked(fs.promises.access).mockImplementation(async (p: unknown) => {
+            if (!present(p)) throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
         });
         const res = await POST(createReq({ oldFolderPath: '/unmatched/X', metadataId: '987', metadataSource: 'METRON' }));
         expect(res.status).toBe(200);
@@ -292,6 +327,28 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(res.status).toBe(403);
         const data = await res.json();
         expect(data.error).toBe('Unauthorized path access');
+    });
+
+    // Discord field report (2026-10-13, Docker Desktop on Windows): a library saved as `C:\Comics`
+    // before saves were checked failed every match with "EACCES: permission denied, mkdir 'C:'".
+    // The match now says which library is wrong and how to fix it - before touching anything.
+    it('refuses to match into a library whose Root Path the server cannot use, saying why', async () => {
+        const restore = pinPlatform('linux');
+        try {
+            mocks.findManyLibraries.mockResolvedValue([{ id: 'lib_1', name: 'Comics', path: 'C:\\Comics', isDefault: true }]);
+            const res = await POST(createReq({ oldFolderPath: '/unmatched/Batman', metadataId: '1234', name: 'Batman', year: 2016, publisher: 'DC Comics' }));
+
+            expect(res.status).toBe(400);
+            const { error } = await res.json();
+            expect(error).toContain('Root Path of library "Comics": "C:\\Comics" is a Windows path');
+            expect(error).toContain('Settings > Library & Files');
+            expect(mocks.safeRelocateFolder).not.toHaveBeenCalled();
+            expect(mocks.moveFileSafe).not.toHaveBeenCalled();
+            expect(mocks.createSeries).not.toHaveBeenCalled();
+            expect(mocks.updateSeries).not.toHaveBeenCalled();
+        } finally {
+            restore();
+        }
     });
 
     it('should substitute admin-supplied {SeriesGroup}/{UniverseName} into the folder and persist + lock them', async () => {
@@ -422,6 +479,178 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(data.conflicts).toBe(2);
     });
 
+    describe('repointing Issue.filePath after a folder relocate (comicinfo-embed-stale-path)', () => {
+        // Every variant matches into the SAME existing series (triggers the update, not create, branch)
+        // at the SAME computed destination, "/comics/DC Comics/Batman (2016)" (default naming pattern).
+        const NEW_FOLDER = '/comics/DC Comics/Batman (2016)';
+        const matchReq = () => createReq({
+            oldFolderPath: '/unmatched/Batman',
+            metadataId: '4050-1234',
+            name: 'Batman',
+            year: 2016,
+            publisher: 'DC Comics',
+        });
+
+        let logSpy: ReturnType<typeof vi.spyOn>;
+        const logLines = (): string[] => logSpy.mock.calls.map((c: any[]) => String(c[0]));
+
+        // The disk AFTER safeRelocateFolder ran: exactly the listed paths exist. Drives both the
+        // route's sync precondition checks (existsSync) and the repoint's async probes (access).
+        const onDisk = (...paths: string[]) => {
+            const has = (p: any) => paths.includes(String(p));
+            vi.mocked(fs.existsSync).mockImplementation(has);
+            vi.mocked(fs.promises.access).mockImplementation(async (p: unknown) => {
+                if (!has(p)) throw Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+            });
+        };
+        const issueRows = (rows: { id: string; filePath: string }[]) =>
+            mocks.findManyIssues.mockImplementation(({ where }: any) =>
+                Promise.resolve(rows.filter(i => i.filePath.startsWith(where.filePath.startsWith)))
+            );
+
+        beforeEach(() => {
+            mocks.findUniqueSeries.mockResolvedValue({ id: 'series_123', year: 2016, isManga: false });
+            mocks.updateSeries.mockResolvedValue({ id: 'series_123', folderPath: NEW_FOLDER });
+            mocks.transaction.mockImplementation((ops: any[]) => Promise.all(ops));
+            logSpy = vi.spyOn(Logger, 'log').mockImplementation(() => undefined as any);
+        });
+        afterEach(() => logSpy.mockRestore());
+
+        it('repoints every sibling issue under the relocated folder, in one transaction', async () => {
+            issueRows([
+                { id: 'i1', filePath: '/unmatched/Batman/Batman 001.cbz' },
+                { id: 'i2', filePath: '/unmatched/Batman/Batman 002.cbz' },
+            ]);
+            // The physical move already happened (safeRelocateFolder's job) -- new paths exist, old ones
+            // don't, except the matched folder itself which the route's own precondition check requires.
+            onDisk('/unmatched/Batman', NEW_FOLDER, `${NEW_FOLDER}/Batman 001.cbz`, `${NEW_FOLDER}/Batman 002.cbz`);
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            // Queried with a trailing separator, not a bare prefix, and only for the two columns used.
+            expect(mocks.findManyIssues).toHaveBeenCalledWith(expect.objectContaining({
+                where: expect.objectContaining({ filePath: { startsWith: '/unmatched/Batman/' } }),
+                select: { id: true, filePath: true },
+            }));
+            expect(mocks.transaction).toHaveBeenCalledTimes(1);
+            expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'i1' }, data: { filePath: `${NEW_FOLDER}/Batman 001.cbz` } });
+            expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'i2' }, data: { filePath: `${NEW_FOLDER}/Batman 002.cbz` } });
+            // Per-row existence probes are async (a big series on a network share must not block
+            // the event loop with hundreds of sync stats).
+            expect(fs.promises.access).toHaveBeenCalledWith('/unmatched/Batman/Batman 001.cbz');
+            expect(fs.existsSync).not.toHaveBeenCalledWith('/unmatched/Batman/Batman 001.cbz');
+            expect(fs.existsSync).not.toHaveBeenCalledWith(`${NEW_FOLDER}/Batman 001.cbz`);
+            expect(logLines()).toContainEqual(expect.stringContaining('Repointed filePath for 2 issue(s)'));
+        });
+
+        it('never even considers an unrelated sibling series ("Batman" vs "Batman Family")', async () => {
+            // "Batman Family"'s own issue starts with the bare string "/unmatched/Batman" but is NOT
+            // under "/unmatched/Batman/". Its file is still at its own path (it's another series'
+            // folder), so even a bare-prefix query couldn't repoint it -- what pins the separator is
+            // that the row is never fetched, so its path is never probed.
+            issueRows([{ id: 'sibling_1', filePath: '/unmatched/Batman Family/Annual 001.cbz' }]);
+            onDisk('/unmatched/Batman', NEW_FOLDER, '/unmatched/Batman Family/Annual 001.cbz');
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(fs.promises.access).not.toHaveBeenCalledWith('/unmatched/Batman Family/Annual 001.cbz');
+            expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'sibling_1' } }));
+        });
+
+        it('merging "X" into an existing "X (2016)" repoints the moved issues and never touches the destination series\' own', async () => {
+            // The #230 review case: the old folder is a startsWith-prefix of the destination folder.
+            // The match merged the source series' rows into series_123, which already owned issues
+            // under the destination.
+            const oldFolder = '/comics/DC Comics/Batman';
+            issueRows([
+                { id: 'moved', filePath: `${oldFolder}/Batman 001.cbz` },
+                { id: 'dest_own', filePath: `${NEW_FOLDER}/Batman 010.cbz` },
+            ]);
+            onDisk(oldFolder, NEW_FOLDER, `${NEW_FOLDER}/Batman 001.cbz`, `${NEW_FOLDER}/Batman 010.cbz`);
+
+            const res = await POST(createReq({
+                oldFolderPath: oldFolder, metadataId: '4050-1234', name: 'Batman', year: 2016, publisher: 'DC Comics',
+            }));
+            expect(res.status).toBe(200);
+
+            expect(mocks.findManyIssues).toHaveBeenCalledWith(expect.objectContaining({
+                where: expect.objectContaining({ filePath: { startsWith: `${oldFolder}/` } }),
+            }));
+            expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'moved' }, data: { filePath: `${NEW_FOLDER}/Batman 001.cbz` } });
+            expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'dest_own' } }));
+            expect(fs.promises.access).not.toHaveBeenCalledWith(`${NEW_FOLDER}/Batman 010.cbz`);
+        });
+
+        it('leaves a row pointing at a name-collision file in place (safeRelocateFolder left it at the old path)', async () => {
+            issueRows([
+                { id: 'moved', filePath: '/unmatched/Batman/Batman 001.cbz' },
+                { id: 'collided', filePath: '/unmatched/Batman/Batman 002.cbz' },
+            ]);
+            // "001" moved cleanly (new exists, old doesn't). "002" collided with a same-named file
+            // already at the destination -- safeRelocateFolder left the source file in place, so
+            // BOTH the old and new paths exist, and this row must not be repointed.
+            onDisk('/unmatched/Batman', NEW_FOLDER,
+                `${NEW_FOLDER}/Batman 001.cbz`,
+                `${NEW_FOLDER}/Batman 002.cbz`, '/unmatched/Batman/Batman 002.cbz');
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(mocks.updateIssue).toHaveBeenCalledWith({ where: { id: 'moved' }, data: { filePath: `${NEW_FOLDER}/Batman 001.cbz` } });
+            expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'collided' } }));
+            const summary = logLines().find(l => l.includes('Repointed filePath for 1 issue(s)'));
+            expect(summary).toContain('1 left at the old path');
+        });
+
+        it('checks the stored path as-is: a left-behind file with a backslash in its name keeps its row', async () => {
+            // On Linux "\" is an ordinary filename character. Normalising it to "/" before the probe
+            // looked for ".../AC/DC 001.cbz", found nothing, decided the file had moved, and pointed the
+            // row at the destination's same-named file -- two rows, one file.
+            const leftBehind = '/unmatched/Batman/AC\\DC 001.cbz';
+            issueRows([{ id: 'acdc', filePath: leftBehind }]);
+            onDisk('/unmatched/Batman', NEW_FOLDER, leftBehind, `${NEW_FOLDER}/AC\\DC 001.cbz`);
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(fs.promises.access).toHaveBeenCalledWith(leftBehind);
+            expect(mocks.updateIssue).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'acdc' } }));
+        });
+
+        it('logs success only when the repoint transaction commits', async () => {
+            issueRows([{ id: 'i1', filePath: '/unmatched/Batman/Batman 001.cbz' }]);
+            onDisk('/unmatched/Batman', NEW_FOLDER, `${NEW_FOLDER}/Batman 001.cbz`);
+            mocks.transaction.mockRejectedValueOnce(new Error('database is locked'));
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            const lines = logLines();
+            expect(lines).toContainEqual(expect.stringContaining('database is locked'));
+            expect(lines).not.toContainEqual(expect.stringContaining('Repointed filePath'));
+        });
+
+        it('still reports when nothing was repointed, and tells a left-behind file apart from a missing one', async () => {
+            issueRows([
+                { id: 'collided', filePath: '/unmatched/Batman/Batman 002.cbz' },
+                { id: 'gone', filePath: '/unmatched/Batman/Batman 003.cbz' },
+            ]);
+            // 002 is still at the old path (collision); 003 exists at neither path.
+            onDisk('/unmatched/Batman', NEW_FOLDER, `${NEW_FOLDER}/Batman 002.cbz`, '/unmatched/Batman/Batman 002.cbz');
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(mocks.transaction).not.toHaveBeenCalled();
+            const summary = logLines().find(l => l.includes('No filePath repointed'));
+            expect(summary).toBeDefined();
+            expect(summary).toContain('1 left at the old path');
+            expect(summary).toContain('1 not found at the old or the new path');
+        });
+    });
+
     it('should preserve a custom cover on re-match (no cover.jpg write, no coverUrl override)', async () => {
         mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'Batman', year: 2020, publisher: 'DC Comics', coverUrl: 'http://cover/img.jpg', status: 'Ongoing' });
         // The series already has an admin-uploaded cover — a manual re-match must not clobber it.
@@ -531,6 +760,32 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(adopt.data).toEqual(expect.objectContaining({ filePath: expect.stringContaining('13.5'), metadataId: '317233', matchState: 'MATCHED', status: 'DOWNLOADED' }));
         // The row's number is its identity — ComicVine's "13½" is not rewritten to the typed form.
         expect(adopt.data.number).toBeUndefined();
+    });
+
+    // #243: {IssueYear} used the series' year for every file the Smart Matcher renamed. It is the
+    // matched issue row's release date now (the year Standardize writes), else the series year.
+    it('#243: names a matched file with the issue\'s own release year, not the series year', async () => {
+        mocks.findManySettings.mockResolvedValue([{ key: 'file_naming_pattern', value: '{Series} #{Issue} ({IssueYear})' }]);
+        vi.mocked(fs.promises.stat).mockResolvedValueOnce({ isFile: () => true } as any);
+        vi.mocked(fs.existsSync).mockImplementation((p: any) => String(p) === '/unmatched/Bone 14.cbz');
+        vi.mocked(fs.promises.readdir).mockResolvedValueOnce(['Bone 14.cbz'] as any);
+        vi.mocked(axios.get).mockResolvedValue({ data: Buffer.from('series-cover') } as any);
+        mocks.getSeriesDetails.mockResolvedValueOnce({ name: 'Bone', year: 1991, publisher: 'Cartoon Books', coverUrl: 'http://cover/img.jpg', status: 'Ended' });
+        mocks.findFirstSeries.mockResolvedValue({ id: 's1' });
+        mocks.updateSeries.mockResolvedValue({ id: 's1', year: 1991 });
+        mocks.findManyIssues.mockImplementation(async (args: any) =>
+            args?.where?.seriesId === 's1' && args?.where?.isAnnual === false
+                ? [{ id: 'i13', number: '13', releaseDate: '1994-04-01' }, { id: 'i14', number: '14', releaseDate: '1994-07-01' }]
+                : []
+        );
+        mocks.updateIssue.mockResolvedValue({ id: 'i14' });
+
+        const res = await POST(createReq({ oldFolderPath: '/unmatched/Bone 14.cbz', metadataId: '2127', metadataSource: 'METRON' }));
+        expect(res.status).toBe(200);
+
+        const renamedTo = mocks.moveFileSafe.mock.calls.map(c => String(c[1]));
+        expect(renamedTo).toContainEqual(expect.stringMatching(/Bone #014 \(1994\)\.cbz$/));
+        expect(renamedTo).not.toContainEqual(expect.stringMatching(/\(1991\)\.cbz$/));
     });
 
     // Issue.fileAddedAt (#206 follow-up): matching is a RE-HOME, not an arrival. A file the scan
@@ -644,6 +899,156 @@ describe('API Route: Smart Matcher (/api/library/match-series)', () => {
         expect(vi.mocked(axios.get)).toHaveBeenCalledWith('http://cover/img.jpg', expect.any(Object));
         const coverWrite = vi.mocked(fs.promises.writeFile).mock.calls.find(c => String(c[0]).includes('cover.jpg'));
         expect(coverWrite).toBeTruthy();
+    });
+
+    // #240 review: NEEDS_REVIEW tells the admin to look at the pack in /unmatched, and the Smart
+    // Matcher is the tool for that — but this route's close-out only looked at MANUAL_DDL, PENDING and
+    // DOWNLOADING, so the request a review was asked for stayed NEEDS_REVIEW for good. It also read
+    // the issue out of activeDownloadName, where a pack title ("Batman #31-40") parses as its first
+    // number — never the issue the request was created for.
+    describe('closing a request out on the issue the match just put on disk (#240 review)', () => {
+        const matchReq = () => createReq({
+            oldFolderPath: '/unmatched/Batman', metadataId: '4050-1234',
+            name: 'Batman', year: 2016, publisher: 'DC Comics',
+        });
+        // The close-out's own issue query; every other issue.findMany in the route (folder repoint,
+        // naming) keeps its empty default.
+        const onDiskIssues = (rows: { number: string; filePath?: string }[]) =>
+            mocks.findManyIssues.mockImplementation(async (args: { where?: { series?: { metadataId?: string } } }) =>
+                args?.where?.series?.metadataId ? rows : []
+            );
+        // The route's request query, honoured rather than ignored: a status the route does not ask
+        // for is never returned, so dropping NEEDS_REVIEW from that list fails these tests (which is
+        // exactly the defect a match used to leave behind).
+        type HeldRequest = {
+            id: string; status: string; issueNumber: string; activeDownloadName: string;
+            userId?: string; imageUrl?: string; user?: { username: string; email: string | null };
+        };
+        const requestsHeld = (rows: HeldRequest[]) =>
+            mocks.findManyRequests.mockImplementation(async (args: { where?: { status?: { in?: string[] } } }) =>
+                rows.filter(r => !args?.where?.status?.in || args.where.status.in.includes(r.status))
+            );
+
+        it('closes a NEEDS_REVIEW request whose pack title names a different number, and rings once', async () => {
+            requestsHeld([
+                { id: 'req_37', status: 'NEEDS_REVIEW', issueNumber: '37', activeDownloadName: 'Batman #31-40 (2016)' },
+            ]);
+            onDiskIssues([{ number: '37', filePath: '/comics/DC Comics/Batman (2016)/Batman #037.cbz' }]);
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            // The stored number — not the 31 out of the pack title — matched the file, and the row
+            // was never announced as available, so it closes un-notified and the bell fires for it.
+            expect(mocks.updateManyRequests).toHaveBeenCalledWith({
+                where: { id: { in: ['req_37'] } },
+                data: { status: 'COMPLETED', progress: 100, notified: false },
+            });
+        });
+
+        // A DOWNLOADING / PENDING / MANUAL_DDL request has usually rung the bell once already
+        // ("Downloading"), and the requester who cleared it has notified: true. Closing it COMPLETED
+        // without resetting that left the "available" line silent — the importer always closes with
+        // notified: false, so a match has to as well.
+        it('rings the "available" bell for every request it closes, not only a reviewed one', async () => {
+            requestsHeld([
+                { id: 'req_pending', status: 'PENDING', issueNumber: '37', activeDownloadName: 'Batman #37' },
+                { id: 'req_downloading', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #31-40 (2016)' },
+                { id: 'req_manual', status: 'MANUAL_DDL', issueNumber: '37', activeDownloadName: 'Batman #37' },
+            ]);
+            onDiskIssues([{ number: '37', filePath: '/comics/DC Comics/Batman (2016)/Batman #037.cbz' }]);
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            const closed = new Map<string, Record<string, unknown>>();
+            for (const [args] of mocks.updateManyRequests.mock.calls as [{ where: { id: { in: string[] } }; data: Record<string, unknown> }][]) {
+                for (const id of args.where.id.in) closed.set(id, args.data);
+            }
+            for (const id of ['req_pending', 'req_downloading', 'req_manual']) {
+                expect(closed.get(id)).toEqual({ status: 'COMPLETED', progress: 100, notified: false });
+            }
+        });
+
+        it('leaves a NEEDS_REVIEW request open while its issue is not on disk', async () => {
+            requestsHeld([
+                { id: 'req_38', status: 'NEEDS_REVIEW', issueNumber: '38', activeDownloadName: 'Batman #31-40 (2016)' },
+            ]);
+            onDiskIssues([{ number: '37', filePath: '/comics/DC Comics/Batman (2016)/Batman #037.cbz' }]);
+
+            const res = await POST(matchReq());
+            expect(res.status).toBe(200);
+
+            expect(mocks.updateManyRequests).not.toHaveBeenCalled();
+            expect(notifierSendAlert).not.toHaveBeenCalled();
+        });
+
+        // A request the match completes used to ring only the in-app bell: Discord, email, Pushover,
+        // Telegram and Apprise heard nothing, while the importer alerts for every request it completes.
+        // One "available" alert per requester per match - a match often completes several at once.
+        describe('the "available" alert', () => {
+            const nicolas = { userId: 'u_nicolas', user: { username: 'nicolas', email: 'n@example.test' } };
+            const adam = { userId: 'u_adam', user: { username: 'adam', email: 'a@example.test' } };
+            const onDisk = (...numbers: string[]) =>
+                onDiskIssues(numbers.map(n => ({ number: n, filePath: `/comics/DC Comics/Batman (2016)/Batman #0${n}.cbz` })));
+
+            it('tells the requester their issue is in the library', async () => {
+                requestsHeld([{ id: 'req_37', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #31-40 (2016)', imageUrl: 'http://cover/37.jpg', ...nicolas }]);
+                onDisk('37');
+
+                expect((await POST(matchReq())).status).toBe(200);
+
+                expect(notifierSendAlert).toHaveBeenCalledTimes(1);
+                expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({
+                    title: 'Batman #37',
+                    user: 'nicolas',
+                    email: 'n@example.test',
+                    imageUrl: 'http://cover/37.jpg',
+                    description: expect.stringContaining('Smart Matcher'),
+                }));
+            });
+
+            it('sends one alert for several issues of the same requester, listing them', async () => {
+                requestsHeld([
+                    { id: 'req_38', status: 'PENDING', issueNumber: '38', activeDownloadName: 'Batman #38', ...nicolas },
+                    { id: 'req_36', status: 'NEEDS_REVIEW', issueNumber: '36', activeDownloadName: 'Batman #31-40 (2016)', ...nicolas },
+                    { id: 'req_37', status: 'MANUAL_DDL', issueNumber: '37', activeDownloadName: 'Batman #37', ...nicolas },
+                ]);
+                onDisk('36', '37', '38');
+
+                expect((await POST(matchReq())).status).toBe(200);
+
+                expect(notifierSendAlert).toHaveBeenCalledTimes(1);
+                const [, payload] = notifierSendAlert.mock.calls[0] as [string, { title: string; description: string; email: string }];
+                expect(payload.title).toBe('Batman - 3 Issues Available!');
+                expect(payload.description).toContain('#36, #37, #38');
+                expect(payload.email).toBe('n@example.test');
+            });
+
+            it('tells each requester about their own issues', async () => {
+                requestsHeld([
+                    { id: 'req_37', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #37', ...nicolas },
+                    { id: 'req_38', status: 'PENDING', issueNumber: '38', activeDownloadName: 'Batman #38', ...adam },
+                ]);
+                onDisk('37', '38');
+
+                expect((await POST(matchReq())).status).toBe(200);
+
+                expect(notifierSendAlert).toHaveBeenCalledTimes(2);
+                expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({ title: 'Batman #37', user: 'nicolas', email: 'n@example.test' }));
+                expect(notifierSendAlert).toHaveBeenCalledWith('comic_available', expect.objectContaining({ title: 'Batman #38', user: 'adam', email: 'a@example.test' }));
+            });
+
+            it('never fails the match when an alert can\'t be sent', async () => {
+                notifierSendAlert.mockRejectedValueOnce(new Error('Discord webhook 500'));
+                requestsHeld([{ id: 'req_37', status: 'DOWNLOADING', issueNumber: '37', activeDownloadName: 'Batman #37', ...nicolas }]);
+                onDisk('37');
+
+                expect((await POST(matchReq())).status).toBe(200);
+                await new Promise(r => setTimeout(r, 0)); // let the detached rejection reach its catch
+                expect(mocks.updateManyRequests).toHaveBeenCalledWith(expect.objectContaining({ where: { id: { in: ['req_37'] } } }));
+            });
+        });
     });
 });
 

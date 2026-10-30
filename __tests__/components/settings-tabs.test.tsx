@@ -137,6 +137,19 @@ describe('Settings tabs (Phase 1 reorganization)', () => {
         expect(screen.queryByText(/Engine Performance/i)).not.toBeInTheDocument();
     });
 
+    // #244 + the naming cleanup: the live previews run the same naming rules (naming.ts) as every
+    // path that names a file - the padding setting, {IssueTitle}, and a Collected row included.
+    it('LibraryFilesTab previews names with the padding setting and every token', () => {
+        const { rerender } = render(<LibraryFilesTab s={mkBag()} />);
+        expect(screen.getByText('Issue Number Padding')).toBeInTheDocument();
+        expect(screen.getByText('Amazing Spider-Man #001.cbz')).toBeInTheDocument();
+        expect(screen.getByText('Amazing Spider-Man Vol. 001 (2022).cbz')).toBeInTheDocument(); // Collected Edition
+
+        rerender(<LibraryFilesTab s={mkBag({ config: { issue_number_padding: 'none', file_naming_pattern: '{Series} #{Issue} - {IssueTitle}' } })} />);
+        expect(screen.getByText('Amazing Spider-Man #1 - The Hunt.cbz')).toBeInTheDocument();
+        expect(screen.getByText('Amazing Spider-Man Vol. 1 (2022).cbz')).toBeInTheDocument();
+    });
+
     it('SearchIndexersTab renders Prowlarr config, scoring, and the relocated acronym expansion', () => {
         render(<SearchIndexersTab s={mkBag()} />);
         expect(screen.getByText(/Prowlarr URL/i)).toBeInTheDocument();

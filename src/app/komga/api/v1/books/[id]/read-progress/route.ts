@@ -9,7 +9,7 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { recordDailyReading } from '@/lib/reading-stats';
 import { evaluateTrophies } from '@/lib/trophy-evaluator';
 import { authenticateKomga, komgaGuard, komgaError, noContent } from '@/lib/komga/auth';
-import { findAccessibleIssue } from '@/lib/komga/data';
+import { bookLabel, findAccessibleIssue } from '@/lib/komga/data';
 
 export const dynamic = 'force-dynamic';
 
@@ -53,6 +53,14 @@ export async function PATCH(req: Request, { params }: { params: Promise<{ id: st
             update: { currentPage, totalPages: total, isCompleted: completed, updatedAt: new Date() },
             create: { userId, issueId: issue.id, currentPage, totalPages: total, isCompleted: completed },
         });
+        // One line per report, so a finished chapter that never syncs (On Deck stays empty) shows
+        // up as a missing line rather than a mystery.
+        Logger.log(
+            completed
+                ? `[Komga] ${auth.user.username} finished "${bookLabel(issue)}" (book ${issue.id})`
+                : `[Komga] ${auth.user.username} is on page ${currentPage} of "${bookLabel(issue)}" (book ${issue.id})`,
+            'info',
+        );
 
         evaluateTrophies(userId).catch((err: unknown) => {
             Logger.log(`[Komga read-progress] Trophy evaluation failed: ${getErrorMessage(err)}`, 'error');

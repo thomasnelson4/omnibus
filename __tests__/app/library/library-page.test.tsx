@@ -19,15 +19,25 @@ import { act, render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { ok, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
-const sessionUser = vi.hoisted(() => ({ id: 'admin_1', role: 'ADMIN', canRequest: false }));
+const viewer = vi.hoisted(() => ({ role: 'ADMIN', canRequest: false }));
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
 vi.mock('next-auth/react', () => ({
-    useSession: () => ({ data: { user: sessionUser }, status: 'authenticated' }),
+    useSession: () => ({ data: { user: { id: `${viewer.role.toLowerCase()}_1`, role: viewer.role, canRequest: viewer.canRequest } }, status: 'authenticated' }),
 }));
 vi.mock('next/navigation', () => ({
     useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
     useSearchParams: () => new URLSearchParams(),
 }));
+// The list view is a TableVirtuoso, which renders no rows in jsdom (no viewport to measure). A plain
+// table that renders every row through the page's own itemContent keeps the row markup under test.
+vi.mock('react-virtuoso', async () => {
+    const React = await import('react');
+    return {
+        TableVirtuoso: ({ data, itemContent, context }: any) =>
+            React.createElement('table', null, React.createElement('tbody', null,
+                data.map((item: any, i: number) => React.createElement('tr', { key: item.id ?? i }, itemContent(i, item, context))))),
+    };
+});
 
 import LibraryPage from '@/app/library/page';
 
@@ -58,9 +68,9 @@ let listCalls: string[] = [];
 // slow-but-correct drain — up to 2.8 s measured on a loaded full-suite run vs vitest's 5 s default.
 describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_000 }, () => {
     beforeEach(() => {
+        viewer.role = 'ADMIN';
+        viewer.canRequest = false;
         listCalls = [];
-        sessionUser.role = 'ADMIN';
-        sessionUser.canRequest = false;
         toast.mockClear();
         localStorage.clear();
         vi.stubGlobal('IntersectionObserver', class {
@@ -135,17 +145,92 @@ describe('LibraryPage grid pagination (scroll-saga client half)', { timeout: 15_
     });
 
     it('hides Add by ID from users without request permission', async () => {
-        sessionUser.role = 'USER';
+        viewer.role = 'USER';
         render(<LibraryPage />);
         await screen.findByText('Series 26');
         expect(screen.queryByRole('button', { name: 'Add by ID' })).toBeNull();
     });
 
     it('offers Add by ID to users with request permission', async () => {
-        sessionUser.role = 'USER';
-        sessionUser.canRequest = true;
+        viewer.role = 'USER';
+        viewer.canRequest = true;
         render(<LibraryPage />);
         await screen.findByText('Series 26');
         expect(screen.getByRole('button', { name: 'Add by ID' })).toBeTruthy();
+    });
+});
+
+// Found in the v1.4.7 permission sweep: the list view's Edit Metadata button was the one opener
+// of the series editor without an admin gate (the grid card and the series page had one). A
+// regular user got the editor, its read of the admin settings, and a save the server refuses.
+describe('LibraryPage list view: Edit Metadata is admin-only', { timeout: 15_000 }, () => {
+    beforeEach(() => {
+        localStorage.clear();
+        localStorage.setItem('omnibus-library-view', 'list');
+        vi.stubGlobal('IntersectionObserver', class { observe() {} unobserve() {} disconnect() {} } as any);
+        vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} } as any);
+        window.scrollTo = vi.fn() as any;
+        stubFetchRouter([
+            ['/api/library/follow', () => ok({ seriesIds: [] })],
+            ['/api/reading-lists', () => ok([])],
+            ['/api/library?', (u) => new URL(u, 'http://localhost').searchParams.get('namesOnly')
+                ? ok({ names: [] })
+                : ok({ series: [makeSeries(1)], hasMore: false, publishers: ['DC'] })],
+        ]);
+    });
+
+    it('a regular user gets the row actions but no Edit Metadata button', async () => {
+        viewer.role = 'USER';
+        await act(async () => { render(<LibraryPage />); });
+
+        // The row rendered (so the absence below is about the gate, not an empty table).
+        screen.getByLabelText('Add Series 01 to a reading list');
+        expect(screen.queryByLabelText('Edit metadata for Series 01')).toBeNull();
+    });
+
+    it('an admin still gets Edit Metadata on the row', async () => {
+        viewer.role = 'ADMIN';
+        await act(async () => { render(<LibraryPage />); });
+
+        screen.getByLabelText('Edit metadata for Series 01');
+    });
+});
+
+// First-run checklist: an empty Library explains what to do (the checklist's library variant)
+// instead of "No comics found matching your criteria." - which stays for a filter that matches
+// nothing in a library that does have comics.
+describe('LibraryPage empty state', { timeout: 15_000 }, () => {
+    const emptyLibraryWith = (status: unknown) => {
+        stubFetchRouter([
+            ['/api/library/follow', () => ok({ seriesIds: [] })],
+            ['/api/reading-lists', () => ok([])],
+            ['/api/setup-status', () => ok(status)],
+            ['/api/library?', (u) => new URL(u, 'http://localhost').searchParams.get('namesOnly')
+                ? ok({ names: [] })
+                : ok({ series: [], hasMore: false, publishers: [] })],
+        ]);
+    };
+
+    beforeEach(() => {
+        viewer.role = 'USER';
+        localStorage.clear();
+        vi.stubGlobal('IntersectionObserver', class { observe() {} unobserve() {} disconnect() {} });
+        vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
+        window.scrollTo = vi.fn() as unknown as typeof window.scrollTo;
+    });
+
+    it('tells a reader with an empty library how to get comics', async () => {
+        emptyLibraryWith({ role: 'USER', libraryEmpty: true, canRequest: true });
+        await act(async () => { render(<LibraryPage />); });
+
+        screen.getByText(/Your library is empty/i);
+        expect(screen.queryByText('No comics found matching your criteria.')).toBeNull();
+    });
+
+    it('keeps the no-match message when the library has comics but the filters match none', async () => {
+        emptyLibraryWith({ role: 'USER', libraryEmpty: false, canRequest: true });
+        await act(async () => { render(<LibraryPage />); });
+
+        screen.getByText('No comics found matching your criteria.');
     });
 });

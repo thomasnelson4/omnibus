@@ -11,6 +11,7 @@ import React from 'react';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ScheduledJobsPage from '@/app/admin/jobs/page';
+import { SCHEDULE_DEFAULTS } from '@/lib/schedule-defaults';
 
 vi.mock('next/navigation', () => ({
     useRouter: () => ({ push: vi.fn(), back: vi.fn() }),
@@ -83,6 +84,37 @@ describe('Jobs page: schedule-only ownership (Phase 3)', () => {
             expect(body.settings).toHaveProperty('series_json_schedule');
             expect(body.settings).toHaveProperty('cbr_conversion_schedule');
             expect(body.settings).not.toHaveProperty('cbr_conversion_enabled');
+        });
+    });
+});
+
+// What the page shows for a schedule nobody saved is exactly what the scheduler runs (one shared map,
+// src/lib/schedule-defaults.ts). The page used to hard-code these while the scheduler ran nothing.
+describe('Jobs page: unsaved schedules show the shared defaults', () => {
+    beforeEach(() => {
+        fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+            if (url === '/api/admin/config' && (!init || !init.method || init.method === 'GET')) {
+                return configResponse([]);
+            }
+            return { ok: true, json: async () => ({}) };
+        });
+    });
+
+    it('saves every schedule at its shared default when nothing was saved before', async () => {
+        render(<ScheduledJobsPage />);
+
+        const saveButton = await screen.findByRole('button', { name: /Save Schedule|Save Unsaved Changes/i });
+        await waitFor(() => expect(saveButton).toBeEnabled());
+        fireEvent.click(saveButton);
+
+        await waitFor(() => {
+            const post = fetchMock.mock.calls.find(([url, init]) => url === '/api/admin/config' && init?.method === 'POST');
+            expect(post).toBeTruthy();
+            const saved = JSON.parse(post![1].body).settings;
+            for (const [key, value] of Object.entries(saved)) {
+                expect(SCHEDULE_DEFAULTS[key as keyof typeof SCHEDULE_DEFAULTS], key).toBe(value);
+            }
+            expect(Object.keys(saved).length).toBeGreaterThan(10);
         });
     });
 });

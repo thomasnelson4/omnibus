@@ -7,7 +7,7 @@
 // number), Load more pagination, and the fallback ID path routing through the same resolver.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
-import { err, ok, stubFetchRouter } from '../../helpers/fetch';
+import { ok, err, stubFetchRouter } from '../../helpers/fetch';
 
 const toast = vi.fn();
 vi.mock('@/components/ui/use-toast', () => ({ useToast: () => ({ toast }) }));
@@ -522,4 +522,82 @@ describe('Smart Matcher — Auto-Scan decision flow', () => {
         expect(searchCalls).toHaveLength(0);
         expect(coverCalls).toHaveLength(0);
     });
+});
+
+describe('Smart Matcher — Start Auto-Scan error handling (review of #231)', () => {
+    const decision = (patch: Record<string, unknown>) => ({
+        status: 'provider_error', confidence: 'none', safeToAccept: false, autoAccept: false,
+        fingerprint: 'f'.repeat(64), algorithmVersion: 'evidence-1', requests: 0,
+        selected: null, candidates: [], reasons: ['Metron request failed'],
+        parsed: { title: 'Conan & Dragonero 001', alternateTitles: [], domain: 'issue', releaseTags: [], warnings: [] },
+        files: [], queries: ['conan dragonero'],
+        ...patch,
+    });
+
+    beforeEach(() => {
+        toast.mockClear();
+        localStorage.clear();
+        // The scan cache is session-scoped: a suggestion an earlier test cached for this same
+        // series would make the scan skip it, so this test would never reach the service.
+        sessionStorage.clear();
+    });
+    afterEach(() => vi.unstubAllGlobals());
+
+    it('records a server error as ERROR, not NOT_FOUND, so it gets retried on the next scan', async () => {
+        // A provider_error verdict must render as ERROR (retried), never as "no confident match"
+        // (cached and skipped) — the review of #231's distinction, now carried by the decision
+        // service's status instead of an HTTP failure in the browser.
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM])],
+            ['/api/admin/config', () => ok({
+                settings: [{ key: 'primary_metadata_source', value: 'METRON' }],
+            })],
+            ['/api/admin/sweep', () => ok({})],
+            ['/api/admin/smart-match', () => ok(decision({}))],
+        ]);
+
+        render(<SmartMatchPage />);
+        await screen.findByText('Conan & Dragonero 001');
+        fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+
+        await screen.findByText('Search failed. Rate limit hit?');
+        expect(screen.queryByText('No confident match found.')).toBeNull();
+    });
+
+    it('retries an ERROR row on the next scan, but not a NOT_FOUND row', async () => {
+        const OTHER = { ...RAW_ITEM, id: 'raw_WmFnb3I', name: 'Zagor 001', folderPath: '/unmatched/Zagor 001.cbz' };
+        const scans: string[] = [];
+        stubFetchRouter([
+            ['/api/admin/unmatched', () => ok([RAW_ITEM, OTHER])],
+            ['/api/admin/config', () => ok({
+                settings: [{ key: 'primary_metadata_source', value: 'METRON' }],
+            })],
+            ['/api/admin/sweep', () => ok({})],
+            ['/api/admin/smart-match', (_u, init) => {
+                const itemId = JSON.parse(init?.body || '{}').itemId as string;
+                scans.push(itemId);
+                // Conan's provider call fails; Zagor genuinely has nothing on the provider.
+                return ok(itemId === RAW_ITEM.id
+                    ? decision({ reasons: ['Metron request failed'] })
+                    : decision({ status: 'not_found', confidence: 'none', reasons: [] }));
+            }],
+        ]);
+
+        render(<SmartMatchPage />);
+        await screen.findByText('Conan & Dragonero 001');
+        const start = () => fireEvent.click(screen.getByRole('button', { name: /Start Auto-Scan/ }));
+
+        start();
+        await screen.findByText('Search failed. Rate limit hit?');
+        await screen.findByText('No confident match found.');
+        await screen.findByRole('button', { name: /Start Auto-Scan/ });
+        expect(scans).toHaveLength(2);
+
+        scans.length = 0;
+        start();
+        await waitFor(() => expect(scans).toHaveLength(1));
+        await screen.findByRole('button', { name: /Start Auto-Scan/ });
+        // Only the ERROR row is re-asked; the cached NOT_FOUND verdict is left alone.
+        expect(scans).toEqual([RAW_ITEM.id]);
+    }, 15000);
 });

@@ -6,7 +6,8 @@ import fs from 'fs';
 import path from 'path';
 import axios from 'axios';
 import { detectManga } from '@/lib/manga-detector';
-import { DiscordNotifier } from '@/lib/discord'; 
+import { DiscordNotifier } from '@/lib/discord';
+import { SystemNotifier } from '@/lib/notifications';
 import { getErrorMessage } from '@/lib/utils/error';
 import { Logger } from '@/lib/logger'; 
 import { MetronProvider } from '@/lib/metadata/providers/metron';
@@ -16,9 +17,10 @@ import { getAuthOptions } from '@/app/api/auth/[...nextauth]/options';
 import { getServerSession } from 'next-auth/next';
 import { omnibusQueue } from '@/lib/queue';
 import { describeIssueFromFilename, normalizeFractionNumbers, isSameIssue } from '@/lib/utils/issue-parser';
+import { issueNumberOf } from '@/lib/request-dedupe';
 import { COMIC_EXTENSIONS } from '@/lib/utils/formats';
 import { sanitizeFilename } from '@/lib/utils/sanitize';
-import { UNMATCHED_DIR, CONFIG_DIR, isPathWithinRoots } from '@/lib/utils/paths';
+import { UNMATCHED_DIR, CONFIG_DIR, isPathWithinRoots, serverPathProblem } from '@/lib/utils/paths';
 import { safeRelocateFolder, moveFileSafe, ensureLibraryDir } from '@/lib/utils/safe-fs';
 import { comicInfoDefaultsUpdateFragment } from '@/lib/utils/comicinfo-fields';
 import { countArchivePages } from '@/lib/utils/archive-pages';
@@ -28,7 +30,8 @@ import { findLocalCoverBasename } from '@/lib/utils/cover-plan';
 import { parseComicVineCredits } from '@/lib/utils';
 import { folderOwner, suggestFreeFolderName, attachAsCollected } from '@/lib/match-collision';
 import { assertAutomaticMatch, revalidateAutomaticMatch, type AutomaticMatchToken } from '@/lib/smart-match/service';
-import { replaceNamingToken } from '@/lib/utils/naming';
+import { issueFileName, issuePaddingFromSetting, issueTitleForName, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
+import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
 
 // #199 round 4 Beta B: only non-empty credit groups become columns (never write a literal '[]' —
 // issue #179), stringified to the Issue JSON-array convention.
@@ -74,6 +77,52 @@ async function fetchIssueCreditsForImport(provider: string, issueMetaId: string)
     } catch (e) {
         Logger.log(`[Match Series] Issue-credit fetch failed for ${provider} ${issueMetaId}: ${getErrorMessage(e)} — the title will be written unlocked.`, 'warn');
         return null;
+    }
+}
+
+type MatchedRequest = {
+    id: string;
+    userId: string;
+    imageUrl: string | null;
+    user?: { username: string | null; email: string | null } | null;
+};
+
+/**
+ * The "available" alert for the requests a match just completed - Discord, email, Pushover, Telegram,
+ * Apprise - which used to hear nothing while the importer alerts for every request it completes. One
+ * alert per requester (a match often completes several at once). Unlike the importer, it doesn't wait
+ * for the requester's other requests in the volume to finish: a match is a deliberate admin action,
+ * and one stuck request would hold the alert forever. Never awaited, so an unreachable webhook or
+ * mail server can't fail or slow the match.
+ */
+function announceMatchedRequests(
+    closed: MatchedRequest[],
+    issueNumbers: Map<string, string>,
+    series: { name: string; publisher?: string | null; year?: number | null },
+): void {
+    const byUser = new Map<string, MatchedRequest[]>();
+    for (const req of closed) byUser.set(req.userId, [...(byUser.get(req.userId) ?? []), req]);
+
+    for (const reqs of byUser.values()) {
+        const issues = [...new Set(reqs.map(r => issueNumbers.get(r.id) ?? ''))]
+            .filter(Boolean)
+            .sort((a, b) => (parseFloat(a) - parseFloat(b)) || a.localeCompare(b));
+        if (issues.length === 0) continue;
+        const first = reqs[0];
+        const one = issues.length === 1;
+
+        SystemNotifier.sendAlert('comic_available', {
+            title: one ? `${series.name} #${issues[0]}` : `${series.name} - ${issues.length} Issues Available!`,
+            imageUrl: first.imageUrl,
+            user: first.user?.username,
+            email: first.user?.email,
+            description: one
+                ? `Matched in the Smart Matcher - #${issues[0]} is in your library and ready to read.`
+                : `Matched in the Smart Matcher - #${issues.join(', #')} are in your library and ready to read.`,
+            publisher: series.publisher || undefined,
+            year: series.year ? String(series.year) : undefined,
+            date: new Date().toLocaleString(),
+        }).catch((e: unknown) => Logger.log(`[Match Series] Couldn't send the "available" alert to ${first.user?.username || 'the requester'}: ${getErrorMessage(e)}`, 'warn'));
     }
 }
 
@@ -168,13 +217,7 @@ export async function POST(request: Request) {
     if (!realName) realName = path.basename(oldFolderPath).replace(/\s\(\d{4}\)$/, "").trim(); 
     if (!realPublisher) realPublisher = 'Other';
 
-    const safePublisher = sanitizeFilename(realPublisher);
     const safeName = sanitizeFilename(realName);
-    const safeYear = realYear > 0 ? realYear.toString() : '';
-    // {UniverseName}/{SeriesGroup} are admin-supplied (the Smart Matcher metadata editor) — providers
-    // don't reliably expose them. Sanitized here so they can build folder/file paths like every other token.
-    const safeUniverse = universe ? sanitizeFilename(universe) : '';
-    const safeSeriesGroup = seriesGroup ? sanitizeFilename(seriesGroup) : '';
     
     // The records are fetched BEFORE the manga decision — they carry the prior signals.
     let existingRecord = await prisma.series.findUnique({
@@ -197,7 +240,6 @@ export async function POST(request: Request) {
         ? existingRecord.imprint
         : (unmatchedRecord?.imprint ?? existingRecord?.imprint ?? '');
     const effectiveImprint = imprint !== undefined ? imprint : storedImprint;
-    const safeImprint = effectiveImprint ? sanitizeFilename(effectiveImprint) : '';
     // A merge deletes the source row. Retain any imprint adopted from it on the surviving
     // series so subsequent Standardize runs use the same value as this move.
     const adoptedImprint = imprint === undefined && existingRecord && !existingRecord.imprint?.trim()
@@ -224,26 +266,24 @@ export async function POST(request: Request) {
 
     if (!targetLib) targetLib = libraries[0];
     if (!targetLib) return NextResponse.json({ error: "No libraries configured." }, { status: 400 });
+    // A Root Path saved before saves were checked (e.g. `C:\Comics` under Docker) would fail below as a
+    // bare "EACCES: permission denied, mkdir 'C:'" - name the library and the fix instead.
+    const rootProblem = serverPathProblem(targetLib.path);
+    if (rootProblem) {
+        return NextResponse.json({ error: `Root Path of library "${targetLib.name}": ${rootProblem} Change it in Settings > Library & Files.` }, { status: 400 });
+    }
 
     const settings = await prisma.systemSetting.findMany();
     const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
     const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
 
-    let relFolderPath = folderPattern
-        .replace(/{Publisher}/gi, safePublisher || "Other")
-        .replace(/{Series}/gi, safeName || "Unknown Series")
-        .replace(/{Year}/gi, safeYear)
-        .replace(/{VolumeYear}/gi, safeYear)
-        .replace(/{UniverseName}/gi, safeUniverse)
-        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-    relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+    // {UniverseName}/{SeriesGroup} are admin-supplied (the Smart Matcher metadata editor) — providers
+    // don't reliably expose them.
+    const seriesValues: NamingInput = { publisher: realPublisher, series: realName, seriesYear: realYear, universe, seriesGroup, imprint: effectiveImprint };
+    const folderParts = seriesFolderSegments(folderPattern, seriesValues);
+    if (!folderParts) {
+        return NextResponse.json({ error: "The folder naming pattern doesn't produce a folder inside the library for this series. Check Settings > Library & Files." }, { status: 400 });
+    }
     let newFolderPath = path.join(targetLib.path, ...folderParts).replace(/\\/g, '/');
 
     // Folder collision (field report by robotshavehearts2, "Image does it a lot"): a run and its
@@ -463,30 +503,68 @@ export async function POST(request: Request) {
         conflicts += folderConflicts;
         activeFolderPath = newFolderPath;
 
-        // Repoint every moved issue, not just a clicked loose file. Require a directory boundary
-        // so /X never catches /X (2016), and leave conflict files at their actual source path.
+        // FIX (comicinfo-embed-stale-path): safeRelocateFolder only moves files on disk. The per-file
+        // loop below only updates Issue.filePath for the single "clicked" target file (isTargetFile
+        // guard) -- every sibling issue in a folder-level match is left with a filePath pointing at
+        // oldFolderPath, which no longer exists. inject_xml_into_zip's path.exists() check then
+        // silently no-ops the embed for every one of them. Repoint every affected row's filePath
+        // prefix now that the physical move already happened -- pure DB correction, no filesystem writes.
         if (existingRecord?.id) {
+            // A bare prefix match (no trailing separator) also catches an unrelated sibling series
+            // whose own folder name starts with this one's — "Comics/Marvel/X" is a startsWith-prefix
+            // of "Comics/Marvel/X (2016)", so merging the former into a new home would otherwise also
+            // rewrite the LATTER series' own issues. Normalize both sides and require the separator.
+            const normOld = path.normalize(oldFolderPath).replace(/\\/g, '/').replace(/\/+$/, '');
+            const normNew = path.normalize(newFolderPath).replace(/\\/g, '/').replace(/\/+$/, '');
+            const oldPrefix = normOld + '/';
             const staleIssues = await prisma.issue.findMany({
-                where: { seriesId: existingRecord.id, filePath: { not: null } }
+                where: { seriesId: existingRecord.id, filePath: { startsWith: oldPrefix } },
+                select: { id: true, filePath: true }
             });
-            const normalize = (p: string) => path.posix.normalize(p.replace(/\\/g, '/'));
-            const oldPrefix = normalize(oldFolderPath).replace(/\/$/, '') + '/';
-            const newPrefix = normalize(newFolderPath).replace(/\/$/, '') + '/';
-            const updates = [];
-            for (const issue of staleIssues) {
-                if (!issue.filePath) continue;
-                const oldFilePath = normalize(issue.filePath);
-                if (!oldFilePath.startsWith(oldPrefix)) continue;
-                const newFilePath = newPrefix + oldFilePath.slice(oldPrefix.length);
-                if (fs.existsSync(issue.filePath) || !fs.existsSync(newFilePath)) continue;
-                updates.push(prisma.issue.update({
-                    where: { id: issue.id },
-                    data: { filePath: newFilePath }
-                }));
+            // Async probes: a big series on a network share would otherwise block the event loop
+            // with two sync stats per issue.
+            const exists = (p: string) => fs.promises.access(p).then(() => true, () => false);
+            const probes = await Promise.all(staleIssues.map(async (issue) => {
+                if (!issue.filePath) return null;
+                const movedPath = normNew + '/' + issue.filePath.slice(oldPrefix.length);
+                // The stored path is probed as-is: on Linux "\" is an ordinary filename character, so
+                // normalising it would miss a file that never left and repoint its row.
+                const [atNew, atOld] = await Promise.all([exists(movedPath), exists(issue.filePath)]);
+                return { id: issue.id, movedPath, atNew, atOld };
+            }));
+            const pathUpdates = [];
+            let leftAtOld = 0;
+            let missing = 0;
+            for (const probe of probes) {
+                if (!probe) continue;
+                // safeRelocateFolder leaves a same-name collision at the OLD path rather than
+                // overwriting the destination (see its own conflict handling) -- repointing that row
+                // would point it at the file that's actually sitting in the collision's spot, not the
+                // file this row has always described. Only repoint when the move actually happened.
+                if (probe.atOld) {
+                    leftAtOld++;
+                } else if (probe.atNew) {
+                    pathUpdates.push(prisma.issue.update({ where: { id: probe.id }, data: { filePath: probe.movedPath } }));
+                } else {
+                    missing++;
+                }
             }
-            if (updates.length > 0) {
-                await prisma.$transaction(updates);
-                Logger.log(`[Match Series] Repointed filePath for ${updates.length} issue(s) after folder relocate.`, 'info');
+            const notes = [
+                ...(leftAtOld > 0 ? [`${leftAtOld} left at the old path (usually a same-named file already at the destination)`] : []),
+                ...(missing > 0 ? [`${missing} not found at the old or the new path`] : []),
+            ];
+            const level = missing > 0 ? 'warn' : 'info';
+            if (pathUpdates.length > 0) {
+                const committed = await prisma.$transaction(pathUpdates).then(() => true, (err) => {
+                    Logger.log(`[Match Series] Repoint filePath transaction failed; ${pathUpdates.length} issue(s) still point at the old folder: ${getErrorMessage(err)}`, 'error');
+                    return false;
+                });
+                if (committed) {
+                    Logger.log(`[Match Series] Repointed filePath for ${pathUpdates.length} issue(s) after folder relocate.`
+                        + (notes.length > 0 ? ` (${notes.join('; ')})` : ''), level);
+                }
+            } else if (notes.length > 0) {
+                Logger.log(`[Match Series] No filePath repointed after folder relocate: ${notes.join('; ')}.`, level);
             }
         }
     }
@@ -551,35 +629,43 @@ export async function POST(request: Request) {
                 }
                 
                 if (issueNumStr) {
-                    // Issue #200: a raw "½" is length 1 and would pad to "0½" — normalize first so
-                    // filenames and the DB row both say "0.5".
+                    // Issue #200: the DB row says "0.5", never "½".
                     issueNumStr = normalizeFractionNumbers(issueNumStr);
-                    let formattedNum = issueNumStr;
-                    if (!issueNumStr.includes('.') && issueNumStr.length === 1) formattedNum = `0${issueNumStr}`;
-                    
+
                     // #203 Phase 1: an annual keeps the Mylar-shaped name wherever it's named.
                     const filePatternToUse = isAnnualFile
-                        ? "{Series} Annual #{Issue} ({IssueYear})"
+                        ? ANNUAL_FILE_PATTERN
                         : isManga
                             ? (config.manga_file_naming_pattern || "{Series} Vol. {Issue}")
                             : (config.file_naming_pattern || "{Series} #{Issue}");
-                        
-                    const issueYear = existingRecord ? (existingRecord.year?.toString() || safeYear) : safeYear;
-                        
-                    // Use finalExt so the rename applies the verified extension
-                    let newFileName = filePatternToUse
-                        .replace(/{Publisher}/gi, safePublisher || "Other")
-                        .replace(/{Series}/gi, safeName)
-                        .replace(/{Year}/gi, safeYear)
-                        .replace(/{VolumeYear}/gi, safeYear)
-                        .replace(/{IssueYear}/gi, issueYear)
-                        .replace(/{Issue}/gi, formattedNum)
-                        .replace(/{UniverseName}/gi, safeUniverse)
-                        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
 
-                    newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-                        .replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '').replace(/\s+/g, ' ').trim() + finalExt;
-                    
+                    // The series' rows in this file's domain, read before naming: the matched row's
+                    // release date is the file's {IssueYear} (#243 - this used the series' year), and
+                    // the adopt-or-create below reuses the same rows.
+                    // #203: find within the SAME domain — "Annual #1" must never adopt the main run's "#1" row.
+                    let domainRows: Array<{ id: string; number: string; name: string | null; releaseDate: string | null }> = [];
+                    if (existingRecord) {
+                        try {
+                            domainRows = await prisma.issue.findMany({
+                                where: { seriesId: existingRecord.id, isAnnual: isAnnualFile },
+                                select: { id: true, number: true, name: true, releaseDate: true },
+                            });
+                        } catch (e) {
+                            Logger.log(`[Match Series] Could not read the series' issues for ${file}: ${getErrorMessage(e)}`, 'warn');
+                        }
+                    }
+                    const matchedRow = domainRows.find(r => isSameIssue(r.number, issueNumStr)) ?? null;
+
+                    // Use finalExt so the rename applies the verified extension. The title is the one
+                    // this match sets on the row, else the row's own - what Standardize will name it.
+                    const newFileName = (issueFileName(filePatternToUse, {
+                        ...seriesValues,
+                        seriesYear: existingRecord?.year || realYear,
+                        issueNumber: issueNumStr,
+                        releaseDate: matchedRow?.releaseDate,
+                        issueTitle: issueTitleForName(String(issueTitle ?? '').trim() || matchedRow?.name, realName, issueNumStr),
+                    }, issuePaddingFromSetting(config.issue_number_padding)) ?? path.basename(file, path.extname(file))) + finalExt;
+
                     const oldFilePath = path.join(activeFolderPath, file);
                     const newFilePath = path.join(activeFolderPath, newFileName);
                     changedPaths.push(oldFilePath, newFilePath);
@@ -634,16 +720,11 @@ export async function POST(request: Request) {
                         }
 
                         try {
-                            // #203: find within the SAME domain — "Annual #1" must never adopt the
-                            // main run's "#1" row (Phase 0's rule, applied at the match surface too).
                             // #205: by issue IDENTITY, never the raw string — the provider's row may
                             // read "13½" while the file and the admin say "13.5". Looked up as a
                             // string, that row was missed and Accept created a twin beside it.
-                            const domainRows: Array<{ id: string; number: string }> = await prisma.issue.findMany({
-                                where: { seriesId: existingRecord.id, isAnnual: isAnnualFile },
-                                select: { id: true, number: true },
-                            });
-                            const existingIssue = domainRows.find(r => isSameIssue(r.number, issueNumStr)) ?? null;
+                            // (domainRows / matchedRow were read before naming, in the file's domain.)
+                            const existingIssue = matchedRow;
 
                             let finalIssueId;
 
@@ -767,29 +848,49 @@ export async function POST(request: Request) {
     }
 
     try {
+        // #240 review: this close-out has to answer the same two questions as the monitor, or the
+        // request a review asked for is never closed. (1) A NEEDS_REVIEW row is precisely the case
+        // this route is the tool for — "the pack was consumed and the issue never arrived" — so the
+        // match that finally puts the issue on disk must close it; it used to be left out of the
+        // status list and stayed NEEDS_REVIEW for good. (2) The issue is identified with the monitor's
+        // own helper — the stored number, else the name parse — because parsing activeDownloadName
+        // here read "#37" out of a pack title like "X-Men #34-40" as 34 and never matched the issue
+        // the request was actually for.
         const pendingRequests = await prisma.request.findMany({
-            where: { volumeId: targetMetaId, status: { in: ['MANUAL_DDL', 'PENDING', 'DOWNLOADING'] } }
+            where: { volumeId: targetMetaId, status: { in: ['MANUAL_DDL', 'PENDING', 'DOWNLOADING', 'NEEDS_REVIEW'] } },
+            include: { user: { select: { username: true, email: true } } }
         });
 
         if (pendingRequests.length > 0) {
             const seriesIssues = await prisma.issue.findMany({ where: { series: { metadataId: targetMetaId } } });
-            const requestsToComplete = [];
+            const requestsToComplete: typeof pendingRequests = [];
+            const issueNumbers = new Map<string, string>();
 
             for (const dbReq of pendingRequests) {
-                const searchStr = (dbReq.activeDownloadName || (dbReq as any).title || (dbReq as any).name || "");
-                // Added -? to capture negative requested issues
-                const numMatch = searchStr.match(/(?:#|issue\s*#?)\s*(-?\d+(?:\.\d+)?)/i);
-                const issueNum = numMatch ? parseFloat(numMatch[1]) : null;
-                if (issueNum === null) continue;
-                const matchingIssue = seriesIssues.find(i => parseFloat(i.number) === issueNum && i.filePath && i.filePath.length > 0);
+                const issueNumber = issueNumberOf(dbReq);
+                if (!issueNumber) continue;
+                const matchingIssue = seriesIssues.find(i => isSameIssue(i.number, issueNumber) && i.filePath && i.filePath.length > 0);
 
-                if (matchingIssue) requestsToComplete.push(dbReq.id);
+                if (matchingIssue) {
+                    requestsToComplete.push(dbReq);
+                    issueNumbers.set(dbReq.id, issueNumber);
+                }
             }
 
             if (requestsToComplete.length > 0) {
+                // The match that delivered the issue is the news, so every request it closes rings
+                // the "available" bell once — `notified: false`, as the importer closes them. A
+                // DOWNLOADING / PENDING / MANUAL_DDL row whose "Downloading" line the requester had
+                // already cleared (notified: true) used to close silently; a NEEDS_REVIEW row was
+                // never announced at all.
                 await prisma.request.updateMany({
-                    where: { id: { in: requestsToComplete } },
-                    data: { status: 'COMPLETED', progress: 100 }
+                    where: { id: { in: requestsToComplete.map(r => r.id) } },
+                    data: { status: 'COMPLETED', progress: 100, notified: false }
+                });
+                announceMatchedRequests(requestsToComplete, issueNumbers, {
+                    name: existingRecord?.name || realName,
+                    publisher: existingRecord?.publisher,
+                    year: existingRecord?.year || realYear,
                 });
             }
         }
@@ -820,9 +921,21 @@ export async function POST(request: Request) {
             }
         }
 
-        // METADATA_SYNC embeds after fetching, so don't enqueue a concurrent writer using the
-        // same archive temp path. If fetching fails or a running sync suppresses this job,
-        // custom edits remain in the DB and reach files on the next successful embed.
+        // FIX (comicinfo-embed-race): this used to also queue a standalone EMBED_METADATA job here,
+        // alongside the METADATA_SYNC job queued a few lines above for the same series. The engine
+        // can run both at once. Until v1.4.7-beta.003 both embed jobs wrote through the SAME temp file
+        // for a given archive ("X.cbz.tmp") and could corrupt each other's output; temp files are now
+        // unique per write (temp_sibling in converter.rs), but two concurrent embeds still race for
+        // the final rename and the last one wins. METADATA_SYNC already embeds on its own,
+        // synchronously, right after its fetch completes, so the standalone job was never adding
+        // anything; it only added a second writer to race against. Removed rather than locked.
+        //
+        // Cost of removing it: this admin edit (SeriesGroup/Universe/Description/etc.) now only
+        // reaches the files on METADATA_SYNC's own embed -- which doesn't happen if that fetch fails,
+        // or if a sync for this series is already in flight and this one gets skipped (metadata.rs's
+        // own in-progress guard). In either case the edit is saved in the DB but waits for the next
+        // successful sync/embed to actually land in the files. A per-file lock in the writer, so a
+        // dedicated embed job could safely coexist with METADATA_SYNC's, would close that gap.
     } catch (e: any) {
         Logger.log(`[Match Series] Failed to queue jobs: ${e.message}`, 'warn');
     }

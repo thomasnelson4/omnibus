@@ -22,13 +22,26 @@ export default function AdminTrophies() {
     const [editing, setEditing] = useState<any>({ name: "", description: "", actionType: "READ_COUNT", targetValue: "", iconBase64: null })
     const { toast } = useToast()
 
+    // The handlers live at /api/trophies (admin-only). This page used to ask /api/admin/trophies, a
+    // route that never existed, so the list was always empty and saves/deletes silently did nothing.
+    const errorOf = async (res: Response, fallback: string) => {
+        const body = await res.json().catch(() => null);
+        return (body && typeof body.error === 'string' && body.error) || fallback;
+    }
+
     const fetchTrophies = async () => {
         try {
-            const res = await fetch('/api/admin/trophies')
-            setTrophies(await res.json())
+            const res = await fetch('/api/trophies')
+            const data = await res.json().catch(() => null)
+            if (res.ok && Array.isArray(data)) setTrophies(data)
+            else toast({ variant: "destructive", title: "Couldn't load trophies", description: data?.error || `HTTP ${res.status}` })
+        } catch (e) {
+            toast({ variant: "destructive", title: "Couldn't load trophies", description: "The server could not be reached." })
         } finally { setLoading(false) }
     }
 
+    // Load once on mount; fetchTrophies reads only setters and the stable toast.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     useEffect(() => { fetchTrophies() }, [])
 
     useEffect(() => {
@@ -44,8 +57,16 @@ export default function AdminTrophies() {
     }
 
     const handleSave = async () => {
+        if (!String(editing.name ?? '').trim()) {
+            toast({ variant: "destructive", title: "Missing name", description: "Give the trophy a name." });
+            return;
+        }
+        if (!/^\d+$/.test(String(editing.targetValue ?? '').trim()) || Number(editing.targetValue) < 1) {
+            toast({ variant: "destructive", title: "Invalid target", description: "The target milestone must be a whole number of 1 or more." });
+            return;
+        }
         try {
-            const res = await fetch('/api/admin/trophies', {
+            const res = await fetch('/api/trophies', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(editing)
             });
@@ -53,15 +74,18 @@ export default function AdminTrophies() {
                 toast({ title: "Trophy Saved" });
                 setModalOpen(false);
                 fetchTrophies();
+            } else {
+                toast({ variant: "destructive", title: "Save Failed", description: await errorOf(res, `HTTP ${res.status}`) });
             }
-        } catch (e) { toast({ variant: "destructive", title: "Error" }); }
+        } catch (e) { toast({ variant: "destructive", title: "Error", description: "The server could not be reached." }); }
     }
 
     const handleDelete = async (id: string) => {
         try {
-            const res = await fetch(`/api/admin/trophies?id=${id}`, { method: 'DELETE' });
+            const res = await fetch(`/api/trophies?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
             if (res.ok) fetchTrophies();
-        } catch (e) { toast({ variant: "destructive", title: "Error" }); }
+            else toast({ variant: "destructive", title: "Delete Failed", description: await errorOf(res, `HTTP ${res.status}`) });
+        } catch (e) { toast({ variant: "destructive", title: "Error", description: "The server could not be reached." }); }
     }
 
     if (loading) return (
@@ -109,8 +133,8 @@ export default function AdminTrophies() {
                             </div>
                         </CardContent>
                         <div className="absolute top-2 right-2 flex opacity-0 group-hover:opacity-100 transition-opacity gap-1">
-                            <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-primary/10 text-primary" onClick={() => { setEditing(t); setModalOpen(true); }}><Edit className="w-4 h-4"/></Button>
-                            <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" onClick={() => handleDelete(t.id)}><Trash2 className="w-4 h-4"/></Button>
+                            <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-primary/10 text-primary" aria-label={`Edit trophy ${t.name}`} onClick={() => { setEditing(t); setModalOpen(true); }}><Edit className="w-4 h-4"/></Button>
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" aria-label={`Delete trophy ${t.name}`} onClick={() => handleDelete(t.id)}><Trash2 className="w-4 h-4"/></Button>
                         </div>
                     </Card>
                 ))}
@@ -129,17 +153,17 @@ export default function AdminTrophies() {
                                 ) : (
                                     <Upload className="w-6 h-6 text-muted-foreground group-hover:text-primary transition-colors" />
                                 )}
-                                <input type="file" className="absolute inset-0 opacity-0 cursor-pointer" accept="image/*" onChange={handleIconUpload} />
+                                <input type="file" aria-label="Upload trophy icon" className="absolute inset-0 opacity-0 cursor-pointer" accept="image/png,image/jpeg,image/webp,image/gif" onChange={handleIconUpload} />
                             </div>
-                            <span className="text-[10px] text-muted-foreground font-medium">Upload Icon (Optional)</span>
+                            <span className="text-[10px] text-muted-foreground font-medium">Upload Icon (Optional — PNG, JPEG, WebP or GIF)</span>
                         </div>
                         <div className="grid gap-2">
-                            <Label className="text-foreground">Trophy Name</Label>
-                            <Input value={editing.name} onChange={e => setEditing({...editing, name: e.target.value})} placeholder="e.g. Bronze Reader" className="bg-background border-border" />
+                            <Label htmlFor="trophy-name" className="text-foreground">Trophy Name</Label>
+                            <Input id="trophy-name" value={editing.name} onChange={e => setEditing({...editing, name: e.target.value})} placeholder="e.g. Bronze Reader" className="bg-background border-border" />
                         </div>
                         <div className="grid gap-2">
-                            <Label className="text-foreground">Description</Label>
-                            <Input value={editing.description} onChange={e => setEditing({...editing, description: e.target.value})} placeholder="e.g. Read your first 10 comics." className="bg-background border-border" />
+                            <Label htmlFor="trophy-description" className="text-foreground">Description</Label>
+                            <Input id="trophy-description" value={editing.description} onChange={e => setEditing({...editing, description: e.target.value})} placeholder="e.g. Read your first 10 comics." className="bg-background border-border" />
                         </div>
                         <div className="grid grid-cols-2 gap-4">
                             <div className="grid gap-2">
@@ -156,8 +180,8 @@ export default function AdminTrophies() {
                                 </Select>
                             </div>
                             <div className="grid gap-2">
-                                <Label className="text-foreground">Target Milestone</Label>
-                                <Input type="number" value={editing.targetValue} onChange={e => setEditing({...editing, targetValue: e.target.value})} placeholder="e.g. 10" className="bg-background border-border" />
+                                <Label htmlFor="trophy-target" className="text-foreground">Target Milestone</Label>
+                                <Input id="trophy-target" type="number" min={1} step={1} value={editing.targetValue} onChange={e => setEditing({...editing, targetValue: e.target.value})} placeholder="e.g. 10" className="bg-background border-border" />
                             </div>
                         </div>
                     </div>

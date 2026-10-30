@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runSystemHealthCheck } from '@/lib/health-checker';
 import fs from 'fs-extra';
+import { pinPlatform } from '../helpers/platform';
 
 // 1. Hoist Mocks
 const mocks = vi.hoisted(() => ({
@@ -149,6 +150,31 @@ describe('System Health & Diagnostics', () => {
         const permCheck = result.checks.find(c => c.id.startsWith('lib_write_'));
         expect(permCheck?.status).toBe('warning');
         expect(permCheck?.message).toContain('read-only');
+    });
+
+    // Discord field report (2026-10-13): a library saved as `C:\Comics` inside the Linux container.
+    // It used to read "Path C:\Comics is inaccessible." - true, but no hint that the PATH is the
+    // problem. The check runs before the existence probe: a relative path can even "exist" (it
+    // resolves under the app's working directory), which is worse.
+    it('says when a library Root Path is not a path the server can use, and how to fix it', async () => {
+        const restore = pinPlatform('linux');
+        try {
+            mocks.findManyLibraries.mockResolvedValue([
+                { id: 'lib_1', name: 'Main', path: 'C:\\Comics', isManga: false },
+                { id: 'lib_2', name: 'Manga', path: '/manga', isManga: true }
+            ]);
+
+            const result = await runSystemHealthCheck();
+
+            const check = result.checks.find(c => c.id === 'lib_acc_lib_1');
+            expect(check?.status).toBe('error');
+            expect(check?.message).toContain('"C:\\Comics" is a Windows path');
+            expect(check?.actionLink).toBe('/admin/settings');
+            expect(result.checks.find(c => c.id === 'lib_acc_lib_2')).toBeUndefined();
+            expect(result.checks.find(c => c.id === 'lib_acc')).toBeUndefined();
+        } finally {
+            restore();
+        }
     });
 
     it('reports an unreachable engine as ERROR with the compose-upgrade hint (issue #187)', async () => {

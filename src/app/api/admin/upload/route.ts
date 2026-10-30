@@ -32,6 +32,9 @@ import { AuditLogger } from '@/lib/audit-logger';
 import { WATCHED_DIR, UNMATCHED_DIR, isPathWithinRoots } from '@/lib/utils/paths';
 import { isComicFile } from '@/lib/utils/formats';
 import { sanitizeFilename } from '@/lib/utils/sanitize';
+// A taken name becomes "(copy N)", never a bare "(N)" - the filename parser would read that as the
+// issue number on scene-style names (see unique-path.ts).
+import { resolveUniquePath } from '@/lib/utils/unique-path';
 import { noteChunkAppended, sessionBytes, dropSession, sweepSessions, freshFileSize, verifyChunkOffset, verifyAssembledSize } from '@/lib/uploads/chunk-session';
 import { prisma } from '@/lib/db';
 import { Importer } from '@/lib/importer';
@@ -41,20 +44,6 @@ export const runtime = 'nodejs';
 
 const MAX_UPLOAD_MB = Number(process.env.OMNIBUS_MAX_UPLOAD_MB) || 2048;
 const MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
-
-// Find a non-colliding destination by appending " (n)" before the extension, mirroring the
-// de-duplication style used elsewhere in the importer.
-async function resolveUniquePath(dir: string, filename: string): Promise<string> {
-  const ext = path.extname(filename);
-  const base = path.basename(filename, ext);
-  let candidate = path.join(dir, filename);
-  let n = 1;
-  while (await fs.pathExists(candidate)) {
-    candidate = path.join(dir, `${base} (${n})${ext}`);
-    n++;
-  }
-  return candidate;
-}
 
 export async function POST(req: NextRequest) {
   let tmpPath: string | null = null;

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 use tokio::task::JoinSet;
 use regex::Regex;
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use crate::naming::{self, IssuePadding, NamingInput};
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
@@ -84,6 +85,99 @@ fn re_metron_issue() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"/issue/(\d+)").unwrap())
 }
 
+// ==========================================
+// ONE SWEEP AT A TIME
+// ==========================================
+// Three things trigger a sweep: the schedule, the importer after it routes a batch pack here, and
+// an admin's Run now. A sweep converting big packs can outlast the next trigger, and two sweeps
+// over one folder race each other's moves and imports (#240). A trigger that lands mid-sweep is
+// folded into ONE more sweep after the running one - its files may have arrived after the running
+// sweep listed the folder, so dropping it would leave them for the next scheduled run.
+
+struct SweepState {
+    running: bool,
+    rerun: bool,
+}
+
+/// Admits one watched-folder sweep at a time; see [`spawn_exclusive`].
+pub(crate) struct SweepGate(Mutex<SweepState>);
+
+/// The gate every watched-folder trigger goes through.
+pub(crate) static WATCHED_SWEEP: SweepGate = SweepGate::new();
+
+impl SweepGate {
+    pub(crate) const fn new() -> Self {
+        SweepGate(Mutex::new(SweepState { running: false, rerun: false }))
+    }
+
+    fn state(&self) -> MutexGuard<'_, SweepState> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Claims the gate, or None when a sweep is running - which then sweeps once more.
+    fn try_acquire(&'static self) -> Option<SweepClaim> {
+        let mut s = self.state();
+        if s.running {
+            s.rerun = true;
+            None
+        } else {
+            s.running = true;
+            Some(SweepClaim { gate: self, released: false })
+        }
+    }
+}
+
+/// The running sweep's hold on its gate; dropping it (a panicked sweep included) opens the gate.
+struct SweepClaim {
+    gate: &'static SweepGate,
+    released: bool,
+}
+
+impl SweepClaim {
+    /// After a sweep: true when a trigger landed during it (sweep again, still holding the gate);
+    /// false opens the gate under the same lock, so no trigger can slip in between unseen.
+    fn rerun_requested(&mut self) -> bool {
+        let mut s = self.gate.state();
+        if s.rerun {
+            s.rerun = false;
+            true
+        } else {
+            s.running = false;
+            self.released = true;
+            false
+        }
+    }
+}
+
+impl Drop for SweepClaim {
+    fn drop(&mut self) {
+        if !self.released {
+            let mut s = self.gate.state();
+            s.running = false;
+            s.rerun = false;
+        }
+    }
+}
+
+/// Runs `sweep` on a background task unless one is already running on `gate`; None means this
+/// trigger was folded into one more sweep after the running one.
+pub(crate) fn spawn_exclusive<F, Fut>(gate: &'static SweepGate, sweep: F) -> Option<tokio::task::JoinHandle<()>>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut claim = gate.try_acquire()?;
+    Some(tokio::spawn(async move {
+        loop {
+            sweep().await;
+            if !claim.rerun_requested() {
+                break;
+            }
+            log::info!("[Watched Sync] Sweeping again for the trigger that arrived during the last sweep.");
+        }
+    }))
+}
+
 pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     let watched_dir = std::env::var("OMNIBUS_WATCHED_DIR").unwrap_or_else(|_| "/watched".to_string());
     let unmatched_dir = std::env::var("OMNIBUS_AWAITING_MATCH_DIR").unwrap_or_else(|_| "/unmatched".to_string());
@@ -148,18 +242,13 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     // ==========================================
     // PHASE 2: SEQUENTIAL DATABASE ROUTING
     // ==========================================
-    let settings = sqlx::query(r#"SELECT key, value FROM "SystemSetting""#).fetch_all(&db.pool).await?;
-    let mut folder_pattern = "{Publisher}/{Series} ({Year})".to_string();
-    let mut file_pattern = "{Series} #{Issue}".to_string();
-    let mut manga_file_pattern = "{Series} Vol. {Issue}".to_string();
-    
-    for row in settings {
-        let key: String = row.get("key");
-        let val: String = row.get("value");
-        if key == "folder_naming_pattern" { folder_pattern = val.clone(); }
-        if key == "file_naming_pattern" { file_pattern = val.clone(); }
-        if key == "manga_file_naming_pattern" { manga_file_pattern = val.clone(); }
-    }
+    let settings: Vec<(String, String)> = sqlx::query(r#"SELECT key, value FROM "SystemSetting""#)
+        .fetch_all(&db.pool)
+        .await?
+        .into_iter()
+        .map(|row| (row.get("key"), row.get("value")))
+        .collect();
+    let naming_settings = WatchedNaming::from_settings(settings.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
     // Bool columns are CAST for the Any driver — SQLite's BOOLEAN decltype has no mapping.
     let libraries = sqlx::query(r#"SELECT id, path, CAST("isDefault" AS INTEGER) AS "isDefault", CAST("isManga" AS INTEGER) AS "isManga" FROM "Library""#).fetch_all(&db.pool).await?;
@@ -181,11 +270,16 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     let mut imported_paths: Vec<String> = Vec::new();
 
     for file_data in preprocessed_files {
+        // #240 PR B: the import handoff is keyed on the file AS IT WAS HANDED OVER, so it is
+        // recorded against the original name — the CBR→CBZ conversion above must not move the key.
+        let handoff_path = file_data.original_path.clone();
         let path = file_data.working_path;
         
         if let Some(info) = file_data.meta {
             if info.series.is_none() {
-                if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                    unmatched_count += 1;
+                }
                 continue;
             }
 
@@ -199,7 +293,6 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 .filter(|y| *y != 0)
                 .or_else(|| info.year.filter(|y| *y != 0))
                 .unwrap_or(0);
-            let year_str = if year != 0 { year.to_string() } else { String::new() };
             let issue_num = info.number.clone().unwrap_or_else(|| "1".to_string());
             // #203: annual domain flag from the file's own signals (Format / Number shape / the
             // ORIGINAL filename — checked before any rename). The number keeps its ComicInfo-only
@@ -248,7 +341,9 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
 
             if meta_source == "LOCAL" || meta_id.is_empty() {
                 log::info!("[Watched Sync] '{}' has no ComicVine/Metron ID; routing to unmatched for review.", series_name);
-                if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                    unmatched_count += 1;
+                }
                 continue;
             }
 
@@ -321,23 +416,17 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 }
 
                 target_lib_id = fallback_lib_id;
-                let rel_folder = expand_folder_pattern(
-                    &folder_pattern,
-                    info.imprint.as_deref(),
-                    &publisher,
-                    &series_name,
-                    &year_str,
-                    info.universe.as_deref().unwrap_or_default(),
-                    info.series_group.as_deref().unwrap_or_default(),
-                ).join("/");
-                // Build the path one segment at a time under the library root (blank segments were
-                // already dropped); anything that would leave the root is refused and sent to unmatched.
-                let Some(folder) = library_subfolder(&fallback_lib_path, &rel_folder) else {
-                    log::warn!("[Watched Sync] Folder pattern for '{}' expanded to '{}', which leaves the library root; routing to unmatched for review.", series_name, rel_folder);
-                    if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+                // naming.rs gives plain segments only; a pattern that would leave the library root
+                // (or give no folder at all) is refused and the file sent to unmatched.
+                let folder_values = comicinfo_naming(&info, year, info.imprint.clone(), &issue_num, None);
+                let Some(segments) = naming::folder_segments(&naming_settings.folder, &folder_values) else {
+                    log::warn!("[Watched Sync] The folder pattern \"{}\" gives no folder inside the library for '{}'; routing to unmatched for review.", naming_settings.folder, series_name);
+                    if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                        unmatched_count += 1;
+                    }
                     continue;
                 };
-                dest_folder = folder;
+                dest_folder = segments.iter().fold(PathBuf::from(&fallback_lib_path), |folder, segment| folder.join(segment));
             }
 
             // A curated nonblank Series imprint is authoritative. Otherwise a new or unlocked
@@ -352,36 +441,50 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
             let should_adopt_imprint = imprint_db.is_some()
                 && (!had_existing_series || (!existing_has_custom_metadata && existing_imprint.as_deref().map(str::trim).unwrap_or("").is_empty()));
 
-            let _ = std::fs::create_dir_all(&dest_folder);
-
-            let formatted_num = if issue_num.len() == 1 { format!("0{}", issue_num) } else { issue_num.clone() };
-            // #203 Phase 1: an annual arriving through the watched folder is named the Mylar way
-            // ("Batman Annual #001 (2012)") — parity with renamer.rs and the Node importer, so a
-            // file lands under the same name whichever door it came through.
-            let annual_pattern = "{Series} Annual #{Issue} ({IssueYear})".to_string();
-            let pattern_to_use = if is_annual {
-                &annual_pattern
-            } else if is_manga {
-                &manga_file_pattern
+            // #243: {IssueYear} is this issue's own year, not the series' (`year` above is the
+            // Volume-first SERIES year). A series already in the library may hold the issue's row
+            // (the monitor's placeholder for a wanted issue) with its release date.
+            let issue_release = if had_existing_series {
+                issue_release_date(&db, &series_id, &issue_num, is_annual).await
             } else {
-                &file_pattern
+                None
+            };
+            // #203 Phase 1: an annual arriving through the watched folder is named the Mylar way
+            // ("Batman Annual #001 (2012)"). Every name goes through naming.rs, so a file lands
+            // under the same name whichever door it came through.
+            let pattern_to_use = if is_annual {
+                crate::renamer::ANNUAL_FILE_PATTERN
+            } else if is_manga {
+                naming_settings.manga_file.as_str()
+            } else {
+                naming_settings.file.as_str()
+            };
+            let file_values = comicinfo_naming(&info, year, Some(effective_imprint.clone()), &issue_num, issue_release);
+            let Some(new_filename) = naming::file_name(pattern_to_use, &file_values, naming_settings.padding) else {
+                log::warn!("[Watched Sync] The file pattern \"{}\" leaves no name for '{}'; routing to unmatched for review.", pattern_to_use, series_name);
+                if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await { unmatched_count += 1; }
+                continue;
             };
 
-            let new_filename = expand_file_pattern(
-                pattern_to_use,
-                Some(&effective_imprint),
-                &[
-                    ("{Publisher}", publisher.as_str()),
-                    ("{Series}", series_name.as_str()),
-                    ("{Year}", year_str.as_str()),
-                    ("{VolumeYear}", year_str.as_str()),
-                    ("{IssueYear}", year_str.as_str()),
-                    ("{Issue}", formatted_num.as_str()),
-                    ("{IssueTitle}", info.title.as_deref().unwrap_or_default()),
-                    ("{UniverseName}", info.universe.as_deref().unwrap_or_default()),
-                    ("{SeriesGroup}", info.series_group.as_deref().unwrap_or_default()),
-                ],
-            );
+            // Never write where the server can't keep it (beta.018 follow-up): the engine runs as root,
+            // so a Root Path the server can't use - "C:\Comics" under Docker, a leading space, a typo
+            // nothing is mounted at - would be CREATED inside the container and the comic lost on the
+            // next image update. The file stays in the watched folder until the path is fixed.
+            let target_root: Option<String> = libraries
+                .iter()
+                .find(|lib| lib.get::<String, _>("id") == target_lib_id)
+                .map(|lib| lib.get::<String, _>("path"));
+            if let Some(problem) = crate::server_paths::series_folder_problem(&dest_folder, target_root.as_deref()) {
+                log::error!(
+                    "[Watched Sync] Not importing {:?} for '{}': {} The file stays in the watched folder and is imported on the next sweep after the fix.",
+                    path.file_name().unwrap_or_default(),
+                    series_name,
+                    problem
+                );
+                continue;
+            }
+
+            let _ = std::fs::create_dir_all(&dest_folder);
 
             // Converted archives (cbr/rar/cb7) and zip/cbz all normalize to .cbz; an .epub is left as
             // .epub so a renamed EPUB isn't mislabeled as a comic archive.
@@ -501,6 +604,10 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                     if row_annual == is_annual && crate::metadata::is_same_issue(&n, &issue_num) { Some(r.get::<String, _>("id")) } else { None }
                 });
 
+                // #240 PR B: the id the handoff reports is the issue row this file really landed
+                // in — the existing row when that number already had one, the new id otherwise.
+                let handoff_issue_id = existing_issue_id.clone().unwrap_or_else(|| issue_id.clone());
+
                 let res = if let Some(eid) = existing_issue_id {
                     sqlx::query(&format!(
                         // Preserve already-present data on re-import (parity with importer.ts dedupe):
@@ -550,6 +657,12 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
 
                 if let Err(e) = res {
                     log::error!("[Watched Sync] Failed to upsert issue {:?}: {:?}", final_dest.file_name(), e);
+                    // #240 PR B: the sweep did handle the file — it just could not become a library
+                    // issue. Recorded as unmatched so the batch settles instead of waiting on a row
+                    // that nothing will ever close; the health check still flags the request.
+                    record_handoff(&db, &watched_dir, &handoff_path, HANDOFF_UNMATCHED, None, None).await;
+                } else {
+                    record_handoff(&db, &watched_dir, &handoff_path, HANDOFF_IMPORTED, Some(&handoff_issue_id), Some(&file_path_str)).await;
                 }
 
                 synced_series_ids.insert(series_id);
@@ -558,7 +671,9 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
                 log::warn!("Skipping file {:?}. It might be locked by another program or cross-drive move failed.", path.file_name());
             }
         } else {
-            if move_to_unmatched(&path, &unmatched_dir).is_ok() { unmatched_count += 1; }
+            if park_to_unmatched(&db, &watched_dir, &handoff_path, &path, &unmatched_dir).await {
+                unmatched_count += 1;
+            }
         }
     }
 
@@ -586,6 +701,42 @@ pub async fn process_watched_folder(db: Db) -> Result<(i32, i32, String)> {
     Ok((success_count, unmatched_count, format!("Processed watched folder. Imported: {}. Moved to unmatched: {}.", success_count, unmatched_count)))
 }
 
+/// What a handed-off file became (#240 PR B, "ImportHandoff".outcome). PENDING is the importer's
+/// row; the sweep only ever writes these two.
+const HANDOFF_IMPORTED: &str = "IMPORTED";
+const HANDOFF_UNMATCHED: &str = "UNMATCHED";
+
+/// #240 PR B: record what happened to a file this batch was handed, so the request that asked for
+/// it is closed on the STORAGE and not on the routing. Keyed on the file's path relative to the
+/// watched folder — the same key the importer wrote — and only on the newest row still PENDING: an
+/// older settled row under the same name belongs to an earlier batch and is left alone. Best-effort
+/// by design: a file nobody queued, or a busy database, must never fail the import itself.
+async fn record_handoff(db: &Db, watched_dir: &str, handoff_path: &Path, outcome: &str, issue_id: Option<&str>, destination: Option<&str>) {
+    let rel = handoff_path
+        .strip_prefix(watched_dir)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| handoff_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+    if rel.is_empty() {
+        return;
+    }
+
+    // Dual-dialect rules of db.rs: positional placeholders in order, now_expr() for the timestamp
+    // (Prisma's SQLite connector stores DateTime columns as INTEGER epoch-milliseconds).
+    let sql = format!(
+        r#"UPDATE "ImportHandoff" SET outcome = $1, "issueId" = $2, destination = $3, "updatedAt" = {now}
+           WHERE id = (SELECT id FROM "ImportHandoff" WHERE "relPath" = $4 AND outcome = 'PENDING'
+                       ORDER BY "createdAt" DESC LIMIT 1)"#,
+        now = db.now_expr()
+    );
+    match sqlx::query(&sql).bind(outcome).bind(issue_id).bind(destination).bind(&rel).execute(&db.pool).await {
+        Ok(res) if res.rows_affected() > 0 => {
+            log::debug!("[Watched Sync] Import handoff {} -> {} ({})", rel, outcome, destination.unwrap_or(""));
+        }
+        Ok(_) => {}
+        Err(e) => log::warn!("[Watched Sync] Could not stamp the import handoff for {}: {:?}", rel, e),
+    }
+}
+
 fn extract_comicinfo(path: &Path) -> Option<ComicInfo> {
     let file = File::open(path).ok()?;
     let mut archive = ZipArchive::new(file).ok()?;
@@ -606,25 +757,126 @@ fn extract_comicinfo(path: &Path) -> Option<ComicInfo> {
     None
 }
 
+/// The release date of the series' row for this issue, if the library already has one - same
+/// identity as the import dedupe below: number (by issue identity, "38" == "038") + annual domain.
+async fn issue_release_date(db: &Db, series_id: &str, issue_num: &str, is_annual: bool) -> Option<String> {
+    let rows = sqlx::query(
+        // isAnnual is CAST for the Any driver (no SQLite BOOLEAN mapping); releaseDate is TEXT.
+        r#"SELECT number, CAST("isAnnual" AS INTEGER) AS is_annual, "releaseDate" FROM "Issue" WHERE "seriesId" = $1"#,
+    )
+    .bind(series_id)
+    .fetch_all(&db.pool)
+    .await
+    .ok()?;
+    rows.iter()
+        .find(|r| {
+            let n: String = r.try_get("number").unwrap_or_default();
+            let row_annual = r.try_get::<i64, _>("is_annual").map(|v| v != 0).unwrap_or(false);
+            row_annual == is_annual && crate::metadata::is_same_issue(&n, issue_num)
+        })
+        .and_then(|r| r.try_get::<Option<String>, _>("releaseDate").ok().flatten())
+}
+
 fn robust_move(src: &Path, dest: &Path) -> Result<()> {
     if std::fs::rename(src, dest).is_ok() {
         return Ok(());
     }
+    copy_then_replace(src, dest)
+}
 
-    let tmp_dest = dest.with_extension("tmp_move");
-    std::fs::copy(src, &tmp_dest)?;
-
-    if cfg!(target_os = "windows") && dest.exists() {
-        let _ = std::fs::remove_file(dest);
+/// The cross-device fallback of `robust_move` (a plain rename can't cross mounts): copy beside the
+/// destination under a temp name of its own, swap it into place, then remove the source. A failed
+/// copy or swap removes the staged copy and keeps the source.
+fn copy_then_replace(src: &Path, dest: &Path) -> Result<()> {
+    let tmp_dest = crate::converter::temp_sibling(dest, "move");
+    let staged = (|| -> Result<()> {
+        std::fs::copy(src, &tmp_dest)?;
+        if cfg!(target_os = "windows") && dest.exists() {
+            let _ = std::fs::remove_file(dest);
+        }
+        std::fs::rename(&tmp_dest, dest)?;
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = std::fs::remove_file(&tmp_dest);
+        return Err(e);
     }
-    std::fs::rename(&tmp_dest, dest)?;
     std::fs::remove_file(src)?;
 
     Ok(())
 }
 
+/// The name a file takes in /unmatched when its own is already there: "<stem> (copy N).<ext>",
+/// the same rule as the upload route (src/lib/utils/unique-path.ts). Never a bare " (N)": the
+/// filename parser reads a trailing bare number as the issue number on scene-style names, and the
+/// Smart Matcher numbers /unmatched files with it ("Saga 054 (2018) (Digital) (1)" parses as #1).
+fn copy_name(file_name: &std::ffi::OsStr, n: u32) -> std::ffi::OsString {
+    let as_path = Path::new(file_name);
+    let mut name = std::ffi::OsString::new();
+    match (as_path.file_stem(), as_path.extension()) {
+        (Some(stem), Some(ext)) => {
+            name.push(stem);
+            name.push(format!(" (copy {}).", n));
+            name.push(ext);
+        }
+        _ => {
+            name.push(file_name);
+            name.push(format!(" (copy {})", n));
+        }
+    }
+    name
+}
+
+/// How many copy numbers are tried before the move gives up (the file then stays in the watched
+/// folder) instead of searching forever.
+const MAX_UNMATCHED_COPIES: u32 = 9999;
+
+/// Where `file_name` lands in /unmatched without replacing anything: its own name when that is
+/// free, else the first free "(copy N)". Anything at a name counts as taken - a file, a folder, a
+/// dangling link.
+fn unique_unmatched_dest(unmatched_dir: &Path, file_name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let taken = |candidate: &Path| std::fs::symlink_metadata(candidate).is_ok();
+    let own = unmatched_dir.join(file_name);
+    if !taken(&own) {
+        return Some(own);
+    }
+    (1..=MAX_UNMATCHED_COPIES)
+        .map(|n| unmatched_dir.join(copy_name(file_name, n)))
+        .find(|candidate| !taken(candidate))
+}
+
+/// #240 PR B: every exit that parks a file in /unmatched stamps its handoff row before leaving the
+/// file behind — the sweep did handle it, so a request waiting on that file is closed on this
+/// outcome instead of waiting on a PENDING row nothing will ever touch. Returns whether the file
+/// actually moved (the caller counts it as unmatched when it did).
+///
+/// One helper because there are five such exits, and one of them (the file pattern leaving no name)
+/// used to move the file without stamping, which left its whole batch PENDING forever and the
+/// request waiting on it IMPORTING until a person looked (#240 review, hankscafe).
+async fn park_to_unmatched(db: &Db, watched_dir: &str, handoff_path: &Path, path: &Path, unmatched_dir: &str) -> bool {
+    if move_to_unmatched(path, unmatched_dir).is_ok() {
+        record_handoff(db, watched_dir, handoff_path, HANDOFF_UNMATCHED, None, None).await;
+        true
+    } else {
+        false
+    }
+}
+
 fn move_to_unmatched(src: &Path, unmatched_dir: &str) -> Result<()> {
-    let dest = PathBuf::from(unmatched_dir).join(src.file_name().unwrap());
+    let file_name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{:?} has no file name to move into unmatched", src))?;
+    // Never over a file already waiting in /unmatched: two ComicInfo-less files with one name (two
+    // packs, or one name in two subfolders of the watched folder) used to leave only the last one.
+    let dest = unique_unmatched_dest(Path::new(unmatched_dir), file_name)
+        .ok_or_else(|| anyhow::anyhow!("no free name for {:?} in {}", file_name, unmatched_dir))?;
+    if dest.file_name() != Some(file_name) {
+        log::info!(
+            "[Watched Sync] {:?} is already waiting in unmatched; keeping both - this one is {:?}.",
+            file_name,
+            dest.file_name().unwrap_or_default()
+        );
+    }
     robust_move(src, &dest)?;
     Ok(())
 }
@@ -649,83 +901,6 @@ fn clean_empty_folders(dir: &Path, base_dir: &Path) -> Result<bool> {
     Ok(is_empty)
 }
 
-/// Strips characters invalid in file/folder names and neutralizes dot-only traversal values — the
-/// same rules as renamer's sanitize_component and Node's sanitizeFilename. ComicInfo feeds this, so
-/// a `<Publisher>..</Publisher>` becomes "_" instead of a ".." segment above the library root.
-fn clean_fs_name(input: &str) -> String {
-    let cleaned = input.replace(&['<', '>', ':', '"', '/', '\\', '|', '?', '*'][..], "");
-    let cleaned = cleaned.trim();
-    let safe = cleaned.trim_matches('.').trim();
-    if safe.is_empty() && !cleaned.is_empty() {
-        return "_".to_string();
-    }
-    safe.to_string()
-}
-
-/// Joins an expanded folder pattern onto the library root one segment at a time, dropping blank
-/// segments. Refuses (None) any segment that isn't a single plain name — "..", ".", a dots-only run,
-/// a drive prefix — so no pattern + metadata combination can place a series outside the library
-/// root (defence in depth behind clean_fs_name).
-fn library_subfolder(root: &str, rel_folder: &str) -> Option<PathBuf> {
-    let mut folder = PathBuf::from(root);
-    for seg in rel_folder.split(['/', '\\']).map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let mut parts = Path::new(seg).components();
-        let plain = matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None));
-        if !plain || seg.chars().all(|c| c == '.') {
-            return None;
-        }
-        folder.push(seg);
-    }
-    Some(folder)
-}
-
-fn replace_imprint_token(pattern: &str, imprint: Option<&str>) -> String {
-    let safe_imprint = crate::renamer::sanitize_component(imprint.unwrap_or_default().trim());
-    crate::renamer::replace_token_ci(pattern, "{Imprint}", &safe_imprint)
-}
-
-fn expand_folder_pattern(
-    pattern: &str,
-    imprint: Option<&str>,
-    publisher: &str,
-    series: &str,
-    year: &str,
-    universe: &str,
-    series_group: &str,
-) -> Vec<String> {
-    let expanded = replace_imprint_token(pattern, imprint)
-        .replace("{Publisher}", &clean_fs_name(publisher))
-        .replace("{Series}", &clean_fs_name(series))
-        .replace("{Year}", year)
-        .replace("{VolumeYear}", year)
-        .replace("{UniverseName}", &clean_fs_name(universe))
-        .replace("{SeriesGroup}", &clean_fs_name(series_group));
-
-    clean_naming_leftovers(&expanded)
-        .split(['/', '\\'])
-        .map(str::trim)
-        .filter(|segment| !segment.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-fn expand_file_pattern(
-    pattern: &str,
-    imprint: Option<&str>,
-    tokens: &[(&str, &str)],
-) -> String {
-    let mut expanded = replace_imprint_token(pattern, imprint);
-    for (token, value) in tokens {
-        let value = match *token {
-            "{Publisher}" | "{Series}" | "{IssueTitle}" | "{UniverseName}" | "{SeriesGroup}" => clean_fs_name(value),
-            _ => value.to_string(),
-        };
-        expanded = expanded.replace(token, &value);
-    }
-
-    clean_naming_leftovers(&expanded)
-}
-
 fn resolve_effective_imprint(
     had_existing_series: bool,
     stored_imprint: Option<&str>,
@@ -739,15 +914,53 @@ fn resolve_effective_imprint(
     }
 }
 
-/// Removes the debris an unfilled naming variable leaves behind — empty `()`/`[]` groups (e.g. a
-/// blank `{Year}` inside `({Year})`) and collapsed whitespace — then trims (parity with importer.ts).
-fn clean_naming_leftovers(input: &str) -> String {
-    static EMPTY_PARENS: OnceLock<Regex> = OnceLock::new();
-    static EMPTY_BRACKETS: OnceLock<Regex> = OnceLock::new();
-    static MULTI_WS: OnceLock<Regex> = OnceLock::new();
-    let no_parens = EMPTY_PARENS.get_or_init(|| Regex::new(r"\(\s*\)").unwrap()).replace_all(input, "");
-    let no_brackets = EMPTY_BRACKETS.get_or_init(|| Regex::new(r"\[\s*\]").unwrap()).replace_all(&no_parens, "");
-    MULTI_WS.get_or_init(|| Regex::new(r"\s+").unwrap()).replace_all(&no_brackets, " ").trim().to_string()
+/// The naming settings a sweep reads once: the three patterns - a blank one is the default, as on
+/// the Node side - and the issue-number padding (#244).
+struct WatchedNaming {
+    folder: String,
+    file: String,
+    manga_file: String,
+    padding: IssuePadding,
+}
+
+impl WatchedNaming {
+    fn from_settings<'a>(rows: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        let mut naming = WatchedNaming {
+            folder: "{Publisher}/{Series} ({Year})".to_string(),
+            file: "{Series} #{Issue}".to_string(),
+            manga_file: "{Series} Vol. {Issue}".to_string(),
+            padding: IssuePadding::Three,
+        };
+        for (key, value) in rows {
+            let pattern = Some(value).filter(|v| !v.trim().is_empty()).map(str::to_string);
+            match (key, pattern) {
+                ("folder_naming_pattern", Some(p)) => naming.folder = p,
+                ("file_naming_pattern", Some(p)) => naming.file = p,
+                ("manga_file_naming_pattern", Some(p)) => naming.manga_file = p,
+                ("issue_number_padding", _) => naming.padding = IssuePadding::from_setting(Some(value)),
+                _ => {}
+            }
+        }
+        naming
+    }
+}
+
+/// What a watched file's ComicInfo gives the naming rules (naming.rs). The caller picks the
+/// imprint: the archive's own <Imprint> for a new series' folder, the effective one (a curated
+/// imprint wins) for the file name.
+fn comicinfo_naming(info: &ComicInfo, series_year: i32, imprint: Option<String>, issue_number: &str, release_date: Option<String>) -> NamingInput {
+    NamingInput {
+        publisher: info.publisher.clone(),
+        series: info.series.clone().unwrap_or_default(),
+        series_year,
+        issue_number: issue_number.to_string(),
+        release_date,
+        comic_info_year: info.year,
+        issue_title: info.title.clone(),
+        universe: info.universe.clone(),
+        series_group: info.series_group.clone(),
+        imprint,
+    }
 }
 
 /// Splits a comma-separated ComicInfo field into a JSON array string (e.g. "A, B" -> `["A","B"]`).
@@ -766,6 +979,148 @@ pub(crate) fn split_to_json(s: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    // ==== Unique temp files: the cross-device move used to stage every copy as
+    // `dest.with_extension("tmp_move")` - shared by any two moves of the same name (and by
+    // "X.cbr" / "X.cbz", which both become "X.tmp_move"), and left behind when the swap failed.
+
+    fn move_fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("omnibus_move_{}", uuid::Uuid::new_v4()));
+        let (from, to) = (base.join("watched"), base.join("unmatched"));
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(&to).unwrap();
+        let src = from.join("Batman 001.cbz");
+        std::fs::write(&src, b"the comic").unwrap();
+        (base, src, to)
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn copy_then_replace_never_touches_another_movers_temp_file() {
+        let (base, src, to) = move_fixture();
+        // Another move into the same folder is mid-copy under the name every move used to share.
+        let theirs = to.join("Batman 001.tmp_move");
+        std::fs::write(&theirs, b"another mover's bytes").unwrap();
+        let dest = to.join("Batman 001.cbz");
+
+        copy_then_replace(&src, &dest).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"the comic");
+        assert!(!src.exists(), "the source is removed after the move");
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"another mover's bytes", "another move's temp file is untouched");
+        assert_eq!(names_in(&to), vec!["Batman 001.cbz", "Batman 001.tmp_move"], "no temp file of ours left behind");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_then_replace_cleans_up_when_the_final_swap_fails() {
+        let (base, src, to) = move_fixture();
+        // The destination name is taken by a non-empty folder: the copy succeeds, the swap can't.
+        let dest = to.join("Batman 001.cbz");
+        std::fs::create_dir_all(dest.join("inner")).unwrap();
+
+        assert!(copy_then_replace(&src, &dest).is_err());
+
+        assert!(src.exists(), "a failed move keeps the source");
+        assert_eq!(names_in(&to), vec!["Batman 001.cbz"], "the staged copy is removed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ==== /unmatched never replaces a file: two ComicInfo-less files with one name (two packs, or
+    // the same name in two subfolders of the watched folder, flattened in one sweep) used to leave
+    // only the second - the first was silently overwritten. The newcomer takes " (copy N)", the
+    // rule the upload route uses too: never a bare " (N)", which the filename parser reads as the
+    // issue number on scene-style names ("Saga 054 (2018) (Digital) (1)" parses as #1).
+
+    #[test]
+    fn move_to_unmatched_keeps_the_file_already_there() {
+        let (base, src, to) = move_fixture();
+        std::fs::write(to.join("Batman 001.cbz"), b"the first").unwrap();
+
+        move_to_unmatched(&src, &to.to_string_lossy()).unwrap();
+
+        assert_eq!(std::fs::read(to.join("Batman 001.cbz")).unwrap(), b"the first", "the file already in unmatched is untouched");
+        assert_eq!(std::fs::read(to.join("Batman 001 (copy 1).cbz")).unwrap(), b"the comic", "the newcomer sits beside it");
+        assert!(!src.exists(), "the source is removed after the move");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_to_unmatched_takes_the_next_free_copy_number() {
+        let (base, src, to) = move_fixture();
+        std::fs::write(to.join("Batman 001.cbz"), b"the first").unwrap();
+        std::fs::write(to.join("Batman 001 (copy 1).cbz"), b"the second").unwrap();
+
+        move_to_unmatched(&src, &to.to_string_lossy()).unwrap();
+
+        assert_eq!(names_in(&to), vec!["Batman 001 (copy 1).cbz", "Batman 001 (copy 2).cbz", "Batman 001.cbz"]);
+        assert_eq!(std::fs::read(to.join("Batman 001 (copy 1).cbz")).unwrap(), b"the second");
+        assert_eq!(std::fs::read(to.join("Batman 001 (copy 2).cbz")).unwrap(), b"the comic");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_to_unmatched_keeps_the_name_when_it_is_free() {
+        let (base, src, to) = move_fixture();
+
+        move_to_unmatched(&src, &to.to_string_lossy()).unwrap();
+
+        assert_eq!(names_in(&to), vec!["Batman 001.cbz"]);
+        assert_eq!(std::fs::read(to.join("Batman 001.cbz")).unwrap(), b"the comic");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_names_keep_the_extension_last_like_the_upload_route() {
+        let name = |s: &str, n: u32| copy_name(std::ffi::OsStr::new(s), n).to_string_lossy().to_string();
+        assert_eq!(name("Saga 054 (2018) (Digital).cbz", 1), "Saga 054 (2018) (Digital) (copy 1).cbz");
+        assert_eq!(name("Batman 001.cbz", 12), "Batman 001 (copy 12).cbz");
+        assert_eq!(name("archive.tar.gz", 1), "archive.tar (copy 1).gz");
+        assert_eq!(name("README", 2), "README (copy 2)");
+        assert_eq!(name(".hidden", 1), ".hidden (copy 1)");
+    }
+
+    // ==== #243: {IssueYear} carried the SERIES year (ComicInfo <Volume>, else <Year>) for every
+    // file the watched folder imported - "X-Men #38 (2024)" for a 2026 issue of a 2024 series.
+
+    #[tokio::test]
+    async fn issue_release_date_reads_the_matching_row_in_the_files_domain() {
+        let base = std::env::temp_dir().join(format!("omnibus_issueyear_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let db_file = base.join("iy.db");
+        std::fs::File::create(&db_file).unwrap();
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = crate::db::Db::connect(&db_url, 2).await.expect("connect file-backed sqlite");
+        // Column types as Prisma creates them on SQLite (BOOLEAN has no Any-driver mapping).
+        sqlx::query(r#"CREATE TABLE "Issue" (id TEXT PRIMARY KEY, "seriesId" TEXT, number TEXT, "isAnnual" BOOLEAN NOT NULL DEFAULT false, "releaseDate" TEXT)"#)
+            .execute(&db.pool).await.unwrap();
+        for (id, series, number, annual, date) in [
+            ("a", "xmen", "37", false, Some("2025-12-10")),
+            ("b", "xmen", "38", false, Some("2026-01-14")),
+            ("c", "xmen", "1", false, Some("2024-07-10")),
+            ("d", "xmen", "1", true, Some("2025-08-20")),
+            ("e", "xmen", "39", false, None),
+            ("f", "other", "38", false, Some("1999-01-01")),
+        ] {
+            sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", number, "isAnnual", "releaseDate") VALUES ($1, $2, $3, $4, $5)"#)
+                .bind(id).bind(series).bind(number).bind(if annual { 1_i64 } else { 0_i64 }).bind(date)
+                .execute(&db.pool).await.unwrap();
+        }
+
+        assert_eq!(issue_release_date(&db, "xmen", "38", false).await.as_deref(), Some("2026-01-14"));
+        assert_eq!(issue_release_date(&db, "xmen", "038", false).await.as_deref(), Some("2026-01-14"), "same issue identity as the import dedupe");
+        assert_eq!(issue_release_date(&db, "xmen", "1", true).await.as_deref(), Some("2025-08-20"), "an annual reads the annual's row");
+        assert_eq!(issue_release_date(&db, "xmen", "1", false).await.as_deref(), Some("2024-07-10"));
+        assert_eq!(issue_release_date(&db, "xmen", "39", false).await, None, "a row with no date");
+        assert_eq!(issue_release_date(&db, "xmen", "40", false).await, None, "no row yet");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn comicinfo_imprint_deserializes() {
         let info: ComicInfo = quick_xml::de::from_str(
@@ -782,55 +1137,50 @@ mod tests {
         assert_eq!(resolve_effective_imprint(true, None, true, Some("Absolute")), "");
     }
 
-    #[test]
-    fn fs_name_strips_invalid_characters() {
-        assert_eq!(clean_fs_name("Bat: Man?"), "Bat Man");
-        assert_eq!(clean_fs_name("  A/B\\C|D  "), "ABCD");
-        assert_eq!(clean_fs_name("Plain Name"), "Plain Name");
+    // ==== Naming (#244 + the naming cleanup): a watched file is named by naming.rs, the same rules
+    // Standardize and every Node path use. It used to pad only a single digit ("#01" beside
+    // Standardize's "#001"), matched every token but {Imprint} case-sensitively, left a dangling
+    // "- " for a blank token, used a blank pattern setting as an empty pattern, and put <Number>
+    // into the file name unsanitized - "1/2" became a sub-path the move then failed on.
+
+    fn comicinfo(xml: &str) -> ComicInfo {
+        quick_xml::de::from_str(xml).expect("parse ComicInfo")
     }
 
     #[test]
-    fn fs_name_neutralizes_dot_only_traversal_values() {
-        // ComicInfo values are untrusted: <Publisher>..</Publisher> must never survive as a ".."
-        // path segment (parity with renamer's sanitize_component + Node's sanitizeFilename).
-        assert_eq!(clean_fs_name(".."), "_");
-        assert_eq!(clean_fs_name("."), "_");
-        assert_eq!(clean_fs_name("..."), "_");
-        assert_eq!(clean_fs_name(" .. "), "_");
-        assert_eq!(clean_fs_name("..Name"), "Name");
-        assert_eq!(clean_fs_name("Name..."), "Name");
-        // Separators are stripped first, so a smuggled "../.." collapses to dots and then to "_".
-        assert_eq!(clean_fs_name("../.."), "_");
-        assert_eq!(clean_fs_name("..\\etc"), "etc");
-        // Interior dots are ordinary name characters; a blank value stays blank (dropped token).
-        assert_eq!(clean_fs_name("Mr. Miracle"), "Mr. Miracle");
-        assert_eq!(clean_fs_name(""), "");
-    }
-
-    /// The watched-sync folder expansion for a NEW series, token for token.
-    fn expand_folder(pattern: &str, publisher: &str, series: &str, year: &str, universe: &str, group: &str) -> String {
-        clean_naming_leftovers(&pattern
-            .replace("{Publisher}", &clean_fs_name(publisher))
-            .replace("{Series}", &clean_fs_name(series))
-            .replace("{Year}", year)
-            .replace("{VolumeYear}", year)
-            .replace("{UniverseName}", &clean_fs_name(universe))
-            .replace("{SeriesGroup}", &clean_fs_name(group)))
-    }
-
-    fn assert_plainly_under(root: &Path, folder: &Path) {
-        assert!(folder.starts_with(root), "{:?} is not under {:?}", folder, root);
-        let rel = folder.strip_prefix(root).unwrap();
-        assert!(
-            rel.components().all(|c| matches!(c, std::path::Component::Normal(_))),
-            "{:?} has a non-plain component",
-            folder
+    fn a_watched_file_is_named_like_standardize_names_it() {
+        let info = comicinfo("<ComicInfo><Series>Batman</Series><Number>1</Number><Volume>2016</Volume><Year>2017</Year><Publisher>DC Comics</Publisher></ComicInfo>");
+        let v = comicinfo_naming(&info, 2016, None, "1", None);
+        assert_eq!(naming::file_name("{Series} #{Issue} ({IssueYear})", &v, IssuePadding::Three).as_deref(), Some("Batman #001 (2017)"));
+        assert_eq!(naming::file_name("{series} #{ISSUE}", &v, IssuePadding::Three).as_deref(), Some("Batman #001"));
+        assert_eq!(naming::file_name("{Imprint} - {Series} #{Issue}", &v, IssuePadding::Three).as_deref(), Some("Batman #001"));
+        assert_eq!(naming::file_name("{Series} #{Issue}", &v, IssuePadding::None).as_deref(), Some("Batman #1"));
+        assert_eq!(
+            naming::folder_segments("{Publisher}/{Series} ({Year})", &v),
+            Some(vec!["DC Comics".to_string(), "Batman (2016)".to_string()])
         );
     }
 
     #[test]
+    fn a_slash_in_the_number_never_becomes_a_sub_path() {
+        let info = comicinfo("<ComicInfo><Series>Wizard</Series><Number>1/2</Number></ComicInfo>");
+        let name = naming::file_name("{Series} #{Issue}", &comicinfo_naming(&info, 0, None, "1/2", None), IssuePadding::Three).unwrap();
+        assert!(!name.contains(['/', '\\']), "{name:?}");
+    }
+
+    #[test]
+    fn imprint_expands_in_watched_folder_and_file_patterns() {
+        let info = comicinfo("<ComicInfo><Series>Batman</Series><Number>1</Number><Imprint>Absolute</Imprint></ComicInfo>");
+        let with = comicinfo_naming(&info, 2016, Some("Absolute".into()), "1", None);
+        let without = comicinfo_naming(&info, 2016, None, "1", None);
+        assert_eq!(naming::folder_segments("{Imprint}/{Series} ({Year})", &with), Some(vec!["Absolute".to_string(), "Batman (2016)".to_string()]));
+        assert_eq!(naming::folder_segments("{Imprint}/{Series} ({Year})", &without), Some(vec!["Batman (2016)".to_string()]));
+        assert_eq!(naming::file_name("{Imprint} {Series} #{Issue}", &with, IssuePadding::Three).as_deref(), Some("Absolute Batman #001"));
+        assert_eq!(naming::file_name("{Imprint} {Series} #{Issue}", &without, IssuePadding::Three).as_deref(), Some("Batman #001"));
+    }
+
+    #[test]
     fn dot_dot_comicinfo_values_cannot_climb_out_of_the_library_root() {
-        let root = if cfg!(windows) { r"C:\comics" } else { "/comics" };
         for pattern in ["{Publisher}/{Series} ({Year})", "{Series}", "{UniverseName}/{SeriesGroup}/{Series}"] {
             for hostile in ["..", ".", "...", " .. ", "../..", "..\\.."] {
                 for (publisher, series, universe, group) in [
@@ -838,63 +1188,38 @@ mod tests {
                     ("Image", hostile, "", ""),
                     (hostile, hostile, hostile, hostile),
                 ] {
-                    let rel = expand_folder(pattern, publisher, series, "", universe, group);
-                    let folder = library_subfolder(root, &rel)
-                        .unwrap_or_else(|| panic!("{:?} with {:?} was refused; clean_fs_name should defuse it", pattern, hostile));
-                    assert_plainly_under(Path::new(root), &folder);
+                    let xml = format!(
+                        "<ComicInfo><Series>{series}</Series><Publisher>{publisher}</Publisher><Universe>{universe}</Universe><SeriesGroup>{group}</SeriesGroup></ComicInfo>"
+                    );
+                    let segments = naming::folder_segments(pattern, &comicinfo_naming(&comicinfo(&xml), 0, None, "1", None))
+                        .unwrap_or_else(|| panic!("{pattern:?} with {hostile:?} was refused; sanitizing should defuse it"));
+                    assert!(segments.iter().all(|s| !s.chars().all(|c| c == '.')), "{pattern:?} with {hostile:?}: {segments:?}");
                 }
             }
         }
         // The default pattern still reads naturally around the neutralized value.
-        let rel = expand_folder("{Publisher}/{Series} ({Year})", "..", "Saga", "2012", "", "");
-        assert_eq!(library_subfolder(root, &rel).unwrap(), Path::new(root).join("_").join("Saga (2012)"));
+        let info = comicinfo("<ComicInfo><Series>Saga</Series><Publisher>..</Publisher></ComicInfo>");
+        assert_eq!(
+            naming::folder_segments("{Publisher}/{Series} ({Year})", &comicinfo_naming(&info, 2012, None, "1", None)),
+            Some(vec!["_".to_string(), "Saga (2012)".to_string()])
+        );
     }
 
     #[test]
-    fn library_subfolder_refuses_any_segment_that_is_not_a_plain_name() {
-        // Defence in depth behind clean_fs_name: pattern literals + blank tokens (or a future
-        // unsanitized token) must still never yield a path that leaves the root.
-        let root = if cfg!(windows) { r"C:\comics" } else { "/comics" };
-        for rel in ["..", "../escape", "Marvel/../../etc", "Marvel\\..\\x", ".", "Marvel/./x", "...", "Marvel/ .. /x"] {
-            assert_eq!(library_subfolder(root, rel), None, "{:?} should be refused", rel);
-        }
-        #[cfg(windows)]
-        assert_eq!(library_subfolder(root, "D:/Marvel"), None); // a drive prefix would replace the root
-        // Ordinary expansions are untouched: blank segments dropped, interior dots kept.
-        assert_eq!(library_subfolder(root, "Marvel//X-Men (1991)"), Some(Path::new(root).join("Marvel").join("X-Men (1991)")));
-        assert_eq!(library_subfolder(root, " DC Comics / Mr. Miracle (2017) "), Some(Path::new(root).join("DC Comics").join("Mr. Miracle (2017)")));
-        assert_eq!(library_subfolder(root, ""), Some(PathBuf::from(root)));
-    }
+    fn blank_naming_settings_fall_back_to_the_defaults_and_the_padding_is_read() {
+        let n = WatchedNaming::from_settings([
+            ("folder_naming_pattern", ""),
+            ("file_naming_pattern", "   "),
+            ("manga_file_naming_pattern", "{Series} v{Issue}"),
+            ("issue_number_padding", "2"),
+        ]);
+        assert_eq!(n.folder, "{Publisher}/{Series} ({Year})");
+        assert_eq!(n.file, "{Series} #{Issue}");
+        assert_eq!(n.manga_file, "{Series} v{Issue}");
+        assert_eq!(n.padding, IssuePadding::Two);
 
-    #[test]
-    fn naming_leftovers_cleaned() {
-        // Blank {Year} inside "({Year})" leaves "()" — must be removed, not printed.
-        assert_eq!(clean_naming_leftovers("Saga ()"), "Saga");
-        assert_eq!(clean_naming_leftovers("Saga [] #01"), "Saga #01");
-        assert_eq!(clean_naming_leftovers("Saga  (2014)  #01"), "Saga (2014) #01");
-    }
-
-    #[test]
-    fn imprint_expands_in_watched_folder_and_file_patterns() {
-        let folder_pattern = "{Imprint}/{Series} ({Year})";
-        let file_pattern = "{Imprint} {Series} #{Issue}";
-
-        assert_eq!(
-            expand_folder_pattern(folder_pattern, Some("Absolute"), "DC Comics", "Batman", "2016", "", ""),
-            vec!["Absolute", "Batman (2016)"],
-        );
-        assert_eq!(
-            expand_folder_pattern(folder_pattern, None, "DC Comics", "Batman", "2016", "", ""),
-            vec!["Batman (2016)"],
-        );
-        assert_eq!(
-            expand_file_pattern(file_pattern, Some("Absolute"), &[("{Series}", "Batman"), ("{Issue}", "001")]),
-            "Absolute Batman #001",
-        );
-        assert_eq!(
-            expand_file_pattern(file_pattern, None, &[("{Series}", "Batman"), ("{Issue}", "001")]),
-            "Batman #001",
-        );
+        let defaults = WatchedNaming::from_settings([]);
+        assert_eq!((defaults.manga_file.as_str(), defaults.padding), ("{Series} Vol. {Issue}", IssuePadding::Three));
     }
 
     #[test]
@@ -924,5 +1249,260 @@ mod tests {
         // Non-numeric / unrelated URLs must NOT match.
         assert!(re_cv_volume().captures("https://example.com/foo").is_none());
         assert!(re_metron_series().captures("https://metron.cloud/series/slug-name/").is_none());
+    }
+
+    // ==== One sweep at a time (#240): every trigger - the schedule, the importer after a batch
+    // pack, an admin's Run now - spawned its own sweep, so a long sweep had others running over
+    // the same folder beside it (four sweeps finishing in the same second).
+
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    type SweepFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+    /// A stand-in sweep that counts its runs and overlaps, and holds until the test finishes it.
+    struct FakeSweeps {
+        started: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        finish: tokio::sync::Semaphore,
+    }
+
+    impl FakeSweeps {
+        fn new() -> Arc<Self> {
+            Arc::new(FakeSweeps {
+                started: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                finish: tokio::sync::Semaphore::new(0),
+            })
+        }
+
+        fn sweep(self: &Arc<Self>) -> impl Fn() -> SweepFuture + Send + 'static {
+            let me = self.clone();
+            move || {
+                let me = me.clone();
+                Box::pin(async move {
+                    me.started.fetch_add(1, SeqCst);
+                    let now = me.active.fetch_add(1, SeqCst) + 1;
+                    me.max_active.fetch_max(now, SeqCst);
+                    me.finish.acquire().await.unwrap().forget();
+                    me.active.fetch_sub(1, SeqCst);
+                })
+            }
+        }
+
+        fn finish_one(&self) {
+            self.finish.add_permits(1);
+        }
+
+        async fn wait_started(&self, n: usize) {
+            for _ in 0..2000 {
+                if self.started.load(SeqCst) >= n {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            panic!("sweep {} never started", n);
+        }
+    }
+
+    #[tokio::test]
+    async fn triggers_during_a_sweep_become_one_more_sweep_after_it_never_one_beside_it() {
+        static GATE: SweepGate = SweepGate::new();
+        let fake = FakeSweeps::new();
+
+        let first = spawn_exclusive(&GATE, fake.sweep()).expect("an idle gate runs the sweep");
+        fake.wait_started(1).await;
+
+        // The schedule and a batch import both fire while it runs.
+        assert!(spawn_exclusive(&GATE, fake.sweep()).is_none(), "a trigger mid-sweep doesn't start a second sweep");
+        assert!(spawn_exclusive(&GATE, fake.sweep()).is_none(), "nor does a third");
+        assert_eq!(fake.started.load(SeqCst), 1);
+
+        // Its files may have landed after the running sweep listed the folder: one more sweep follows.
+        fake.finish_one();
+        fake.wait_started(2).await;
+        fake.finish_one();
+        first.await.unwrap();
+
+        assert_eq!(fake.started.load(SeqCst), 2, "two mid-sweep triggers fold into one follow-up sweep");
+        assert_eq!(fake.max_active.load(SeqCst), 1, "never two sweeps at once");
+
+        // Idle again: the next trigger sweeps straight away.
+        let next = spawn_exclusive(&GATE, fake.sweep()).expect("the gate opens once the sweeps finish");
+        fake.finish_one();
+        next.await.unwrap();
+        assert_eq!(fake.started.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_sweep_with_no_trigger_during_it_runs_once() {
+        static GATE: SweepGate = SweepGate::new();
+        let fake = FakeSweeps::new();
+
+        let only = spawn_exclusive(&GATE, fake.sweep()).expect("an idle gate runs the sweep");
+        fake.finish_one();
+        only.await.unwrap();
+
+        assert_eq!(fake.started.load(SeqCst), 1, "no follow-up without a trigger");
+        assert!(spawn_exclusive(&GATE, fake.sweep()).is_some(), "and the gate is open");
+        fake.finish_one();
+    }
+
+    #[tokio::test]
+    async fn a_sweep_that_panics_still_opens_the_gate() {
+        static GATE: SweepGate = SweepGate::new();
+
+        let crashed = spawn_exclusive(&GATE, || async { panic!("sweep crashed"); }).expect("an idle gate runs the sweep");
+        assert!(crashed.await.is_err(), "the sweep panicked");
+
+        let fake = FakeSweeps::new();
+        let next = spawn_exclusive(&GATE, fake.sweep()).expect("a crashed sweep doesn't hold the gate shut");
+        fake.finish_one();
+        next.await.unwrap();
+        assert_eq!(fake.started.load(SeqCst), 1);
+    }
+}
+
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A file-backed sqlite of its own holding the `ImportHandoff` table exactly as Prisma creates
+    /// it on SQLite: TEXT ids, DATETIME (epoch-ms) timestamps — the two processes share one file.
+    async fn handoff_db(base: &Path) -> Db {
+        let db_file = base.join("handoff.db");
+        std::fs::File::create(&db_file).expect("pre-create sqlite file");
+        let db_url = format!("file:{}", db_file.to_string_lossy().replace('\\', "/"));
+        let db = crate::db::Db::connect(&db_url, 1).await.expect("connect file-backed sqlite");
+
+        // The model exactly as Prisma creates it on SQLite: TEXT ids, DATETIME (epoch-ms) timestamps.
+        sqlx::query(
+            r#"CREATE TABLE "ImportHandoff" (
+                id TEXT PRIMARY KEY NOT NULL,
+                "batchId" TEXT NOT NULL,
+                "requestIds" TEXT NOT NULL DEFAULT '[]',
+                "relPath" TEXT NOT NULL,
+                "volumeId" TEXT,
+                "metadataSource" TEXT,
+                outcome TEXT NOT NULL DEFAULT 'PENDING',
+                "issueId" TEXT,
+                destination TEXT,
+                "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                "updatedAt" DATETIME NOT NULL
+            )"#,
+        )
+        .execute(&db.pool)
+        .await
+        .expect("create handoff table");
+
+        db
+    }
+
+    /// #240 PR B: the sweep's whole job in the handoff is to stamp a file's outcome under the key
+    /// the importer wrote (its name relative to the watched folder), on Prisma's real SQLite column
+    /// types — the two processes share one database file.
+    #[tokio::test]
+    async fn stamps_the_newest_pending_handoff_row_for_the_relative_path() {
+        let base = std::env::temp_dir().join(format!("omnibus_handoff_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let db = handoff_db(&base).await;
+
+        let watched = base.join("watched");
+        std::fs::create_dir_all(&watched).unwrap();
+        let watched_str = watched.to_string_lossy().to_string();
+        let routed = watched.join("Pack #1.cbz");
+        std::fs::File::create(&routed).and_then(|mut f| f.write_all(b"x")).expect("write fixture file");
+        let rel = "Pack #1.cbz";
+
+        // Two batches, same file name: the older row is already settled, the newer one is pending.
+        for (id, outcome, created) in [("old", "UNMATCHED", 1_000_i64), ("new", "PENDING", 2_000_i64)] {
+            sqlx::query(
+                r#"INSERT INTO "ImportHandoff" (id, "batchId", "requestIds", "relPath", outcome, "createdAt", "updatedAt")
+                   VALUES ($1, 'b1', '[]', $2, $3, $4, $4)"#,
+            )
+            .bind(id)
+            .bind(rel)
+            .bind(outcome)
+            .bind(created)
+            .execute(&db.pool)
+            .await
+            .expect("seed handoff row");
+        }
+
+        // A file nobody queued: no row to stamp, and no error either.
+        record_handoff(&db, &watched_str, &watched.join("Stranger.cbz"), HANDOFF_UNMATCHED, None, None).await;
+
+        record_handoff(&db, &watched_str, &routed, HANDOFF_IMPORTED, Some("issue-1"), Some("/comics/Pack #1.cbz")).await;
+
+        let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+            r#"SELECT id, outcome, "issueId", destination FROM "ImportHandoff" ORDER BY "createdAt""#,
+        )
+        .fetch_all(&db.pool)
+        .await
+        .expect("read handoff rows");
+
+        assert_eq!(rows.len(), 2, "no row is invented for a file nobody queued");
+        assert_eq!(rows[0].0, "old");
+        assert_eq!(rows[0].1, "UNMATCHED", "an already-settled row is never rewritten");
+        assert_eq!(rows[1].0, "new");
+        assert_eq!(rows[1].1, "IMPORTED");
+        assert_eq!(rows[1].2.as_deref(), Some("issue-1"));
+        assert_eq!(rows[1].3.as_deref(), Some("/comics/Pack #1.cbz"));
+
+        // A second pass over the same file leaves the row it already settled alone.
+        record_handoff(&db, &watched_str, &routed, HANDOFF_UNMATCHED, None, None).await;
+        let (outcome,): (String,) = sqlx::query_as(r#"SELECT outcome FROM "ImportHandoff" WHERE id = 'new'"#)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read settled row");
+        assert_eq!(outcome, "IMPORTED");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// #240 review (hankscafe): the fifth exit — the file pattern leaving no name — used to move the
+    /// file to /unmatched without stamping its row, which left the whole batch PENDING forever and
+    /// the request waiting on it IMPORTING until a person looked. Every park now goes through
+    /// `park_to_unmatched`, so this pins the shared behaviour: the file lands in /unmatched AND its
+    /// row is settled.
+    #[tokio::test]
+    async fn parking_a_file_settles_its_pending_handoff_row() {
+        let base = std::env::temp_dir().join(format!("omnibus_handoff_park_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let db = handoff_db(&base).await;
+
+        let watched = base.join("watched");
+        let unmatched = base.join("unmatched");
+        std::fs::create_dir_all(&watched).unwrap();
+        // The sweep creates this up front (`process_watched_folder`); the park needs it to exist.
+        std::fs::create_dir_all(&unmatched).unwrap();
+        let watched_str = watched.to_string_lossy().to_string();
+        let file = watched.join("Pack #1.cbz");
+        std::fs::File::create(&file).and_then(|mut f| f.write_all(b"x")).expect("write fixture file");
+
+        sqlx::query(
+            r#"INSERT INTO "ImportHandoff" (id, "batchId", "requestIds", "relPath", outcome, "createdAt", "updatedAt")
+               VALUES ('row1', 'b1', '["req_1"]', 'Pack #1.cbz', 'PENDING', 1000, 1000)"#,
+        )
+        .execute(&db.pool)
+        .await
+        .expect("seed handoff row");
+
+        let moved = park_to_unmatched(&db, &watched_str, &file, &file, &unmatched.to_string_lossy()).await;
+
+        assert!(moved, "the file left the watched folder");
+        assert!(!file.exists());
+        assert!(unmatched.join("Pack #1.cbz").exists(), "and it is parked in /unmatched");
+        let (outcome,): (String,) = sqlx::query_as(r#"SELECT outcome FROM "ImportHandoff" WHERE id = 'row1'"#)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the row");
+        assert_eq!(outcome, "UNMATCHED", "the batch settles instead of waiting on a PENDING row");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

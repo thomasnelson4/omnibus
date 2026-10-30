@@ -5,10 +5,10 @@ import { prisma } from "@/lib/db";
 import bcrypt from "bcryptjs";
 import { cookies } from "next/headers";
 import { decrypt2FA } from "@/lib/encryption";
-import crypto from "crypto";
 import { Logger } from "@/lib/logger";
 import { grantAllLibraries, setUserLibraryAccess, getDefaultLibraryIds } from "@/lib/library-access";
-import { isInactivityExpired } from "@/lib/session-timeout";
+import { isInactivityExpired, windowRole } from "@/lib/session-timeout";
+import { IMPERSONATION_COOKIE, readImpersonationCookie } from "@/lib/impersonation";
 
 // --- SECURITY SAFEGUARD ---
 const defaultSecret = 'change_this_to_a_random_secure_string_123!';
@@ -103,7 +103,9 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
               if (!isValid) throw new Error("2FA_INVALID");
           }
           loginAttempts.delete(input);
-          return { id: user.id, name: user.username, email: user.email, role: user.role, autoApproveRequests: user.autoApproveRequests, canDownload: user.canDownload, canCreateGlobalLists: user.canCreateGlobalLists, image: user.avatar, sessionVersion: user.sessionVersion };
+          // Every tier flag, like the SSO path below: the browser's request buttons read canRequest
+          // from the session, and a password sign-in without it showed every Hero "Requests not enabled".
+          return { id: user.id, name: user.username, email: user.email, role: user.role, canRequest: user.canRequest, autoApproveRequests: user.autoApproveRequests, canDownload: user.canDownload, canCreateGlobalLists: user.canCreateGlobalLists, image: user.avatar, sessionVersion: user.sessionVersion };
     }
     })
   ];
@@ -235,15 +237,20 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
           token.sessionVersion = (user as any).sessionVersion;
           token.lastActive = Date.now();
           token.lastSessionCheck = Date.now();
+          // An impersonation cookie counts only if it was issued after this — signing out and back
+          // in no longer resumes one (the cookie outlives sign-out).
+          token.signedInAt = Date.now();
         }
         // Expiry gate BEFORE the update-trigger slide: a queued activity ping must not revive a
-        // session that already timed out.
-        if (isInactivityExpired(token.role as string, token.lastActive as number)) return { error: "SessionExpired" };
+        // session that already timed out. An impersonating session keeps the admin's window.
+        if (isInactivityExpired(windowRole(token), token.lastActive as number)) return { error: "SessionExpired" };
         if (trigger === "update") {
             if (session?.user?.image !== undefined) token.picture = session.user.image;
             if (session?.sessionVersion !== undefined) token.sessionVersion = session.sessionVersion;
             token.lastActive = Date.now();
-            token.lastSessionCheck = Date.now();
+            // No lastSessionCheck stamp here: the ping comes at most every 5 minutes on input, so
+            // stamping it starved the sweep below for any active user — revocations and permission
+            // changes never reached them.
         }
         // Deliberately NO lastActive refresh on ambient reads (the SessionProvider's 300s refetch
         // and background polls run this callback constantly and used to keep the window from ever
@@ -259,9 +266,26 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                 // expires); only exceptions defer. lastSessionCheck is stamped either way so a
                 // struggling DB gets one probe per 5-minute cycle, not one per session fetch —
                 // which bounds the fail-open window for a revoked session to that same cycle.
+                //
+                // The same read refreshes role + tier flags: an admin applying a tier (or a role) to a
+                // signed-in user changes only the database, and the session used to keep its sign-in
+                // copy until the user signed out. While impersonating, the session is still the admin's
+                // — revocation is judged on the admin's own row, and the target's flags (copied at the
+                // swap below) are left alone.
+                const impersonating = !!(token.isImpersonating && token.originalAdminId);
                 try {
-                    const dbUser = await prisma.user.findUnique({ where: { id: token.id as string }, select: { sessionVersion: true } });
+                    const dbUser = await prisma.user.findUnique({
+                        where: { id: (impersonating ? token.originalAdminId : token.id) as string },
+                        select: { sessionVersion: true, role: true, canRequest: true, autoApproveRequests: true, canDownload: true, canCreateGlobalLists: true },
+                    });
                     if (!dbUser || dbUser.sessionVersion !== (token.sessionVersion || 0)) return { error: "SessionExpired" };
+                    if (!impersonating) {
+                        token.role = dbUser.role;
+                        token.canRequest = dbUser.canRequest;
+                        token.autoApproveRequests = dbUser.autoApproveRequests;
+                        token.canDownload = dbUser.canDownload;
+                        token.canCreateGlobalLists = dbUser.canCreateGlobalLists;
+                    }
                 } catch (e) {
                     Logger.log(`[Auth] sessionVersion check deferred on transient DB error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
                 }
@@ -270,27 +294,14 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
         }
 
         const cookieStore = await cookies();
-        const rawImpersonateCookie = cookieStore.get('omnibus_impersonate')?.value;
-        let impersonateId = null;
-
         if (token.role === "ADMIN" && !token.originalAdminId) token.originalAdminId = token.id;
 
-        if (rawImpersonateCookie && token.originalAdminId) {
-            const parts = rawImpersonateCookie.split('|');
-            if (parts.length === 3) {
-                const [targetId, cookieAdminId, signature] = parts;
-                const secret = process.env.NEXTAUTH_SECRET!;
-                const expectedSignature = crypto.createHmac('sha256', secret).update(`${targetId}|${cookieAdminId}`).digest('hex');
-                
-                const signatureBuffer = Buffer.from(signature);
-                const expectedBuffer = Buffer.from(expectedSignature);
-                if (signatureBuffer.length === expectedBuffer.length && 
-                    crypto.timingSafeEqual(signatureBuffer, expectedBuffer) && 
-                    cookieAdminId === token.originalAdminId) {
-                    impersonateId = targetId;
-                }
-            }
-        }
+        // Genuine, started by this session's admin, issued during this sign-in, inside its hour.
+        const impersonateId = readImpersonationCookie(cookieStore.get(IMPERSONATION_COOKIE)?.value, {
+            secret: process.env.NEXTAUTH_SECRET,
+            adminId: token.originalAdminId,
+            signedInAt: token.signedInAt,
+        });
         // Same fail-open posture as the sessionVersion sweep: a thrown lookup leaves this round's
         // token unchanged (the cookie/token state persists, so the swap or revert simply retries on
         // the next callback run) instead of killing the admin's session.
@@ -299,8 +310,12 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                 try {
                     const targetUser = await prisma.user.findUnique({ where: { id: impersonateId } });
                     if (targetUser) {
+                        // Keep the admin's own name/email to restore on the way back (an SSO admin's
+                        // display name isn't their username).
+                        if (!token.isImpersonating) { token.originalAdminName = token.name; token.originalAdminEmail = token.email; }
                         token.id = targetUser.id; token.role = targetUser.role; token.autoApproveRequests = targetUser.autoApproveRequests;
-                        token.canRequest = targetUser.canRequest; token.canDownload = targetUser.canDownload; token.canCreateGlobalLists = targetUser.canCreateGlobalLists; token.picture = targetUser.avatar; token.isImpersonating = true;
+                        token.canRequest = targetUser.canRequest; token.canDownload = targetUser.canDownload; token.canCreateGlobalLists = targetUser.canCreateGlobalLists; token.picture = targetUser.avatar;
+                        token.name = targetUser.username; token.email = targetUser.email; token.isImpersonating = true;
                     }
                 } catch (e) {
                     Logger.log(`[Auth] Impersonation swap deferred on transient DB error: ${e instanceof Error ? e.message : String(e)}`, 'warn');
@@ -311,7 +326,11 @@ export async function getAuthOptions(): Promise<NextAuthOptions> {
                 const adminUser = await prisma.user.findUnique({ where: { id: token.originalAdminId as string } });
                 if (adminUser) {
                     token.id = adminUser.id; token.role = adminUser.role; token.autoApproveRequests = adminUser.autoApproveRequests;
-                    token.canRequest = adminUser.canRequest; token.canDownload = adminUser.canDownload; token.canCreateGlobalLists = adminUser.canCreateGlobalLists; token.picture = adminUser.avatar; token.isImpersonating = false;
+                    token.canRequest = adminUser.canRequest; token.canDownload = adminUser.canDownload; token.canCreateGlobalLists = adminUser.canCreateGlobalLists; token.picture = adminUser.avatar;
+                    token.name = (token.originalAdminName as string | null | undefined) ?? adminUser.username;
+                    token.email = (token.originalAdminEmail as string | null | undefined) ?? adminUser.email;
+                    delete token.originalAdminName; delete token.originalAdminEmail;
+                    token.isImpersonating = false;
                 }
             } catch (e) {
                 Logger.log(`[Auth] Impersonation revert deferred on transient DB error: ${e instanceof Error ? e.message : String(e)}`, 'warn');

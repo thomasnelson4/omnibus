@@ -33,6 +33,7 @@ import { InteractiveSearchModal } from "@/components/interactive-search-modal"
 import { FollowBell } from "@/components/follow-bell"
 import MetadataEditorModal from "@/components/metadata-editor-modal"
 import { AddByIdDialog } from "@/components/add-by-id-dialog"
+import { SetupChecklist } from "@/components/setup-checklist"
 
 interface Comic {
   id: string; // Prisma ID
@@ -325,7 +326,10 @@ function LibraryContent() {
       }
   }, [searchParams]);
 
+  // The naming patterns feed the admin-only Standardize tools. Regular users never ask: the admin
+  // settings refuse them, and that refusal used to read as an expired session and sign them out.
   useEffect(() => {
+      if (!isAdmin) return;
       fetch('/api/admin/config')
           .then(res => res.ok ? res.json() : null)
           .then(data => {
@@ -340,7 +344,7 @@ function LibraryContent() {
               }
           })
           .catch(() => {});
-  }, []);
+  }, [isAdmin]);
 
   useEffect(() => {
     if (!selectedComic?.cvId) return;
@@ -1169,9 +1173,19 @@ function LibraryContent() {
       {loading && page === 1 ? (
         <LibrarySkeleton count={pageSize} />
       ) : series.length === 0 ? (
-        <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
-          {activeCollection !== "ALL" ? (<><Layers className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>This reading list is currently empty.</p></>) : (<><Folder className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>No comics found matching your criteria.</p></>)}
-        </div>
+        activeCollection !== "ALL" ? (
+          <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
+            <Layers className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>This reading list is currently empty.</p>
+          </div>
+        ) : (
+          // An empty library says what to do next (the first-run checklist); a filter that matches
+          // nothing in a library that has comics keeps the plain message.
+          <SetupChecklist variant="library" fallback={
+            <div className="text-center py-20 text-muted-foreground border-2 border-dashed rounded-lg border-border bg-muted/30">
+              <Folder className="w-10 h-10 mx-auto mb-3 opacity-20" /><p>No comics found matching your criteria.</p>
+            </div>
+          } />
+        )
       ) : viewMode === 'grid' ? (
         // v1.4.2: plain CSS grid again — the virtualized grid (VirtuosoGrid + useWindowScroll,
         // in place since beta.063) fought the browser's scroll anchoring at the infinite-scroll
@@ -1416,7 +1430,7 @@ function LibraryContent() {
                                     <FollowBell seriesId={item.id} seriesName={item.name} isFollowing={followedIds.has(item.id)} onToggled={handleFollowToggled} variant="ghost" size="icon" className="h-10 w-10 sm:h-8 sm:w-8 shadow-none hover:text-primary hover:bg-primary/10" />
                                     <Button variant="ghost" size="icon" className="h-10 w-10 sm:h-8 sm:w-8 hover:text-primary hover:bg-primary/10" title="Add to List" aria-label={`Add ${item.name} to a reading list`} onClick={(e) => { e.preventDefault(); e.stopPropagation(); setTargetSeries(item); }}> <ListPlus className="w-5 h-5 sm:w-4 sm:h-4" /> </Button>
                                     {activeCollection !== "ALL" && (<Button variant="ghost" size="icon" className="h-10 w-10 sm:h-8 sm:w-8 text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20" title="Remove from List" aria-label={`Remove ${item.name} from current reading list`} onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleRemoveFromCollection(item.id); }}> <Minus className="w-5 h-5 sm:w-4 sm:h-4" /> </Button>)} 
-                                    <Button aria-label={`Edit metadata for ${item.name}`} variant="ghost" size="icon" className="hidden sm:inline-flex h-8 w-8 hover:bg-muted" title="Edit Metadata" onClick={(e) => { e.preventDefault(); e.stopPropagation(); setEditing(item); }}> <Settings2 className="w-4 h-4 text-muted-foreground" /> </Button>
+                                    {isAdmin && (<Button aria-label={`Edit metadata for ${item.name}`} variant="ghost" size="icon" className="hidden sm:inline-flex h-8 w-8 hover:bg-muted" title="Edit Metadata" onClick={(e) => { e.preventDefault(); e.stopPropagation(); setEditing(item); }}> <Settings2 className="w-4 h-4 text-muted-foreground" /> </Button>)}
                                     <Button 
                                         variant="ghost" 
                                         size="icon" 

@@ -1,6 +1,8 @@
 // __tests__/api/import-anilist.test.ts
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { POST } from '@/app/api/reading-lists/import-anilist/route';
+import { processAutomationQueue } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 const mocks = vi.hoisted(() => ({
     userFindUnique: vi.fn(),
@@ -89,6 +91,13 @@ describe('API Route: AniList Import', () => {
         expect(mocks.requestCreate).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ activeDownloadName: 'Chainsaw Man' })
         }));
+
+        // An import's searches are a bulk ask: behind a reader's single request, ahead of the
+        // Series Monitor's own searches.
+        expect(processAutomationQueue).toHaveBeenCalledWith(
+            [expect.objectContaining({ id: 'req_123', name: 'Chainsaw Man' })],
+            JOB_PRIORITY.BULK
+        );
     });
 
     it('reads the Komga links before the re-import deletes the old list, and keeps komgaSync on', async () => {

@@ -1,7 +1,7 @@
 // src/app/api/request/manual/route.ts
 import { NextResponse, NextRequest } from 'next/server';
 import { prisma } from '@/lib/db';
-import path from 'path'; // <-- Added path for safe joining
+import path from 'path';
 import { getToken } from 'next-auth/jwt';
 import { Logger } from '@/lib/logger';
 import { DownloadService } from '@/lib/download-clients';
@@ -12,9 +12,18 @@ import { getErrorMessage } from '@/lib/utils/error';
 import { detectManga } from '@/lib/manga-detector';
 import { DiscordNotifier } from '@/lib/discord';
 import { Mailer } from '@/lib/mailer';
-import { replaceNamingToken } from '@/lib/utils/naming';
+import { seriesFolderSegments } from '@/lib/utils/naming';
+import { settleDuplicateOnLink } from '@/lib/request-dedupe';
 
 export const dynamic = 'force-dynamic';
+
+// #240: what to tell the user when a link they picked is already consumed — the three manual paths
+// (torrent, GetComics, Anna's Archive) answer alike.
+function settledMessage(status: 'COMPLETED' | 'NEEDS_REVIEW'): string {
+    return status === 'COMPLETED'
+        ? "That issue is already in your library — nothing was downloaded."
+        : "That pack was already downloaded and consumed, but the issue never reached the library — the request is marked for review. Nothing was downloaded.";
+}
 
 export async function POST(request: NextRequest) {
   const token = await getToken({ req: request });
@@ -78,32 +87,20 @@ export async function POST(request: NextRequest) {
                 : libraries.find(l => l.isDefault && !l.isManga) || libraries.find(l => !l.isManga);
             if (!targetLib) targetLib = libraries[0];
 
-            // --- FIX: Fetch Settings and apply Custom Folder Naming Pattern ---
+            // The name, publisher and year can come straight from the requester (the provider only fills
+            // what's missing). The shared naming rules (naming.ts) sanitize each like ComicInfo metadata - a
+            // dots-only value becomes "_", a year is only ever a plausible year - and refuse a pattern that
+            // would leave the library.
             const settings = await prisma.systemSetting.findMany();
             const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
             const folderPattern = config.folder_naming_pattern || "{Publisher}/{Series} ({Year})";
-
-            const safeFolderName = name.replace(/[<>:"/\\|?*]/g, ' - ').replace(/\s+/g, ' ').trim();
-            const safePubFolder = safePublisher !== "Unknown" ? safePublisher.replace(/[<>:"/\\|?*]/g, '').trim() : "Other";
-            // A newly created request placeholder has no trusted imprint yet. The first import
-            // fills it from ComicInfo; an existing series keeps its own folderPath.
-            const safeImprint = '';
-
-            let relFolderPath = folderPattern
-                .replace(/{Publisher}/gi, safePubFolder)
-                .replace(/{Series}/gi, safeFolderName)
-                .replace(/{Year}/gi, year ? year.toString() : "");
-
-            relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-                .replace(/\(\s*\)/g, '')
-                .replace(/\[\s*\]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-
-            const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+            const folderParts = seriesFolderSegments(folderPattern, { publisher, series: name, seriesYear: year, imprint: '' });
             const libraryTypeFolder = isManga ? 'Manga' : 'Comics';
             const basePath = targetLib ? targetLib.path : `/${libraryTypeFolder}`;
-            
+            if (!folderParts) {
+                Logger.log(`[Manual Request] Folder pattern "${folderPattern}" gives no folder inside the library for ${name}. Check Settings > Library & Files.`, 'warn');
+                return NextResponse.json({ error: "The folder naming pattern doesn't produce a folder inside the library for this series. Ask an admin to check Settings > Library & Files." }, { status: 400 });
+            }
             const folderPath = path.join(basePath, ...folderParts).replace(/\\/g, '/');
 
             await prisma.series.upsert({
@@ -136,6 +133,9 @@ export async function POST(request: NextRequest) {
             userId: userId,
             volumeId: cvId.toString(),
             status: initialStatus,
+            // #240: an issue request keeps the issue it is for; a pack/series request has no single
+            // number, so the column stays null and the name parse remains the fallback.
+            issueNumber: type === 'issue' && body.issueNumber ? String(body.issueNumber) : null,
             activeDownloadName: searchResult?.title || searchName,
             imageUrl: image,
             downloadLink: skipIndexers && initialStatus === 'PENDING_APPROVAL' ? 'DIRECT_GETCOMICS' : null,
@@ -183,21 +183,28 @@ export async function POST(request: NextRequest) {
                 const trackingHash = searchResult.infoHash || searchResult.guid || null;
                 
                 if (trackingHash) {
-                    const duplicateDownload = await prisma.request.findFirst({
-                        where: {
-                            downloadLink: trackingHash,
-                            status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] },
-                            id: { not: targetReqId }
-                        }
-                    });
+                    const duplicateDownload = await settleDuplicateOnLink(trackingHash, targetReqId);
 
-                    if (duplicateDownload) {
+                    if (duplicateDownload.action === 'park') {
                          Logger.log(`[Manual Request] Batch torrent already downloading (${trackingHash}). Queuing for batch extraction.`, 'info');
                          await prisma.request.update({
                              where: { id: targetReqId },
                              data: { status: 'DOWNLOADING', activeDownloadName: searchResult.title, downloadLink: trackingHash, clientDownloadId: duplicateDownload.clientDownloadId, downloadClientId: duplicateDownload.downloadClientId, indexer: searchResult.indexer }
                          });
                          return NextResponse.json({ success: true, message: "Added to existing batch download queue." });
+                    }
+                    if (duplicateDownload.action === 'join') {
+                         // #240 PR B: the sibling's pack is already in the watched folder, so its
+                         // bytes are gone and its outcome is not known yet — wait with it (the
+                         // reconciler closes this request when the sweep reports back).
+                         await prisma.request.update({
+                             where: { id: targetReqId },
+                             data: { status: 'IMPORTING', progress: 100, activeDownloadName: searchResult.title, downloadLink: trackingHash, indexer: searchResult.indexer }
+                         });
+                         return NextResponse.json({ success: true, message: "This pack is already in the watched folder — the request waits for the import instead of downloading it again." });
+                    }
+                    if (duplicateDownload.action === 'settle') {
+                         return NextResponse.json({ success: true, message: settledMessage(duplicateDownload.status) });
                     }
                 }
 
@@ -252,21 +259,28 @@ export async function POST(request: NextRequest) {
                     const settings = await prisma.systemSetting.findMany();
                     const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
                     
-                    const duplicateDownload = await prisma.request.findFirst({
-                        where: {
-                            downloadLink: url,
-                            status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] },
-                            id: { not: targetReqId }
-                        }
-                    });
+                    const duplicateDownload = await settleDuplicateOnLink(url, targetReqId);
 
-                    if (duplicateDownload) {
+                    if (duplicateDownload.action === 'park') {
                          Logger.log(`[Manual Request] Batch pack already downloading (${url}). Queuing for batch extraction.`, 'info');
                          await prisma.request.update({
                              where: { id: targetReqId },
                              data: { status: 'DOWNLOADING', activeDownloadName: safeTitle, downloadLink: url }
                          });
                          return NextResponse.json({ success: true, message: "Added to existing batch download queue." });
+                    }
+                    if (duplicateDownload.action === 'join') {
+                         // #240 PR B: the sibling's pack is already in the watched folder, so its
+                         // bytes are gone and its outcome is not known yet — wait with it (the
+                         // reconciler closes this request when the sweep reports back).
+                         await prisma.request.update({
+                             where: { id: targetReqId },
+                             data: { status: 'IMPORTING', progress: 100, activeDownloadName: safeTitle, downloadLink: url }
+                         });
+                         return NextResponse.json({ success: true, message: "This pack is already in the watched folder — the request waits for the import instead of downloading it again." });
+                    }
+                    if (duplicateDownload.action === 'settle') {
+                         return NextResponse.json({ success: true, message: settledMessage(duplicateDownload.status) });
                     }
 
                     await prisma.request.update({
@@ -301,16 +315,26 @@ export async function POST(request: NextRequest) {
                 const settings = await prisma.systemSetting.findMany();
                 const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
 
-                const duplicateDownload = await prisma.request.findFirst({
-                    where: { downloadLink: url, status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] }, id: { not: targetReqId } }
-                });
-                if (duplicateDownload) {
+                const duplicateDownload = await settleDuplicateOnLink(url, targetReqId);
+                if (duplicateDownload.action === 'park') {
                     Logger.log(`[Manual Request] Anna's Archive file already downloading (${url}). Queuing for batch extraction.`, 'info');
                     await prisma.request.update({
                         where: { id: targetReqId },
                         data: { status: 'DOWNLOADING', activeDownloadName: safeTitle, downloadLink: url }
                     });
                     return NextResponse.json({ success: true, message: "Added to existing batch download queue." });
+                }
+                if (duplicateDownload.action === 'join') {
+                    // #240 PR B: see the torrent branch above — the pack is in the watched folder, so
+                    // this request waits for the sweep instead of downloading it again.
+                    await prisma.request.update({
+                        where: { id: targetReqId },
+                        data: { status: 'IMPORTING', progress: 100, activeDownloadName: safeTitle, downloadLink: url }
+                    });
+                    return NextResponse.json({ success: true, message: "This pack is already in the watched folder — the request waits for the import instead of downloading it again." });
+                }
+                if (duplicateDownload.action === 'settle') {
+                    return NextResponse.json({ success: true, message: settledMessage(duplicateDownload.status) });
                 }
 
                 await prisma.request.update({

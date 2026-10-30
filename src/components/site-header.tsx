@@ -10,7 +10,7 @@ import { Button } from "@/components/ui/button"
 import {
   ShieldAlert, LogOut, User as UserIcon, Sun, Moon, Key, Loader2,
   Bell, Image as ImageIcon, Trophy, Wrench, Menu, UserPlus, AlertTriangle,
-  FolderSearch, Search, Sparkles, RefreshCw, UploadCloud
+  FolderSearch, Search, Sparkles, RefreshCw, UploadCloud, EyeOff
 } from "lucide-react"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog"
@@ -21,6 +21,7 @@ import { OmnibusLogo } from "@/components/omnibus-logo"
 import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
 import { TierBadge } from "@/components/tier-badge"
+import { ImpersonationBanner, useStopImpersonating } from "@/components/impersonation-banner"
 import { cn } from "@/lib/utils"
 
 // --- INTERNAL NOTIFICATION COMPONENT ---
@@ -218,6 +219,9 @@ export function SiteHeader() {
   const [passwords, setPasswords] = useState({ current: "", new: "", confirm: "" })
   const [passLoading, setPassLoading] = useState(false)
 
+  const isImpersonating = !!(session?.user as { isImpersonating?: boolean } | undefined)?.isImpersonating
+  const { stop: stopImpersonating, stopping: stoppingImpersonation } = useStopImpersonating()
+
   // Session expiry (the inactivity flag AND a lapsed cookie) is handled once, for every page, by
   // SessionExpiryGuard in AuthProvider (#204) — it also carries the user back after signing in.
 
@@ -256,6 +260,7 @@ export function SiteHeader() {
       suppressHydrationWarning 
       className="sticky top-0 z-40 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60 shadow-sm transition-colors duration-300"
     >
+      {mounted && <ImpersonationBanner />}
       <div className="container mx-auto flex h-16 items-center justify-between px-4 sm:px-6">
 
         <div className="flex items-center gap-2 sm:gap-4 min-w-0">
@@ -415,6 +420,15 @@ export function SiteHeader() {
                         {session?.user?.role === "ADMIN" && (
                           <DropdownMenuItem asChild className="p-3 sm:p-2 text-base sm:text-sm cursor-pointer rounded-lg sm:rounded-sm text-primary hover:bg-primary/10 focus:bg-primary/20 focus:text-primary transition-colors duration-150 ease-out motion-reduce:transition-none active:scale-[0.98]">
                             <Link href="/admin"><ShieldAlert className="w-5 h-5 sm:w-4 sm:h-4 mr-3 sm:mr-2" /> Admin Dashboard</Link>
+                          </DropdownMenuItem>
+                        )}
+                        {isImpersonating && (
+                          <DropdownMenuItem
+                            className="p-3 sm:p-2 text-base sm:text-sm cursor-pointer rounded-lg sm:rounded-sm font-bold text-amber-700 dark:text-amber-400 focus:bg-amber-50 dark:focus:bg-amber-900/20 transition-colors duration-150 ease-out motion-reduce:transition-none active:scale-[0.98]"
+                            disabled={stoppingImpersonation}
+                            onClick={(e) => { e.preventDefault(); stopImpersonating(); }}
+                          >
+                            <EyeOff className="w-5 h-5 sm:w-4 sm:h-4 mr-3 sm:mr-2" /> Stop impersonating
                           </DropdownMenuItem>
                         )}
                         <DropdownMenuSeparator className="bg-border my-1" />

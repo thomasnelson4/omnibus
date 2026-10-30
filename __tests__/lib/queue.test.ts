@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { initWorker } from '@/lib/queue';
 import { ENGINE_URL } from '@/lib/engine';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 
 // 1. Hoist our mocks
 const mocks = vi.hoisted(() => ({
@@ -32,6 +33,8 @@ const mocks = vi.hoisted(() => ({
     reapStaleDownloads: vi.fn().mockResolvedValue({ reaped: 0, examined: 0, skippedClientUnreadable: 0, skippedActivelyProgressing: 0 }),
     logReaperSweep: vi.fn().mockResolvedValue(undefined),
     searchAndDownload: vi.fn().mockResolvedValue(undefined),
+    waitForSearchSlot: vi.fn().mockResolvedValue(undefined),
+    processPageSweepChunk: vi.fn().mockResolvedValue(undefined),
     sendWeeklyDigest: vi.fn().mockResolvedValue(true),
     digestHistoryCreate: vi.fn(),
     transaction: vi.fn().mockResolvedValue([]),
@@ -83,7 +86,8 @@ vi.mock('@/lib/download-reaper', () => ({
     reapStaleDownloads: mocks.reapStaleDownloads,
     logReaperSweep: mocks.logReaperSweep
 }));
-vi.mock('@/lib/automation', () => ({ searchAndDownload: mocks.searchAndDownload }));
+vi.mock('@/lib/automation', () => ({ searchAndDownload: mocks.searchAndDownload, waitForSearchSlot: mocks.waitForSearchSlot }));
+vi.mock('@/lib/pages/page-sweep', () => ({ processPageSweepChunk: mocks.processPageSweepChunk }));
 
 // Mock the mailer for the digest
 vi.mock('@/lib/mailer', () => ({
@@ -431,14 +435,15 @@ describe('Cron: BullMQ Worker Router', () => {
     // request. The DDL path already dedups against the primary link (queue.ts duplicateDownload);
     // the external-client (Prowlarr → SAB/qBit) path must do the same on the tracking hash.
 
-    const runExternalClientSearch = async (sibling: { id: string } | null) => {
+    const runExternalClientSearch = async (siblings: { id: string; status: string; userId?: string }[], req: Record<string, unknown> = { id: 'req_2', volumeId: '0', failedLinks: '[]' }) => {
         initWorker();
 
-        // freshReq: volumeId "0" skips the series/issue-year block — this test targets routing only.
-        mocks.requestFindUnique.mockResolvedValue({ id: 'req_2', volumeId: '0', failedLinks: '[]' });
+        // freshReq: volumeId "0" skips the series/issue-year block — these tests target routing only.
+        mocks.requestFindUnique.mockResolvedValue(req);
         mocks.systemSettingFindMany.mockResolvedValue([]);
         mocks.downloadClientFindMany.mockResolvedValue([{ id: 'dc1', name: 'SAB', protocol: 'usenet' }]);
-        mocks.requestFindFirst.mockResolvedValue(sibling);
+        // The dedupe now loads every request holding this link, not just the first one.
+        mocks.requestFindMany.mockResolvedValue(siblings);
 
         // Engine matched the same whole-run pack this request's sibling already grabbed.
         mocks.engineFetch.mockResolvedValueOnce({
@@ -465,7 +470,7 @@ describe('Cron: BullMQ Worker Router', () => {
     };
 
     it('parks a duplicate external-client pack instead of re-adding it to the client (issue #174)', async () => {
-        await runExternalClientSearch({ id: 'req_1' }); // sibling already holds this tracking hash
+        await runExternalClientSearch([{ id: 'req_1', status: 'DOWNLOADING' }]); // sibling is on it now
 
         // The pack must NOT be sent to SABnzbd a second time…
         expect(mocks.addDownload).not.toHaveBeenCalled();
@@ -477,8 +482,56 @@ describe('Cron: BullMQ Worker Router', () => {
         }));
     });
 
+    // ==== #240: the sibling has FINISHED, so the importer's shared-link sweep will never run again
+    // for that link and the parked row would stay DOWNLOADING forever (10 such rows in the report).
+    // Settle it instead — and download nothing.
+
+    it('settles the request as NEEDS_REVIEW when the link\'s earlier request already finished and the issue never arrived (#240)', async () => {
+        await runExternalClientSearch([{ id: 'req_1', status: 'COMPLETED' }]);
+
+        expect(mocks.addDownload).not.toHaveBeenCalled();
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_2' },
+            data: { status: 'NEEDS_REVIEW' }
+        }));
+    });
+
+    it('closes the request as COMPLETED when the finished sibling\'s pack did put the issue in the library (#240)', async () => {
+        mocks.seriesFindFirst.mockResolvedValue({ id: 's1', metadataId: '101', metadataSource: 'COMICVINE' });
+        mocks.issueFindMany.mockResolvedValue([{ number: '2' }]);
+
+        await runExternalClientSearch([{ id: 'req_1', status: 'COMPLETED', userId: 'u1' }], {
+            id: 'req_2', volumeId: '101', metadataSource: 'COMICVINE', issueNumber: '2',
+            activeDownloadName: "Batman '89: Echoes #2", userId: 'u1', failedLinks: '[]'
+        });
+
+        expect(mocks.addDownload).not.toHaveBeenCalled();
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_2' },
+            data: { status: 'COMPLETED', progress: 100, notified: true }
+        }));
+    });
+
+    // #240 review: the "the pack's import already told this user" claim only holds for the user who
+    // owns the finished request on the link. Another user's request closes silently unless it rings.
+    it('rings the bell for the closer when the finished sibling on the link belongs to another user (#240)', async () => {
+        mocks.seriesFindFirst.mockResolvedValue({ id: 's1', metadataId: '101', metadataSource: 'COMICVINE' });
+        mocks.issueFindMany.mockResolvedValue([{ number: '2' }]);
+
+        await runExternalClientSearch([{ id: 'req_1', status: 'COMPLETED', userId: 'someone_else' }], {
+            id: 'req_2', volumeId: '101', metadataSource: 'COMICVINE', issueNumber: '2',
+            activeDownloadName: "Batman '89: Echoes #2", userId: 'u1', failedLinks: '[]'
+        });
+
+        expect(mocks.addDownload).not.toHaveBeenCalled();
+        expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'req_2' },
+            data: { status: 'COMPLETED', progress: 100, notified: false }
+        }));
+    });
+
     it('adds the download normally when no sibling holds the same tracking hash', async () => {
-        await runExternalClientSearch(null);
+        await runExternalClientSearch([]);
 
         expect(mocks.addDownload).toHaveBeenCalledTimes(1);
         expect(mocks.requestUpdate).toHaveBeenCalledWith(expect.objectContaining({
@@ -575,6 +628,51 @@ describe('Cron: BullMQ Worker Router', () => {
         expect(mocks.searchAndDownload).toHaveBeenCalledTimes(1);
     });
 
+    it('re-uses an existing COMPLETED request whose name became the pack title (#240)', async () => {
+        // The download overwrites activeDownloadName with the release's own title, so a request for
+        // #37 reads "X-Men #34-40". Parsing that name back gives 34, never 37 — on dev the monitor
+        // saw no request for the candidate, created a fresh one, and downloaded the pack again.
+        mocks.requestFindMany.mockImplementation(async (args: { where?: { volumeId?: { in?: string[] } } }) =>
+            args.where?.volumeId?.in ? [{ id: 'req_37', volumeId: 'v1', activeDownloadName: 'X-Men #34-40 (2004)', issueNumber: '37', status: 'COMPLETED' }] : []
+        );
+
+        await runMonitor([{
+            volume_id: 'v1', metadata_source: 'COMICVINE', search_name: 'X-Men #37', issue_number: '37',
+            issue_year: '2004', is_released: true, has_date: true, publisher: 'Marvel', is_manga: false, image_url: null
+        }]);
+
+        expect(mocks.requestCreate).not.toHaveBeenCalled();
+        expect(mocks.searchAndDownload).not.toHaveBeenCalled();
+    });
+
+    it('still re-requests an issue the pack title genuinely does not cover (#240 regression guard)', async () => {
+        mocks.requestFindMany.mockImplementation(async (args: { where?: { volumeId?: { in?: string[] } } }) =>
+            args.where?.volumeId?.in ? [{ id: 'req_37', volumeId: 'v1', activeDownloadName: 'X-Men #34-40 (2004)', issueNumber: '37', status: 'COMPLETED' }] : []
+        );
+
+        await runMonitor([{
+            volume_id: 'v1', metadata_source: 'COMICVINE', search_name: 'X-Men #41', issue_number: '41',
+            issue_year: '2004', is_released: true, has_date: true, publisher: 'Marvel', is_manga: false, image_url: null
+        }]);
+
+        expect(mocks.requestCreate).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ status: 'PENDING', issueNumber: '41' })
+        }));
+    });
+
+    it('stores the candidate issue number on the request it creates (#240)', async () => {
+        mocks.requestFindMany.mockImplementation(async () => []);
+
+        await runMonitor([{
+            volume_id: 'v1', metadata_source: 'COMICVINE', search_name: 'Spawn #360', issue_number: '360',
+            issue_year: '2026', is_released: true, has_date: true, publisher: 'Image', is_manga: false, image_url: null
+        }]);
+
+        expect(mocks.requestCreate).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ issueNumber: '360' })
+        }));
+    });
+
     it('re-searches parked MANUAL_DDL and dead STALLED requests on the awaiting cadence, leaving live retries to the cron', async () => {
         // No candidates → the first request.findMany call is the UNRELEASED sweep, the second is
         // the parked/dead sweep (this is the one under test).
@@ -598,6 +696,76 @@ describe('Cron: BullMQ Worker Router', () => {
         expect(mocks.searchAndDownload).toHaveBeenCalledTimes(3);
         // …but a STALLED with retries left AND an http link belongs to the 60s cron, not this sweep.
         expect(mocks.requestUpdate).not.toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'r_live' } }));
+    });
+
+    // A monitor run can queue hundreds of searches at once (every new issue, plus every parked request
+    // past the awaiting cadence). Nobody is waiting on any one of them, so all four of its search paths
+    // go to the back: a request someone makes in the meantime must not queue behind the whole run.
+    it('queues every search it starts at the background tier, behind anything a person asked for', async () => {
+        mocks.requestFindMany
+            .mockResolvedValueOnce([   // the candidates' dedup: #358 was requested while unreleased
+                { id: 'req_up', volumeId: 'v1', activeDownloadName: 'Spawn #358', issueNumber: '358', status: 'UNRELEASED' }
+            ])
+            .mockResolvedValueOnce([   // Phase 3: an UNRELEASED request whose issue is out by now
+                { id: 'req_unrel', volumeId: 'v2', activeDownloadName: 'Saga #70' }
+            ])
+            .mockResolvedValueOnce([   // Phase 3b: a parked request past the awaiting cadence
+                { id: 'req_park', volumeId: null, activeDownloadName: 'X-Men #5', status: 'MANUAL_DDL', retryCount: 0, downloadLink: 'https://getcomics.org/dls/x' }
+            ]);
+        mocks.seriesFindMany.mockResolvedValueOnce([
+            { id: 's2', metadataId: 'v2', publisher: 'Image', isManga: false, issues: [{ number: '70', releaseDate: '2020-01-01' }] }
+        ]);
+
+        await runMonitor([
+            { volume_id: 'v1', metadata_source: 'COMICVINE', search_name: 'Spawn #358', issue_number: '358',
+              issue_year: '2026', is_released: true, has_date: true, publisher: 'Image', is_manga: false, image_url: null },
+            { volume_id: 'v1', metadata_source: 'COMICVINE', search_name: 'Spawn #359', issue_number: '359',
+              issue_year: '2026', is_released: true, has_date: true, publisher: 'Image', is_manga: false, image_url: null }
+        ]);
+
+        const searched = mocks.searchAndDownload.mock.calls.map(c => c[0]).sort();
+        expect(searched).toEqual(['new_req', 'req_park', 'req_unrel', 'req_up']);
+        for (const call of mocks.searchAndDownload.mock.calls) {
+            expect(call[6]).toBe(JOB_PRIORITY.BACKGROUND);
+        }
+    });
+
+    // The 5-second gap between searches is kept here, as each search STARTS — not handed out as a
+    // delay when it is queued, where no priority could overtake it.
+    it('waits for its turn in the 5-second search spacing before asking the engine to search', async () => {
+        initWorker();
+        mocks.requestFindUnique.mockResolvedValue(null);
+        mocks.engineFetch.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ success: false }) });
+
+        await mocks.workerCb.current({
+            id: 'job_slot',
+            data: { type: 'SEARCH_AND_DOWNLOAD', requestId: 'req_slot', name: 'Saga #1', year: '2012', isManga: false, skipIndexers: false },
+            updateProgress: vi.fn()
+        });
+
+        const searchIdx = mocks.engineFetch.mock.calls.findIndex((c: unknown[]) => String(c[0]).includes('/api/automation/search'));
+        expect(searchIdx).toBeGreaterThanOrEqual(0);
+        expect(mocks.waitForSearchSlot).toHaveBeenCalledTimes(1);
+        expect(mocks.waitForSearchSlot.mock.invocationCallOrder[0]).toBeLessThan(mocks.engineFetch.mock.invocationCallOrder[searchIdx]);
+    });
+
+    // #189 Phase 3 made the page sweep chain itself in 5-file chunks so the one worker is never held
+    // for a whole sweep. Since searches carry a priority (#249), a chunk queued WITHOUT one would jump
+    // every search until the sweep ends; at the top tier it alternates with the searches people asked for.
+    it('queues the next page-sweep chunk at the top tier, so the searches people asked for alternate with it', async () => {
+        initWorker();
+        type SweepChunk = { runId: string; processed: number };
+        mocks.processPageSweepChunk.mockImplementationOnce(async (data: SweepChunk, enqueueNext: (next: SweepChunk) => Promise<unknown>) => {
+            await enqueueNext({ ...data, processed: 5 });
+        });
+
+        await mocks.workerCb.current({ id: 'job_sweep', data: { type: 'PAGE_SWEEP', runId: 'run1', processed: 0 }, updateProgress: vi.fn() });
+
+        expect(mocks.queueAdd).toHaveBeenCalledWith(
+            'PAGE_SWEEP',
+            expect.objectContaining({ runId: 'run1', processed: 5 }),
+            expect.objectContaining({ jobId: 'PAGE_SWEEP_run1_5', priority: JOB_PRIORITY.REQUESTED })
+        );
     });
 
     // ==== Pack guard: packs bypass the single-issue number check and the off-series reverse
@@ -662,6 +830,7 @@ describe('Cron: BullMQ Worker Router', () => {
         mocks.requestFindUnique.mockResolvedValue({ id: 'req_ddl', volumeId: '0', failedLinks: '[]' });
         mocks.systemSettingFindMany.mockResolvedValue([]);
         mocks.requestFindFirst.mockResolvedValue(null); // no duplicate download
+        mocks.requestFindMany.mockResolvedValue([]); // …and nothing holds this link either
         mocks.downloadDirectFile.mockResolvedValue(false); // every hoster fails
         mocks.engineFetch.mockResolvedValueOnce({
             ok: true, status: 200,

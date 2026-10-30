@@ -16,10 +16,16 @@ import { isSameIssue, extractIssueNumber, annualFlagForSignals } from '@/lib/uti
 import { STOP_WORDS } from '@/lib/utils/search-terms';
 import { COMIC_EXTENSIONS, COMIC_EXT_REGEX, IMAGE_EXT_REGEX } from '@/lib/utils/formats';
 import { sanitizeFilename as sanitize } from '@/lib/utils/sanitize';
-import { WATCHED_DIR } from '@/lib/utils/paths';
+import { WATCHED_DIR, isInsideLibraryRoot } from '@/lib/utils/paths';
 import { ENGINE_URL, engineHeaders } from '@/lib/engine';
 import { deleteUsenetSource } from '@/lib/utils/usenet-cleanup';
-import { replaceNamingToken } from '@/lib/utils/naming';
+import { issueFileName, issuePaddingFromSetting, seriesFolderSegments, type NamingInput } from '@/lib/utils/naming';
+import { ANNUAL_FILE_PATTERN } from '@/lib/utils/file-pattern';
+import { readZipEntryNames } from '@/lib/utils/archive-pages';
+import { fixMagicNumberSync } from '@/lib/utils/archive-signature';
+import { storedFolderProblem } from '@/lib/utils/stored-folder';
+import { requeueWithNextRelease } from '@/lib/requeue';
+import { dropPendingHandoff, newImportBatchId, recordImportHandoff, recordPendingHandoff, rekeyPendingHandoff, watchedRelativePath } from '@/lib/import-handoff';
 
 // Engine nested-pack helper (list when destDir is omitted, extract when given). Returns null on any
 // engine failure so callers fall back to the local AdmZip path — imports never break on a down engine.
@@ -37,36 +43,6 @@ async function engineNestedArchives(archivePath: string, destDir?: string): Prom
         Logger.log(`[Importer] Engine nested-pack offload unavailable, using local AdmZip: ${e.message}`, 'debug');
         return null;
     }
-}
-
-function fixMagicNumberSync(filePath: string): string {
-    try {
-        if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) return filePath;
-        const buffer = Buffer.alloc(4);
-        const fd = fs.openSync(filePath, 'r');
-        fs.readSync(fd, buffer, 0, 4, 0);
-        fs.closeSync(fd);
-        const hex = buffer.toString('hex').toLowerCase();
-        
-        const currentExt = path.extname(filePath).toLowerCase();
-        let trueExt = currentExt;
-
-        if (hex === '52617221') {
-            trueExt = '.cbr';
-        } else if (hex === '504b0304') {
-            trueExt = '.cbz';
-        }
-
-        if (trueExt !== currentExt && ((currentExt === '.cbz' || currentExt === '.zip') && trueExt === '.cbr' || (currentExt === '.cbr' || currentExt === '.rar') && trueExt === '.cbz')) {
-            Logger.log(`[Importer] Detected fake extension (${currentExt} -> ${trueExt}) on destination file! Renaming to match true signature...`, 'info');
-            const correctedPath = filePath.replace(/\.[^/.]+$/, trueExt);
-            fs.renameSync(filePath, correctedPath);
-            return correctedPath;
-        }
-    } catch (e: any) {
-        Logger.log(`[Importer Debug] Failed to verify file signature for ${filePath}: ${e.message}`, 'warn');
-    }
-    return filePath;
 }
 
 // Give a freshly imported series a real on-disk cover the instant the import lands, so the library
@@ -110,8 +86,10 @@ export const Importer = {
         include: { user: true } 
     });
     
-    // Abort if the user cancelled the request while it was downloading
-    if (!req || req.status === 'COMPLETED' || req.status === 'IMPORTED' || req.status === 'CANCELLED') return false;
+    // Abort if the user cancelled the request while it was downloading. An IMPORTING request has
+    // already been handed to the watched folder (#240 PR B) and is waiting on the sweep: importing
+    // it again would look for a download that is gone and could fail a request that is fine.
+    if (!req || req.status === 'COMPLETED' || req.status === 'IMPORTED' || req.status === 'IMPORTING' || req.status === 'CANCELLED') return false;
 
     Logger.log(`[Importer] Starting import for: ${req.activeDownloadName || requestId}`, 'info');
     Logger.log(`[Importer Debug] Resolving physical path for request [${requestId}]...`, 'debug');
@@ -280,6 +258,8 @@ export const Importer = {
     let isRarContainer = false;
     let batchFiles: string[] = [];
     let nestedArchiveCount = 0;
+    // #240: set when the archive can't be read at all - it is refused below, never imported.
+    let unreadableReason: string | null = null;
 
     if (fs.statSync(sourcePath).isDirectory()) {
         async function getComicFilesInDir(dir: string) {
@@ -343,10 +323,12 @@ export const Importer = {
                     Logger.log(`[Importer Debug] Found ${nestedArchiveCount} nested archives inside ${path.basename(actualSourceFile)} (engine)`, 'debug');
                 }
             } else if (isZipContainer) {
+                // #240: the ZIP's own index (end record + central directory) - never the whole pack in
+                // the Node heap. An index that can't be read means the archive can't be imported at
+                // all; it used to be logged and then filed as ONE issue with 0 pages.
                 try {
-                    const zip = new AdmZip(actualSourceFile);
-                    const entries = zip.getEntries();
-                    const comicFiles = entries.filter((e: any) => !e.isDirectory && COMIC_EXT_REGEX.test(e.entryName));
+                    const comicFiles = (await readZipEntryNames(actualSourceFile))
+                        .filter(name => !name.endsWith('/') && COMIC_EXT_REGEX.test(name));
 
                     if (comicFiles.length > 0) {
                         isBatchArchive = true;
@@ -354,12 +336,29 @@ export const Importer = {
                         Logger.log(`[Importer Debug] Found ${nestedArchiveCount} nested archives inside ${path.basename(actualSourceFile)}`, 'debug');
                     }
                 } catch(e: any) {
-                    Logger.log(`[Importer Debug] Error inspecting zip for nested archives: ${e.message}`, 'error');
+                    unreadableReason = e.message;
                 }
             } else {
                 Logger.log(`[Importer] Engine unavailable — cannot inspect ${path.basename(actualSourceFile)} (RAR) for nested archives; importing as a single file.`, 'debug');
             }
         }
+    }
+
+    // --- UNREADABLE ARCHIVE (#240) ---
+    // Usually a download that was cut short. It is never imported: the release (its link and title)
+    // is blocked and the request searches again - the same "try the next release" step the cron
+    // takes when a client reports a failed download.
+    if (unreadableReason) {
+        const label = req.activeDownloadName || path.basename(actualSourceFile);
+        Logger.log(`[Importer] Not importing "${label}": the archive can't be read (${unreadableReason}) - usually a download that was cut short.`, 'error');
+        // An admin's upload is reported, never deleted or searched for on their behalf.
+        if (opts?.sourcePathOverride) return false;
+        // Our own direct-download temp file goes, so a folder search never picks it up again. A
+        // client's file stays where it is: a torrent may be seeding it, and usenet cleanup (#198)
+        // only ever follows a verified import.
+        if (!isFromClient && !trackingHash) await fs.remove(sourcePath).catch(() => {});
+        await requeueWithNextRelease(req as any, { title: req.activeDownloadName });
+        return false;
     }
 
     // --- BATCH ROUTING EXECUTION ---
@@ -371,6 +370,31 @@ export const Importer = {
         const watchedDir = WATCHED_DIR;
         await fs.ensureDir(watchedDir);
         let moveSuccessCount = 0;
+        // The files this batch actually handed over, named relative to the watched folder
+        // (#240 PR B): the engine stamps each one's outcome under exactly this key.
+        const routedRelPaths: string[] = [];
+
+        // The batch, and the requests it closes for, exist BEFORE its first file does (#240 review):
+        // each row is written as its own file is routed, so a sweep starting mid-routing finds it.
+        const batchId = newImportBatchId();
+        // Every request this download was made for: the pack is shared, so the batch is closed for
+        // all of them (and each one on its own issue, once the library can answer). Read once here
+        // because the rows written during the routing need the ids — and again just before the
+        // IMPORTING update, because a request can park on the link *while* the pack is being moved.
+        const requestsOnTheLink = async () =>
+            req.downloadLink && req.downloadLink !== "PENDING_MATCH"
+                ? await prisma.request.findMany({
+                    where: { downloadLink: req.downloadLink, status: { in: ['DOWNLOADING', 'IMPORTING'] } },
+                    select: { id: true }
+                })
+                : [];
+        const batchRequestIds = Array.from(new Set([requestId, ...(await requestsOnTheLink()).map(r => r.id)]));
+        const handoffContext = {
+            batchId,
+            requestIds: batchRequestIds,
+            volumeId: req.volumeId,
+            metadataSource: req.metadataSource
+        };
 
         if (isBatchFolder) {
             for (const file of batchFiles) {
@@ -379,6 +403,11 @@ export const Importer = {
                 if (fs.existsSync(finalDest)) {
                     finalDest = path.join(watchedDir, `${Date.now()}_${path.basename(file)}`);
                 }
+                // The row goes in BEFORE the file does (#240 review): a sweep that starts while the
+                // pack is still being routed finds it and stamps it. The other order leaves the sweep
+                // importing files whose row appears a moment later — and nothing ever settles it.
+                const plannedRel = watchedRelativePath(watchedDir, finalDest);
+                await recordPendingHandoff({ ...handoffContext, relativePath: plannedRel });
                 try {
                     if (isFromClient || trackingHash) {
                         await fs.copy(file, finalDest, { overwrite: true });
@@ -387,9 +416,18 @@ export const Importer = {
                     }
                     
                     finalDest = fixMagicNumberSync(finalDest);
+                    // A lying extension is corrected by a rename, so the row follows the name the
+                    // engine will actually read.
+                    const finalRel = watchedRelativePath(watchedDir, finalDest);
+                    if (finalRel !== plannedRel) await rekeyPendingHandoff(batchId, plannedRel, finalRel);
+                    routedRelPaths.push(finalRel);
 
                     moveSuccessCount++;
                 } catch(err: any) {
+                    // Nothing landed: withdraw the row rather than leave a PENDING one the sweep can
+                    // never stamp (that is the "batch never reported back" verdict, over a file that
+                    // was never handed over).
+                    await dropPendingHandoff(batchId, plannedRel);
                     Logger.log(`[Importer Debug] Failed to route ${path.basename(file)} to Watched folder: ${err.message}`, 'warn');
                 }
             }
@@ -402,6 +440,12 @@ export const Importer = {
             const engineExtract = await engineNestedArchives(actualSourceFile, watchedDir);
             if (engineExtract?.files) {
                 moveSuccessCount = engineExtract.files.length;
+                routedRelPaths.push(...engineExtract.files.map(f => watchedRelativePath(watchedDir, f)));
+                // Known residual (#240 review): the engine names and writes these files itself, so
+                // their rows can only follow the extraction. Closing it means the engine owning the
+                // insert (it would need the batch context in the request), which is a change of its
+                // own. Recorded as one bulk write so the batch is still fully handed over.
+                await recordImportHandoff({ ...handoffContext, relativePaths: routedRelPaths });
                 if (!isFromClient && !trackingHash) {
                     try { await fs.remove(sourcePath); } catch(e) { Logger.log(`[Importer] Could not remove the source file ${sourcePath}: ${getErrorMessage(e)}`, 'debug'); }
                 }
@@ -423,55 +467,76 @@ export const Importer = {
                             if (fs.existsSync(finalDest)) {
                                 finalDest = path.join(watchedDir, `${Date.now()}_${fileName}`);
                             }
-                            fs.writeFileSync(finalDest, entry.getData());
+                            // Same rule as the folder path above: the row is in place before the file
+                            // is, so a sweep that starts mid-extraction stamps it instead of importing
+                            // a file whose row lands afterwards and is never settled.
+                            const plannedRel = watchedRelativePath(watchedDir, finalDest);
+                            await recordPendingHandoff({ ...handoffContext, relativePath: plannedRel });
+                            try {
+                                fs.writeFileSync(finalDest, entry.getData());
 
-                            finalDest = fixMagicNumberSync(finalDest);
+                                finalDest = fixMagicNumberSync(finalDest);
+                                const finalRel = watchedRelativePath(watchedDir, finalDest);
+                                if (finalRel !== plannedRel) await rekeyPendingHandoff(batchId, plannedRel, finalRel);
+                                routedRelPaths.push(finalRel);
 
-                            moveSuccessCount++;
+                                moveSuccessCount++;
+                            } catch (writeErr: unknown) {
+                                await dropPendingHandoff(batchId, plannedRel);
+                                throw writeErr;
+                            }
                         }
                     }
                     if (!isFromClient && !trackingHash) {
                         await fs.remove(sourcePath);
                     }
                 } catch (err: any) {
+                    // The batch did not make it: withdraw the rows of the files already written, so
+                    // the requests are left to the download checker with nothing half-promised.
+                    for (const rel of routedRelPaths) await dropPendingHandoff(batchId, rel);
                     Logger.log(`[Importer] Failed to extract batch archive: ${err.message}`, 'error');
                     return false;
                 }
             }
         }
 
-        // Safely clear the queue for anything sharing the link (Except missing match placeholders)
-        if (req.downloadLink && req.downloadLink !== "PENDING_MATCH") {
-            await prisma.request.updateMany({
-                where: { downloadLink: req.downloadLink, status: 'DOWNLOADING' },
-                data: { status: 'COMPLETED', progress: 100, notified: false }
-            });
-        } else {
-            await prisma.request.update({
-                where: { id: requestId },
-                data: { status: 'COMPLETED', progress: 100, notified: false }
-            });
+        // --- HANDOFF, NOT ARRIVAL (#240 PR B) ---
+        // The pack is in the watched folder; that is all we know. The requests now wait at
+        // IMPORTING until the sweep reports what each file became, and the reconciler in the cron
+        // closes them: COMPLETED with the "available" alert only once the issue really is in the
+        // library, NEEDS_REVIEW when the batch settled without it. Routing nothing is not a handoff
+        // — leave the requests to the download checker rather than promise an import that is not
+        // coming.
+        if (moveSuccessCount === 0) {
+            Logger.log(`[Importer] Batch of "${req.activeDownloadName || requestId}" routed 0 files — not handing anything to the watched folder.`, 'error');
+            return false;
         }
+
+        // Read the link once more: a request that parked on it while the files were being moved is
+        // not in the list taken at the start, and nothing else closes a parked request (#240 PR B) —
+        // it would sit at DOWNLOADING, and for a torrent the cron's client loop could match the
+        // finished torrent and route the pack a second time. They need no rows of their own: the
+        // reconciler's joined-batch path waits on the newest batch on their link.
+        const importingRequestIds = Array.from(new Set([
+            ...batchRequestIds,
+            ...(await requestsOnTheLink()).map(r => r.id)
+        ]));
+
+        await prisma.request.updateMany({
+            where: { id: { in: importingRequestIds } },
+            data: { status: 'IMPORTING', progress: 100, notified: false }
+        });
 
         try {
             const { omnibusQueue } = await import('./queue');
             await omnibusQueue.add('WATCHED_FOLDER_SYNC', { type: 'WATCHED_FOLDER_SYNC' }, {
-                jobId: `WATCHED_SYNC_BATCH_${Date.now()}`
+                jobId: batchId
             });
         } catch(e) {
             Logger.log(`[Importer] Could not queue the watched-sync batch: ${getErrorMessage(e)}`, 'warn');
         }
 
-        Logger.log(`[Importer] Successfully routed ${moveSuccessCount} files to Watched folder. Batch import complete.`, 'success');
-        
-        await SystemNotifier.sendAlert('comic_available', {
-            title: `${req.activeDownloadName || "Batch Download"} - ${moveSuccessCount} Files`,
-            imageUrl: req.imageUrl,
-            user: req.user?.username,
-            email: req.user?.email,
-            description: `Your batch download has finished! The files have been sent to the Watched Folder for auto-tagging and organization.`,
-            date: new Date().toLocaleString()
-        });
+        Logger.log(`[Importer] Successfully routed ${moveSuccessCount} files to Watched folder. Batch ${batchId} handed off; ${importingRequestIds.length} request(s) stay IMPORTING until the sweep reports back.`, 'success');
 
         // CRITICAL: Only add trackingHash (Torrents) to the ignore list so DDLs can be re-downloaded later if needed!
         if (trackingHash) {
@@ -642,6 +707,15 @@ export const Importer = {
       return false;
     }
 
+    // A Root Path saved before Settings checked it (a Windows path under Docker, a leading space, a
+    // folder nothing is mounted at) used to surface only as a bare EACCES deep in the copy. Name the
+    // library and the fix instead, and touch nothing (beta.018 follow-up).
+    const rootProblem = storedFolderProblem(libraryRoot, { example: '/data/comics' });
+    if (rootProblem) {
+      Logger.log(`[Importer] Can't import into library "${targetLibrary.name || 'Unnamed'}": ${rootProblem} Fix its Root Path in Settings → Library & Files.`, "error");
+      return false;
+    }
+
     if (isManga && targetLibrary.isManga) {
         Logger.log(`[Importer] Auto-routed to Manga Library: ${targetLibrary.name}`, "info");
     }
@@ -658,47 +732,45 @@ export const Importer = {
     const isActualZip = inMemoryTrueExt === '.cbz' || inMemoryTrueExt === '.zip' || actualSourceFile.toLowerCase().match(/\.(cbz|zip|epub)$/i);
     if (isActualZip) {
         try {
-            const zip = new AdmZip(actualSourceFile);
-            pageCount = zip.getEntries().filter((e: any) => !e.isDirectory && !e.entryName.toLowerCase().includes('__macosx') && IMAGE_EXT_REGEX.test(e.entryName)).length;
+            // Pages are counted after the move, from the archive's index (#240: this used to load the
+            // whole file into the Node heap just to count its entries).
             const { parseComicInfo } = await import('./metadata-extractor');
             xmlMeta = await parseComicInfo(actualSourceFile);
         } catch(e) {}
     }
 
-    const publisherName = (series?.publisher && series.publisher !== "Unknown") ? sanitize(series.publisher) : "Other";
     const seriesYearFromMeta = series?.year || req.activeDownloadName?.match(/\((\d{4})\)/)?.[1] || "";
     const seriesNameFromMeta = series?.name || cleanSeriesName;
-    const safeUniverse = (series as any)?.universe ? sanitize((series as any).universe) : "";
-    // Series Group is not supplied by ComicVine/Metron — the folder uses the value already stored on
-    // the series record (set by a prior scan or a manual edit). A group found only in this file's
-    // ComicInfo.xml is persisted to the series below so subsequent imports/renames pick it up.
-    const safeSeriesGroup = (series as any)?.seriesGroup ? sanitize((series as any).seriesGroup) : "";
     const storedImprint = (series as any)?.imprint?.trim();
     const shouldAdoptImprint = !storedImprint && !(series as any)?.hasCustomMetadata && !!xmlMeta?.imprint;
     const imprintName = storedImprint || (shouldAdoptImprint ? xmlMeta.imprint : "");
-    const safeImprint = imprintName ? sanitize(imprintName) : "";
+    // Series Group is not supplied by ComicVine/Metron — the folder uses the value already stored on
+    // the series record (set by a prior scan or a manual edit). A group found only in this file's
+    // ComicInfo.xml is persisted to the series below so subsequent imports/renames pick it up.
+    const seriesValues: NamingInput = {
+        publisher: series?.publisher,
+        series: seriesNameFromMeta,
+        seriesYear: seriesYearFromMeta,
+        universe: (series as any)?.universe,
+        seriesGroup: (series as any)?.seriesGroup,
+        imprint: imprintName,
+    };
+    const issuePadding = issuePaddingFromSetting(config.issue_number_padding);
 
-    Logger.log(`[Importer Debug] Applying Folder Pattern: "${folderPattern}" | Variables -> Publisher: "${publisherName}", Series: "${seriesNameFromMeta}", Year: "${seriesYearFromMeta}"`, 'debug');
+    Logger.log(`[Importer Debug] Applying Folder Pattern: "${folderPattern}" | Variables -> Publisher: "${series?.publisher || ''}", Series: "${seriesNameFromMeta}", Year: "${seriesYearFromMeta}"`, 'debug');
 
-    let relFolderPath = folderPattern
-        .replace(/{Publisher}/gi, publisherName)
-        .replace(/{Series}/gi, sanitize(seriesNameFromMeta))
-        .replace(/{Year}/gi, seriesYearFromMeta.toString())
-        .replace(/{VolumeYear}/gi, seriesYearFromMeta.toString())
-        .replace(/{UniverseName}/gi, safeUniverse)
-        .replace(/{SeriesGroup}/gi, safeSeriesGroup);
-
-    relFolderPath = replaceNamingToken(relFolderPath, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const folderParts = relFolderPath.split(/[/\\]/).map((p:string) => p.trim()).filter(Boolean);
+    const folderParts = seriesFolderSegments(folderPattern, seriesValues);
+    if (!folderParts) {
+        Logger.log(`[Importer] The folder pattern "${folderPattern}" gives no folder inside the library for ${seriesNameFromMeta}. Check Settings > Library & Files.`, "error");
+        return false;
+    }
     const idealDestFolder = path.join(libraryRoot, ...folderParts);
 
     let destFolder = "";
-    if (series?.folderPath && series.folderPath.trim() !== "") {
+    // A stored folder that isn't strictly inside a library (a library root itself, or a folder
+    // elsewhere on disk) is never this series' to move - the download goes to the pattern's folder.
+    const storedFolderIsOurs = isInsideLibraryRoot(series?.folderPath, libraries.map(l => l.path));
+    if (series?.folderPath && series.folderPath.trim() !== "" && storedFolderIsOurs) {
         if (series.folderPath !== idealDestFolder && fs.existsSync(series.folderPath)) {
             try {
                 Logger.log(`[Importer] Standardizing folder to: ${idealDestFolder}`, "info");
@@ -742,60 +814,48 @@ export const Importer = {
         destFolder = idealDestFolder;
     }
 
-    Logger.log(`[Importer Debug] Evaluated Folder Pattern: Publisher="${publisherName}", Series="${seriesNameFromMeta}", Year="${seriesYearFromMeta}" -> Result: ${destFolder}`, 'debug');
+    Logger.log(`[Importer Debug] Evaluated Folder Pattern: Series="${seriesNameFromMeta}", Year="${seriesYearFromMeta}" -> Result: ${destFolder}`, 'debug');
 
     const rawFileName = path.basename(actualSourceFile);
     const ext = path.extname(rawFileName);
     const extractedNum = extractIssueNumber(rawFileName);
     Logger.log(`[Importer Debug] Extracted internal issue number as: ${extractedNum} from raw string: ${rawFileName}`, 'debug');
     
-    let formattedNum = extractedNum;
-    if (!extractedNum.includes('.') && extractedNum.length === 1) formattedNum = `0${extractedNum}`;
-    
-    // Sanitize the XML year to prevent ComicVine IDs in the filename
-    let xmlYear = xmlMeta?.year;
-    if (xmlYear && (xmlYear < 1900 || xmlYear > 2100)) {
-        xmlYear = null;
-    }
-    
-    const issueYearFromMeta = xmlMeta?.year ? xmlMeta.year.toString() : seriesYearFromMeta.toString();
     // #203 Phase 1: an imported annual lands under the Mylar-shaped name (engine parity:
     // renamer.rs / watched_sync.rs) so it reads correctly beside the main run from the first write.
     const isAnnualImport = annualFlagForSignals(xmlMeta?.format, xmlMeta?.number, rawFileName);
-    const filePatToUse = isAnnualImport
-        ? "{Series} Annual #{Issue} ({IssueYear})"
-        : (isManga ? mangaFilePattern : filePattern);
-    
-    const issueTitle = xmlMeta?.title || "";
-    const universeName = xmlMeta?.universe || "";
-    const seriesGroupName = xmlMeta?.seriesGroup || (series as any)?.seriesGroup || "";
 
-    let newFileName = filePatToUse
-        .replace(/{Publisher}/gi, publisherName)
-        .replace(/{Series}/gi, sanitize(seriesNameFromMeta))
-        .replace(/{Year}/gi, seriesYearFromMeta.toString())
-        .replace(/{VolumeYear}/gi, seriesYearFromMeta.toString())
-        .replace(/{IssueYear}/gi, issueYearFromMeta)
-        .replace(/{Issue}/gi, formattedNum)
-        .replace(/{IssueTitle}/gi, sanitize(issueTitle))
-        .replace(/{UniverseName}/gi, sanitize(universeName))
-        .replace(/{SeriesGroup}/gi, sanitize(seriesGroupName));
+    // #243: {IssueYear} is THIS issue's year - its release date in the library (the year
+    // Standardize writes), else the file's own ComicInfo <Year>, else the series year. A monitored
+    // download already has its row (the monitor's placeholder), so look it up before naming -
+    // same identity as the dedupe below: number + annual domain.
+    let issueReleaseDate: string | null = null;
+    if (series?.id) {
+        const identity = xmlMeta?.number || extractedNum;
+        const rows = await prisma.issue.findMany({
+            where: { seriesId: series.id },
+            select: { number: true, isAnnual: true, releaseDate: true },
+        }).catch(() => [] as Array<{ number: string; isAnnual: boolean; releaseDate: string | null }>);
+        issueReleaseDate = rows.find(r => ((r.isAnnual ?? false) === isAnnualImport) && isSameIssue(r.number, identity))?.releaseDate ?? null;
+    }
+    const filePatToUse = isAnnualImport ? ANNUAL_FILE_PATTERN : (isManga ? mangaFilePattern : filePattern);
+    const newFileName = issueFileName(filePatToUse, {
+        ...seriesValues,
+        issueNumber: extractedNum,
+        releaseDate: issueReleaseDate,
+        comicInfoYear: xmlMeta?.issueYear,
+        issueTitle: xmlMeta?.title,
+        universe: xmlMeta?.universe,
+        seriesGroup: xmlMeta?.seriesGroup || (series as any)?.seriesGroup,
+    }, issuePadding) ?? sanitize(path.basename(rawFileName, ext));
 
-    newFileName = replaceNamingToken(newFileName, '{Imprint}', safeImprint)
-        .replace(/\(\s*\)/g, '')
-        .replace(/\[\s*\]/g, '')
-        .replace(/\s*-\s*-/g, ' - ')
-        .replace(/(^\s*-\s*|\s*-\s*$)/g, '')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    let fileName = `${sanitize(newFileName)}${ext}`;
+    let fileName = `${newFileName}${ext}`;
     let finalPath = path.join(destFolder, fileName);
     // Set once the file has physically landed in the library, so the catch below can still report
     // it if a later step (Prisma, notifier, usenet cleanup) throws.
     let landedInLibrary = false;
     
-    Logger.log(`[Importer Debug] Evaluated File Pattern: Issue="${formattedNum}", IssueYear="${issueYearFromMeta}" -> Result: ${fileName}`, 'debug');
+    Logger.log(`[Importer Debug] Evaluated File Pattern: Issue="${extractedNum}" (padding ${issuePadding}) -> Result: ${fileName}`, 'debug');
     Logger.log(`[Importer Debug] Target move operation: [${actualSourceFile}] -> [${finalPath}]`, 'debug');
 
     try {
@@ -867,9 +927,9 @@ export const Importer = {
           }
       }
 
-      // Late page count: the AdmZip count above only handles zip sources, so a CBR/CB7 import lands
-      // here with 0 — count the final file now (converted .cbz locally, unconverted .cbr/.rar/.cb7
-      // via the engine's native listing) so OPDS-PSE never advertises a fresh import as "0 pages".
+      // Page count: every import is counted here, from the final file - a .cbz/.zip from its index
+      // (never loaded whole), an unconverted .cbr/.rar/.cb7 via the engine's native listing - so
+      // OPDS-PSE never advertises a fresh import as "0 pages".
       if (pageCount === 0 && /\.(cbz|zip|cbr|rar|cb7)$/i.test(finalPath)) {
           const { countArchivePages, countArchivePagesViaEngine, isEngineCountable } = await import('./utils/archive-pages');
           pageCount = isEngineCountable(finalPath)

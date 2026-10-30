@@ -4,6 +4,8 @@ import { useEffect, useState } from "react"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { ArrowLeft, Webhook, Terminal, Copy, Check, FileJson, Play, Loader2, X } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { useToast } from "@/components/ui/use-toast"
@@ -11,41 +13,36 @@ import { copyText } from "@/lib/utils/clipboard"
 
 export default function ApiGuidePage() {
   const [copied, setCopied] = useState(false);
+  // The admin pastes the key to test. Nothing can read one back: keys made under Settings → Access &
+  // Security are stored hashed, and the admin settings only ever return a stored secret as `********`
+  // (the old tester sent that mask and got a 401 every time).
   const [apiKey, setApiKey] = useState<string>("");
   const [isTesting, setIsTesting] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
-  
+  const [testResult, setTestResult] = useState<{ status: number | null; body: string } | null>(null);
+
   const { toast } = useToast();
 
   useEffect(() => {
     document.title = "Omnibus - API Guide";
-    
-    // Fetch the actual API key so the Live Tester works instantly
-    fetch('/api/admin/config')
-      .then(res => res.json())
-      .then(data => {
-        if (data.settings && Array.isArray(data.settings)) {
-          const keySetting = data.settings.find((s: any) => s.key === 'omnibus_api_key');
-          if (keySetting) setApiKey(keySetting.value);
-        }
-      })
-      .catch(() => {});
   }, []);
 
   const handleTestApi = async () => {
+    const key = apiKey.trim();
+    if (!key) return;
     setIsTesting(true);
     setTestResult(null);
     try {
       const res = await fetch('/api/v1/stats', {
         method: 'GET',
+        cache: 'no-store',
         headers: {
-          'x-api-key': apiKey
+          'x-api-key': key
         }
       });
-      const data = await res.json();
-      setTestResult(JSON.stringify(data, null, 2));
+      const data = await res.json().catch(() => ({ error: "The endpoint did not return JSON." }));
+      setTestResult({ status: res.status, body: JSON.stringify(data, null, 2) });
     } catch (e: any) {
-      setTestResult(JSON.stringify({ error: e.message || "Failed to reach endpoint." }, null, 2));
+      setTestResult({ status: null, body: JSON.stringify({ error: e.message || "Failed to reach endpoint." }, null, 2) });
     } finally {
       setIsTesting(false);
     }
@@ -235,33 +232,47 @@ export default function ApiGuidePage() {
                         <h3 className="text-lg font-bold text-foreground">Live API Tester</h3>
                         <p className="text-xs text-muted-foreground mt-0.5">Ping your server locally to verify the response payload.</p>
                     </div>
-                    <Button 
-                        onClick={handleTestApi} 
-                        disabled={isTesting || !apiKey} 
+                    <Button
+                        onClick={handleTestApi}
+                        disabled={isTesting || !apiKey.trim()}
                         className="font-bold bg-primary hover:bg-primary/90 text-primary-foreground shadow-sm w-full sm:w-auto"
                     >
                         {isTesting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Play className="w-4 h-4 mr-2 fill-current" />}
                         Test Endpoint
                     </Button>
                 </div>
-                
-                {!apiKey && (
-                    <div className="text-sm text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-950/30 p-4 rounded-lg border border-orange-200 dark:border-orange-900/50 font-medium flex items-center gap-2">
-                        <Terminal className="w-5 h-5 shrink-0" />
-                        You must generate an API Key in the Settings panel before you can test this endpoint.
-                    </div>
-                )}
+
+                <div className="grid gap-2">
+                    <Label htmlFor="api-test-key" className="text-foreground font-semibold">API key to test</Label>
+                    <Input
+                        id="api-test-key"
+                        type="password"
+                        autoComplete="off"
+                        spellCheck={false}
+                        value={apiKey}
+                        onChange={e => setApiKey(e.target.value)}
+                        onKeyDown={e => { if (e.key === 'Enter') handleTestApi(); }}
+                        placeholder="Paste an API key"
+                        className="font-mono bg-background border-border"
+                    />
+                    <p className="text-xs text-muted-foreground flex items-start gap-1.5">
+                        <Terminal className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                        A key is shown once, when you create it under Settings → Access &amp; Security. It is sent only to this server, as the <code className="font-mono">x-api-key</code> header, and is not saved.
+                    </p>
+                </div>
 
                 {testResult && (
                     <div className="relative rounded-lg overflow-hidden border border-border bg-muted/30 animate-in fade-in slide-in-from-top-2 shadow-inner">
                         <div className="flex items-center justify-between px-4 py-2 bg-muted/50 border-b border-border">
-                            <span className="text-xs font-mono font-bold text-muted-foreground">JSON Response</span>
-                            <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-foreground hover:bg-background" onClick={() => setTestResult(null)}>
+                            <span className="text-xs font-mono font-bold text-muted-foreground">
+                                JSON Response{testResult.status !== null && <span className={testResult.status >= 200 && testResult.status < 300 ? "ml-2 text-green-600 dark:text-green-400" : "ml-2 text-red-600 dark:text-red-400"}>HTTP {testResult.status}</span>}
+                            </span>
+                            <Button variant="ghost" size="icon" className="h-6 w-6 text-muted-foreground hover:text-foreground hover:bg-background" onClick={() => setTestResult(null)} aria-label="Close response">
                                 <X className="w-4 h-4" />
                             </Button>
                         </div>
                         <pre className="p-4 overflow-x-auto text-xs sm:text-sm font-mono text-foreground leading-relaxed max-h-[400px]">
-                            <code>{testResult}</code>
+                            <code>{testResult.body}</code>
                         </pre>
                     </div>
                 )}

@@ -6,13 +6,16 @@ import { SystemNotifier } from './notifications';
 import { Mailer } from './mailer';
 import { apiClient as axios } from '@/lib/api-client';
 import { isReleasedYet } from '@/lib/utils';
-import { searchAndDownload } from '@/lib/automation';
+import { searchAndDownload, waitForSearchSlot } from '@/lib/automation';
+import { JOB_PRIORITY } from '@/lib/job-priority';
 import packageJson from '../../package.json';
 import { getErrorMessage } from '@/lib/utils/error';
 import { ENGINE_URL, engineHeaders, engineFetchLong } from '@/lib/engine';
 import { isSameIssue, extractIssueNumber } from '@/lib/utils/issue-parser';
+import { issueNumberOf, settleDuplicateOnLink } from '@/lib/request-dedupe';
 import { processPageSweepChunk } from '@/lib/pages/page-sweep';
 import { SCHEDULE_SEED_KEY, newScheduleSeed, scheduleOffsetMs } from '@/lib/schedule-jitter';
+import { SCHEDULE_KEYS, scheduleValue } from '@/lib/schedule-defaults';
 
 function isNewerVersion(latest: string, current: string): boolean {
     const cleanLatest = latest.replace(/^v/, '');
@@ -102,20 +105,14 @@ const NO_RETRY_SCHEDULED_JOBS = new Set([
 
 export async function syncSchedules() {
     const settings = await prisma.systemSetting.findMany({
-        where: {
-            key: {
-                in: [
-                    'library_sync_schedule', 'metadata_sync_schedule', 'monitor_sync_schedule',
-                    'diagnostics_sync_schedule', 'backup_sync_schedule', 'backup_sync_day', 'popular_sync_schedule',
-                    'weekly_digest_schedule', 'weekly_digest_day', 'cbr_conversion_schedule', 'embed_metadata_schedule',
-                    'series_json_schedule', 'cache_cleanup_schedule', 'watched_sync_schedule', 'health_check_schedule',
-                    'unmatched_sweep_schedule', 'download_reaper_schedule'
-                ]
-            }
-        }
+        where: { key: { in: [...SCHEDULE_KEYS, 'cbr_conversion_enabled', 'download_reaper_schedule'] } }
     });
-    
-    const config = Object.fromEntries(settings.map(s => [s.key, s.value]));
+
+    // A schedule nobody saved runs on the default Admin → Jobs shows for it (schedule-defaults.ts) -
+    // a fresh install saves none, and used to run none of these jobs until someone pressed Save there.
+    const saved: Record<string, string> = Object.fromEntries(settings.map(s => [s.key, s.value]));
+    const config: Record<string, string> = { ...saved };
+    for (const key of SCHEDULE_KEYS) config[key] = scheduleValue(saved, key);
 
     // #216: a legacy `repeat: { every }` lands on multiples of the interval since the Unix epoch, so every
     // install fired its daily jobs at 00:00 UTC together - a nightly burst against Metron. Schedules now
@@ -189,20 +186,19 @@ export async function syncSchedules() {
     // --------------------------------
     
     // cbr_conversion_enabled=false: no scheduled conversion sweep (native RAR reading serves CBRs);
-    // the manual "Run Now" trigger keeps working regardless.
+    // the manual "Run Now" trigger keeps working regardless. (The setting is loaded above now - it
+    // wasn't, so turning Auto-Convert off never stopped the scheduled sweep.)
     await addJob('CBR_CONVERSION', config.cbr_conversion_enabled === 'false' ? '0' : config.cbr_conversion_schedule);
     await addJob('EMBED_METADATA', config.embed_metadata_schedule);
     await addJob('EXPORT_SERIES_JSON', config.series_json_schedule);
     await addJob('CACHE_CLEANUP', config.cache_cleanup_schedule);
 
     // --- REPLACED: Converted hardcoded 15m intervals to dynamic user variables ---
-    await addJob('WATCHED_FOLDER_SYNC', config.watched_sync_schedule || '0.25'); 
+    await addJob('WATCHED_FOLDER_SYNC', config.watched_sync_schedule);
     // Unmatched-series retry sweep (discussion #177): budget-aware; default hourly.
-    await addJob('UNMATCHED_SWEEP', config.unmatched_sweep_schedule || '1');
-    await addJob('SYSTEM_HEALTH_CHECK', config.health_check_schedule || '0.25'); 
-    // Zombie-download reaper (production incident layer 4): hourly by default, threshold via the
-    // `download_reaper_stale_days` SystemSetting (default 3) read inside the sweep itself.
-    await addJob('DOWNLOAD_REAPER', config.download_reaper_schedule || '1');
+    await addJob('UNMATCHED_SWEEP', config.unmatched_sweep_schedule);
+    await addJob('SYSTEM_HEALTH_CHECK', config.health_check_schedule);
+    await addJob('DOWNLOAD_REAPER', config.download_reaper_schedule);
 
     // Leave the GitHub update checker at 24 hours
     await addJob('UPDATE_CHECK', '24');
@@ -303,6 +299,9 @@ export function initWorker() {
                     }
 
                     try {
+                        // Searches start at least 5 s apart (automation.ts): the gap is kept here, as the
+                        // search starts, so the queue can order the searches by priority alone.
+                        await waitForSearchSlot();
                         const rustResponse = await fetch(ENGINE_URL + '/api/automation/search', {
                             method: 'POST',
                             headers: engineHeaders({ 'Content-Type': 'application/json' }),
@@ -401,15 +400,23 @@ export function initWorker() {
 
                             // Batch-pack dedup against the primary link: if another request is already
                             // downloading it, attach for batch extraction rather than downloading twice
-                            // (parity with automation.ts duplicateDownload).
-                            const duplicateDownload = await prisma.request.findFirst({
-                                where: { downloadLink: candidates[0].url, status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] }, id: { not: requestId } }
-                            });
-                            if (duplicateDownload) {
-                                Logger.log(`[BullMQ] Batch pack already downloading/downloaded (${candidates[0].url}). Queuing ${name} for batch extraction.`, 'info');
-                                await prisma.request.update({ where: { id: requestId }, data: { status: 'DOWNLOADING', activeDownloadName: safeTitle, downloadLink: candidates[0].url, clientDownloadId: null, downloadClientId: null } });
+                            // (parity with automation.ts duplicateDownload). #240: a link whose earlier
+                            // request has already FINISHED is not a reason to park — nothing would ever
+                            // close this row, and the pack's bytes are gone. The helper settles it
+                            // instead (COMPLETED when the issue is in the library, NEEDS_REVIEW when it
+                            // never arrived) and we download nothing.
+                            const duplicateDownload = await settleDuplicateOnLink(candidates[0].url, requestId);
+                            if (duplicateDownload.action === 'park') {
+                                Logger.log(`[BullMQ] Batch pack already downloading (${candidates[0].url}). Queuing ${name} for batch extraction.`, 'info');
+                                await prisma.request.update({ where: { id: requestId }, data: { status: 'DOWNLOADING', activeDownloadName: safeTitle, downloadLink: candidates[0].url } });
                                 break;
                             }
+                            if (duplicateDownload.action === 'join') {
+                                Logger.log(`[BullMQ] Batch pack already handed to the watched folder (${candidates[0].url}). Joining its wait instead of downloading it again.`, 'info');
+                                await prisma.request.update({ where: { id: requestId }, data: { status: 'IMPORTING', progress: 100, activeDownloadName: safeTitle, downloadLink: candidates[0].url } });
+                                break;
+                            }
+                            if (duplicateDownload.action === 'settle') break;
 
                             // Detached download-time fallback: try each hoster in priority order until one
                             // streams. If they all fail but a Cloudflare-gated getcomics.org/dls/ link was
@@ -468,11 +475,14 @@ export function initWorker() {
                             // download, not one per request. Park this request against the sibling's link —
                             // the importer's shared-link completion sweep (updateMany on downloadLink) closes
                             // it out when the single download imports, and the cron dead-lead release frees it
-                            // if the lead permanently fails.
-                            const duplicateExternal = await prisma.request.findFirst({
-                                where: { downloadLink: trackingHash, status: { in: ['DOWNLOADING', 'IMPORTED', 'COMPLETED'] }, id: { not: requestId } }
-                            });
-                            if (duplicateExternal) {
+                            // if the lead permanently fails. #240: that only holds while the lead is still
+                            // downloading. A finished lead means nothing will ever close this row: the
+                            // shared-link sweep has already run, and the cron's client loop would match
+                            // the parked row to the same completed (still-seeding) torrent and route the
+                            // same files a second time. Settling is the better behaviour, so the helper
+                            // does that instead of parking.
+                            const duplicateExternal = await settleDuplicateOnLink(trackingHash, requestId);
+                            if (duplicateExternal.action === 'park') {
                                 Logger.log(`[BullMQ] Release already sent to the download client by another request (${bestMatch.title}). Parking ${name} against it instead of re-downloading.`, 'info');
                                 await prisma.request.update({
                                     where: { id: requestId },
@@ -480,6 +490,15 @@ export function initWorker() {
                                 });
                                 break;
                             }
+                            if (duplicateExternal.action === 'join') {
+                                Logger.log(`[BullMQ] Release already handed to the watched folder by another request (${bestMatch.title}). Joining its wait instead of re-downloading.`, 'info');
+                                await prisma.request.update({
+                                    where: { id: requestId },
+                                    data: { status: 'IMPORTING', progress: 100, activeDownloadName: bestMatch.title, downloadLink: trackingHash, indexer: bestMatch.indexer }
+                                });
+                                break;
+                            }
+                            if (duplicateExternal.action === 'settle') break;
 
                             Logger.log(`[BullMQ] Routing ${bestMatch.protocol.toUpperCase()} release to external client: ${clientConfig.name}`, 'info');
 
@@ -796,8 +815,11 @@ export function initWorker() {
                     // handles a handful of files then re-enqueues the remainder, so this single
                     // worker is never blocked for a whole 400-file sweep. The processor owns
                     // progress/cancel/completion; enqueueNext is injected to avoid an import cycle.
+                    // The next chunk takes the top tier (job-priority.ts): queued with no priority it would
+                    // jump every search until the sweep ends; at REQUESTED it alternates with the searches
+                    // people asked for and still goes ahead of the bulk and background ones.
                     await processPageSweepChunk(job.data, (next) =>
-                        omnibusQueue.add('PAGE_SWEEP', next, { jobId: `PAGE_SWEEP_${next.runId}_${next.processed}` })
+                        omnibusQueue.add('PAGE_SWEEP', next, { jobId: `PAGE_SWEEP_${next.runId}_${next.processed}`, priority: JOB_PRIORITY.REQUESTED })
                     );
                     break;
                 }
@@ -964,16 +986,23 @@ export function initWorker() {
                     const existingReqs: any[] = candidateVolumeIds.length
                         ? await prisma.request.findMany({
                             where: { volumeId: { in: candidateVolumeIds } },
-                            select: { id: true, volumeId: true, activeDownloadName: true, status: true }
+                            select: { id: true, volumeId: true, activeDownloadName: true, issueNumber: true, status: true }
                         })
                         : [];
 
-                    // Request creation / UNRELEASED upgrade from the engine's candidates.
+                    // Request creation / UNRELEASED upgrade from the engine's candidates. Every search the
+                    // monitor starts (here and in Phases 3/3b) is BACKGROUND (job-priority.ts): a run can
+                    // queue hundreds, and a request someone makes meanwhile must not wait behind them.
                     for (const c of (monitorData.candidates || [])) {
+                        // Identity first, name second (#240): the stored issue number survives the
+                        // download overwriting activeDownloadName with a pack title, which is what made a
+                        // COMPLETED request titled "X-Men #34-40" stop matching the #37 it was created
+                        // for — the monitor then queued a fresh request and the same pack came down again.
+                        // Rows that predate the column (and requests that aren't for one issue: a
+                        // reading-list title import, a manual pack link) fall back to the name parse.
                         const alreadyReq = existingReqs.find(r => {
                             if (r.volumeId !== c.volume_id) return false;
-                            const match = r.activeDownloadName?.match(/(?:#|issue\s*#?|ch(?:apter)?\s*\.?)\s*0*(\d+(?:\.\d+)?[a-zA-Z]?)/i);
-                            const reqNum = match ? match[1] : null;
+                            const reqNum = issueNumberOf(r);
                             return reqNum ? isSameIssue(reqNum, c.issue_number) : false;
                         });
 
@@ -989,7 +1018,7 @@ export function initWorker() {
                             if (alreadyReq.status === 'UNRELEASED' && c.is_released && !dateless) {
                                 details += `[UPGRADE] ${c.search_name} released. Triggering search...\n`;
                                 await prisma.request.update({ where: { id: alreadyReq.id }, data: { status: 'PENDING' } });
-                                searchAndDownload(alreadyReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga).catch(() => {});
+                                searchAndDownload(alreadyReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                                 unreleasedUpgraded++;
                                 alreadyReq.status = 'PENDING';
                             }
@@ -1005,13 +1034,16 @@ export function initWorker() {
                                     // broke that lookup for Metron-monitored series and weakened the guard.
                                     metadataSource: c.metadata_source,
                                     status: issueStatus,
+                                    // #240: the issue this request is for, kept alongside the search name the
+                                    // download will overwrite with the release's own title.
+                                    issueNumber: c.issue_number != null ? String(c.issue_number) : null,
                                     activeDownloadName: c.search_name,
                                     imageUrl: c.image_url || null
                                 }
                             });
                             existingReqs.push(newReq);
                             if (c.is_released && !dateless) {
-                                searchAndDownload(newReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga).catch(() => {});
+                                searchAndDownload(newReq.id, c.search_name, c.issue_year, c.publisher, c.is_manga, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                                 newRequestsFound++;
                             }
                         }
@@ -1045,7 +1077,7 @@ export function initWorker() {
                                 if (skeleton && skeleton.releaseDate) {
                                     if (isReleasedYet(skeleton.releaseDate, skeleton.releaseDate)) {
                                         await prisma.request.update({ where: { id: req.id }, data: { status: 'PENDING' } });
-                                        searchAndDownload(req.id, req.activeDownloadName || "", skeleton.releaseDate.split('-')[0], matchedSeries.publisher || "Unknown", matchedSeries.isManga).catch(() => {});
+                                        searchAndDownload(req.id, req.activeDownloadName || "", skeleton.releaseDate.split('-')[0], matchedSeries.publisher || "Unknown", matchedSeries.isManga, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                                         unreleasedUpgraded++;
                                     }
                                 }
@@ -1104,7 +1136,7 @@ export function initWorker() {
                         }
                         // Reset retryCount so a fresh find gets the cron's full download-retry budget.
                         await prisma.request.update({ where: { id: req.id }, data: { status: 'PENDING', retryCount: 0, progress: 0 } });
-                        searchAndDownload(req.id, req.activeDownloadName || "", searchYear, s?.publisher || "Unknown", s?.isManga || false).catch(() => {});
+                        searchAndDownload(req.id, req.activeDownloadName || "", searchYear, s?.publisher || "Unknown", s?.isManga || false, false, JOB_PRIORITY.BACKGROUND).catch(() => {});
                         parkedRetried++;
                     }
                     if (parkedRetried > 0) details += `[PARKED] Re-searched ${parkedRetried} parked request(s) (awaiting/manual/dead-stalled) after ${awaitingRetryDays}d.\n`;

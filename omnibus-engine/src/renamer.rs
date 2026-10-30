@@ -14,93 +14,13 @@ use sqlx::Row;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use crate::naming::{self, IssuePadding, NamingInput};
 
 pub struct RenameSummary {
     pub files_renamed: i64,
     pub folders_renamed: i64,
     pub conflicts: i64,
     pub last_path: String,
-}
-
-/// Strips characters invalid in file/folder names + neutralizes dot-only traversal segments.
-/// Byte-for-byte parity with Node's sanitizeFilename (utils/sanitize.ts) — both sides MUST produce
-/// identical paths or renames and imports would disagree about where a series lives.
-pub(crate) fn sanitize_component(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
-        .collect();
-    let cleaned = cleaned.trim();
-    let safe = cleaned.trim_start_matches('.').trim_end_matches('.').trim();
-    if safe.is_empty() && !cleaned.is_empty() {
-        return "_".to_string();
-    }
-    safe.to_string()
-}
-
-/// Case-insensitive replacement of a naming token like `{Publisher}` (parity with Node's `/gi`
-/// replaces). Tokens are pure ASCII, so byte-wise ASCII-case comparison is safe on UTF-8 input.
-pub(crate) fn replace_token_ci(input: &str, token: &str, value: &str) -> String {
-    let bytes = input.as_bytes();
-    let tok = token.as_bytes();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + tok.len() <= bytes.len() && bytes[i..i + tok.len()].eq_ignore_ascii_case(tok) {
-            out.push_str(value);
-            i += tok.len();
-        } else {
-            let ch_len = match bytes[i] {
-                b if b < 0x80 => 1,
-                b if b < 0xE0 => 2,
-                b if b < 0xF0 => 3,
-                _ => 4,
-            };
-            out.push_str(&input[i..i + ch_len]);
-            i += ch_len;
-        }
-    }
-    out
-}
-
-/// The shared tail of both naming pipelines: drop empty `()`/`[]` leftovers, (file mode) collapse
-/// double hyphens + strip leading/trailing hyphens, collapse whitespace. Order matches the Node
-/// replace chains exactly.
-fn clean_pattern_result(s: &str, file_mode: bool) -> String {
-    use std::sync::OnceLock;
-    static EMPTY_PARENS: OnceLock<regex::Regex> = OnceLock::new();
-    static EMPTY_BRACKETS: OnceLock<regex::Regex> = OnceLock::new();
-    static DOUBLE_HYPHEN: OnceLock<regex::Regex> = OnceLock::new();
-    static EDGE_HYPHEN: OnceLock<regex::Regex> = OnceLock::new();
-    static MULTI_SPACE: OnceLock<regex::Regex> = OnceLock::new();
-
-    let mut out = EMPTY_PARENS.get_or_init(|| regex::Regex::new(r"\(\s*\)").unwrap()).replace_all(s, "").to_string();
-    out = EMPTY_BRACKETS.get_or_init(|| regex::Regex::new(r"\[\s*\]").unwrap()).replace_all(&out, "").to_string();
-    if file_mode {
-        out = DOUBLE_HYPHEN.get_or_init(|| regex::Regex::new(r"\s*-\s*-").unwrap()).replace_all(&out, " - ").to_string();
-        out = EDGE_HYPHEN.get_or_init(|| regex::Regex::new(r"(^\s*-\s*|\s*-\s*$)").unwrap()).replace_all(&out, "").to_string();
-    }
-    out = MULTI_SPACE.get_or_init(|| regex::Regex::new(r"\s+").unwrap()).replace_all(&out, " ").to_string();
-    out.trim().to_string()
-}
-
-/// Issue-number padding: 3-digit zero-pad on the integer part, preserving decimals and a leading
-/// minus (parity with the Node route's padding block).
-fn pad_issue_number(number: &str) -> String {
-    let mut n = if number.is_empty() { "0".to_string() } else { number.to_string() };
-    let negative = n.starts_with('-');
-    if negative {
-        n = n[1..].to_string();
-    }
-    let padded = if !n.contains('.') {
-        format!("{:0>3}", n)
-    } else {
-        let mut parts = n.splitn(2, '.');
-        let int = parts.next().unwrap_or("");
-        let frac = parts.next().unwrap_or("");
-        format!("{:0>3}.{}", int, frac)
-    };
-    if negative { format!("-{}", padded) } else { padded }
 }
 
 /// Separator- and case-insensitive path comparison key (parity with the Node route's
@@ -265,6 +185,7 @@ pub async fn run_bulk_rename(
     file_pattern: &str,
     manga_file_pattern: Option<&str>,
     collected_file_pattern: Option<&str>,
+    padding: IssuePadding,
 ) -> Result<RenameSummary> {
     // Empty id list → nothing to rename (`IN ()` is invalid SQL; matches the old ANY('{}')).
     let series_rows = if series_ids.is_empty() {
@@ -332,39 +253,32 @@ pub async fn run_bulk_rename(
                 continue;
             }
         };
-        let current_folder = s.folder_path.clone();
-
-        // --- Shared substitution values (used for both folder + file patterns) ---
-        let safe_publisher = match s.publisher.as_deref() {
-            Some(p) if !p.is_empty() && p != "Unknown" => sanitize_component(p),
-            _ => "Other".to_string(),
-        };
-        let safe_series = sanitize_component(if s.name.is_empty() { "Unknown" } else { &s.name });
-        let safe_year = if s.year != 0 { s.year.to_string() } else { String::new() };
-        let safe_universe = s.universe.as_deref().filter(|u| !u.is_empty()).map(sanitize_component).unwrap_or_default();
-        let safe_series_group = s.series_group.as_deref().filter(|g| !g.is_empty()).map(sanitize_component).unwrap_or_default();
-        let safe_imprint = s.imprint.as_deref().filter(|i| !i.is_empty()).map(sanitize_component).unwrap_or_default();
-
-        // --- Compute the target folder from the active pattern ---
-        let mut rel = folder_pattern.to_string();
-        for (token, value) in [
-            ("{Imprint}", safe_imprint.as_str()),
-            ("{Publisher}", safe_publisher.as_str()),
-            ("{Series}", safe_series.as_str()),
-            ("{Year}", safe_year.as_str()),
-            ("{VolumeYear}", safe_year.as_str()),
-            ("{UniverseName}", safe_universe.as_str()),
-            ("{SeriesGroup}", safe_series_group.as_str()),
-        ] {
-            rel = replace_token_ci(&rel, token, value);
-        }
-        let rel = clean_pattern_result(&rel, false);
-
-        let folder_parts: Vec<&str> = rel.split(['/', '\\']).map(str::trim).filter(|p| !p.is_empty()).collect();
-        if folder_parts.is_empty() {
-            log::warn!("[Renamer] Skipping series \"{}\" - naming pattern produced an empty folder path.", s.name);
+        // The engine runs as root: renaming under a Root Path the server can't use would create the
+        // target folder inside the container, where the next image update deletes it (beta.018
+        // follow-up, same check as the watched-folder import).
+        if let Some(problem) = crate::server_paths::folder_problem(&library_root, "/data/comics") {
+            log::warn!(
+                "[Renamer] Skipping series \"{}\" - its library's Root Path can't be used: {} Fix it in Settings → Library & Files.",
+                s.name, problem
+            );
             continue;
         }
+        let current_folder = s.folder_path.clone();
+
+        // --- Compute the target folder from the active pattern (naming.rs, twinned with Node) ---
+        let series_values = NamingInput {
+            publisher: s.publisher.clone(),
+            series: s.name.clone(),
+            series_year: s.year,
+            universe: s.universe.clone(),
+            series_group: s.series_group.clone(),
+            imprint: s.imprint.clone(),
+            ..Default::default()
+        };
+        let Some(folder_parts) = naming::folder_segments(folder_pattern, &series_values) else {
+            log::warn!("[Renamer] Skipping series \"{}\" - the folder pattern doesn't give a folder inside the library.", s.name);
+            continue;
+        };
         let mut target_folder = PathBuf::from(&library_root);
         for part in &folder_parts {
             target_folder.push(part);
@@ -445,13 +359,6 @@ pub async fn run_bulk_rename(
                 .map(|e| format!(".{}", e.to_string_lossy()))
                 .unwrap_or_default();
 
-            let padded_num = pad_issue_number(&issue_number);
-            let issue_year = release_date
-                .as_deref()
-                .filter(|d| !d.is_empty())
-                .map(|d| d.split('-').next().unwrap_or("").to_string())
-                .unwrap_or_else(|| if s.year != 0 { s.year.to_string() } else { "0000".to_string() });
-
             // Strip a redundant "Series #N: " prefix out of the issue title before substitution.
             let mut clean_issue_name = issue_name.clone().unwrap_or_default();
             if !s.name.is_empty() {
@@ -464,36 +371,25 @@ pub async fn run_bulk_rename(
                 }
             }
 
-            // File pattern: publisher/series go in RAW (the whole result is sanitized at the end),
-            // title/universe/group are pre-sanitized — exact parity with the Node substitution chain.
-            let raw_publisher = match s.publisher.as_deref() {
-                Some(p) if !p.is_empty() => p,
-                _ => "Unknown",
-            };
-            let raw_series = if s.name.is_empty() { "Unknown" } else { &s.name };
             // A LOCAL collected edition's books are named after the edition — its files' names are
             // the only claim it has (twinned with the Node loop + the preview).
-            let series_token = series_token_for_issue(is_collected, attachment_source.as_deref(), attachment_name.as_deref(), raw_series);
-            let year_str = if s.year != 0 { s.year.to_string() } else { "0000".to_string() };
+            let series_token = series_token_for_issue(is_collected, attachment_source.as_deref(), attachment_name.as_deref(), &s.name);
+            let issue_values = NamingInput {
+                series: series_token.to_string(),
+                issue_number: issue_number.clone(),
+                release_date: release_date.clone(),
+                issue_title: Some(clean_issue_name),
+                ..series_values.clone()
+            };
 
-            // #203 Phase 1: an annual takes the Mylar-shaped name (see ANNUAL_FILE_PATTERN). The
-            // tokens still flow through the same substitution + sanitize chain as every other name.
-            let mut file_name = file_pattern_for_issue(is_annual, is_collected, s.is_manga, file_pattern, manga_file_pattern, collected_file_pattern).to_string();
-            for (token, value) in [
-                ("{Imprint}", safe_imprint.as_str()),
-                ("{Publisher}", raw_publisher),
-                ("{Series}", series_token),
-                ("{Year}", year_str.as_str()),
-                ("{VolumeYear}", year_str.as_str()),
-                ("{IssueYear}", issue_year.as_str()),
-                ("{Issue}", padded_num.as_str()),
-                ("{IssueTitle}", &sanitize_component(&clean_issue_name)),
-                ("{UniverseName}", safe_universe.as_str()),
-                ("{SeriesGroup}", safe_series_group.as_str()),
-            ] {
-                file_name = replace_token_ci(&file_name, token, value);
-            }
-            let file_name = format!("{}{}", sanitize_component(&clean_pattern_result(&file_name, true)), ext);
+            // #203 Phase 1: an annual takes the Mylar-shaped name (see ANNUAL_FILE_PATTERN), named
+            // through the same naming.rs rules as every other file.
+            let pattern = file_pattern_for_issue(is_annual, is_collected, s.is_manga, file_pattern, manga_file_pattern, collected_file_pattern);
+            let Some(stem) = naming::file_name(pattern, &issue_values, padding) else {
+                log::warn!("[Renamer] Skipping issue {:?} - the file pattern leaves no name.", issue_name);
+                continue;
+            };
+            let file_name = format!("{}{}", stem, ext);
             let new_file_path = target_folder.join(&file_name);
             let new_file_path_str = new_file_path.to_string_lossy().to_string();
 
@@ -571,49 +467,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitize_component_matches_node_sanitize_filename() {
-        assert_eq!(sanitize_component("Batman: Year One?"), "Batman Year One");
-        assert_eq!(sanitize_component("a<b>c:d\"e/f\\g|h?i*j"), "abcdefghij");
-        assert_eq!(sanitize_component("  spaced  "), "spaced");
-        // Traversal neutralization: leading/trailing dots stripped, dot-only collapses to "_".
-        assert_eq!(sanitize_component(".."), "_");
-        assert_eq!(sanitize_component("..evil"), "evil");
-        assert_eq!(sanitize_component("trailing..."), "trailing");
-        assert_eq!(sanitize_component(""), "");
-    }
-
-    #[test]
-    fn replace_token_ci_is_case_insensitive_and_utf8_safe() {
-        assert_eq!(replace_token_ci("{Series} #{Issue}", "{Series}", "Batman"), "Batman #{Issue}");
-        assert_eq!(replace_token_ci("{series}/{SERIES}", "{Series}", "X"), "X/X");
-        assert_eq!(replace_token_ci("{imprint}/{IMPRINT}", "{Imprint}", "$&"), "$&/$&");
-        // Non-ASCII around the token must survive untouched.
-        assert_eq!(replace_token_ci("Ünïcode {Year} déjà", "{Year}", "2016"), "Ünïcode 2016 déjà");
-        assert_eq!(replace_token_ci("no tokens here", "{Issue}", "5"), "no tokens here");
-    }
-
-    #[test]
-    fn pad_issue_number_matches_node_padding() {
-        assert_eq!(pad_issue_number("1"), "001");
-        assert_eq!(pad_issue_number("42"), "042");
-        assert_eq!(pad_issue_number("1000"), "1000"); // never truncates
-        assert_eq!(pad_issue_number("1.5"), "001.5");
-        assert_eq!(pad_issue_number("-1"), "-001");
-        assert_eq!(pad_issue_number("-2.1"), "-002.1");
-        assert_eq!(pad_issue_number(""), "000"); // falsy → "0" → padded
-    }
-
-    #[test]
-    fn clean_pattern_result_matches_node_replace_chains() {
-        // Folder mode: empty () / [] dropped, whitespace collapsed.
-        assert_eq!(clean_pattern_result("DC/Batman ( )", false), "DC/Batman");
-        assert_eq!(clean_pattern_result("Marvel/X [ ]  Men", false), "Marvel/X Men");
-        // File mode also collapses double hyphens and strips edge hyphens.
-        assert_eq!(clean_pattern_result("Batman - - 001", true), "Batman - 001");
-        assert_eq!(clean_pattern_result(" - Batman 001 - ", true), "Batman 001");
-    }
-
-    #[test]
     fn norm_ci_boundary_prevents_sibling_root_match() {
         // "/libraryX" must not be treated as inside "/library" by the cleanup walk.
         let root = norm_ci("/library");
@@ -666,13 +519,17 @@ mod tests {
         assert_eq!(file_pattern_for_issue(false, false, true, comic, manga, None), "{Series} Vol. {Issue}");
         assert_eq!(file_pattern_for_issue(false, false, false, comic, manga, None), "{Series} #{Issue}");
 
-        // End to end through the same substitution chain the rename loop uses: zero-padded number,
-        // the annual's own year, sanitized result.
-        let mut name = file_pattern_for_issue(true, false, false, comic, None, None).to_string();
-        for (token, value) in [("{Series}", "Batman"), ("{Issue}", pad_issue_number("1").as_str()), ("{IssueYear}", "2012")] {
-            name = replace_token_ci(&name, token, value);
-        }
-        assert_eq!(sanitize_component(&clean_pattern_result(&name, true)), "Batman Annual #001 (2012)");
+        // End to end through the naming rules the rename loop uses: zero-padded number, the
+        // annual's own year, sanitized result.
+        let annual = naming_values("Batman", "1", "2012-05-01");
+        assert_eq!(
+            naming::file_name(file_pattern_for_issue(true, false, false, comic, None, None), &annual, IssuePadding::Three).as_deref(),
+            Some("Batman Annual #001 (2012)")
+        );
+    }
+
+    fn naming_values(series: &str, number: &str, release_date: &str) -> NamingInput {
+        NamingInput { series: series.into(), issue_number: number.into(), release_date: Some(release_date.into()), ..Default::default() }
     }
 
     // #203 COLLECTED: a trade attached to a series is named by its own (configurable) template,
@@ -706,11 +563,11 @@ mod tests {
 
         // End to end: the user's number becomes the volume number, so the filename carries the
         // reading order they curated.
-        let mut name = file_pattern_for_issue(false, true, false, comic, None, None).to_string();
-        for (token, value) in [("{Series}", "Batman"), ("{Issue}", pad_issue_number("2").as_str()), ("{IssueYear}", "2012")] {
-            name = replace_token_ci(&name, token, value);
-        }
-        assert_eq!(sanitize_component(&clean_pattern_result(&name, true)), "Batman Vol. 002 (2012)");
+        let trade = naming_values("Batman", "2", "2012-05-01");
+        assert_eq!(
+            naming::file_name(file_pattern_for_issue(false, true, false, comic, None, None), &trade, IssuePadding::Three).as_deref(),
+            Some("Batman Vol. 002 (2012)")
+        );
     }
 
     #[test]
@@ -740,12 +597,12 @@ mod tests {
 
         // End to end through the collected pattern: the edition's name is what the name rule will
         // find as the filename's prefix after the rename.
-        let mut name = file_pattern_for_issue(false, true, false, "{Series} #{Issue}", None, None).to_string();
         let token = series_token_for_issue(true, Some("LOCAL"), Some("Batman Compendium"), "Batman");
-        for (t, value) in [("{Series}", token), ("{Issue}", pad_issue_number("1").as_str()), ("{IssueYear}", "2016")] {
-            name = replace_token_ci(&name, t, value);
-        }
-        assert_eq!(sanitize_component(&clean_pattern_result(&name, true)), "Batman Compendium Vol. 001 (2016)");
+        let book = naming_values(token, "1", "2016-01-01");
+        assert_eq!(
+            naming::file_name(file_pattern_for_issue(false, true, false, "{Series} #{Issue}", None, None), &book, IssuePadding::Three).as_deref(),
+            Some("Batman Compendium Vol. 001 (2016)")
+        );
     }
 
     /// The bulk renamer against a real file-backed SQLite + real files, so the issue query's JOIN
@@ -797,7 +654,7 @@ mod tests {
                 .execute(&db.pool).await.unwrap();
         }
 
-        let summary = run_bulk_rename(&db, &["s1".to_string()], "{Publisher}/{Series} ({Year})", "{Series} #{Issue}", None, None).await.unwrap();
+        let summary = run_bulk_rename(&db, &["s1".to_string()], "{Publisher}/{Series} ({Year})", "{Series} #{Issue}", None, None, IssuePadding::Three).await.unwrap();
         assert_eq!((summary.files_renamed, summary.folders_renamed, summary.conflicts), (3, 1, 0));
 
         let target = root.join("DC Comics").join("Batman (2016)");
@@ -819,6 +676,34 @@ mod tests {
         assert!(path_of("cv_book").await.ends_with("Batman Vol. 002 (2016).cbz"));
         assert!(path_of("issue_3").await.ends_with("Batman #003.cbz"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // beta.018 follow-up: the engine runs as root, so renaming under a Root Path the server can't use
+    // (here: a full path nothing is mounted at) would CREATE it - inside the container, where the next
+    // image update deletes the moved files. The series is skipped instead, and nothing is created.
+    #[tokio::test]
+    async fn bulk_rename_skips_a_series_whose_library_root_does_not_exist() {
+        let (db, base) = rename_fixture("unmounted_root").await;
+        let missing_root = base.join("not-mounted");
+        let messy = base.join("inbox");
+        fs::create_dir_all(&messy).unwrap();
+        let source = messy.join("Batman 1.cbz");
+        fs::write(&source, b"data").unwrap();
+        let messy_str = messy.to_string_lossy().replace('\\', "/");
+
+        sqlx::query(r#"INSERT INTO "Library" (id, path, "isDefault", "isManga") VALUES ('lib_1', $1, 1, 0)"#)
+            .bind(missing_root.to_string_lossy().replace('\\', "/")).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Series" (id, name, publisher, year, "folderPath", "libraryId", "isManga") VALUES ('s1', 'Batman', 'DC Comics', 2016, $1, 'lib_1', 0)"#)
+            .bind(&messy_str).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", name, number, "filePath") VALUES ('i1', 's1', 'Batman #1', '1', $1)"#)
+            .bind(source.to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+
+        let summary = run_bulk_rename(&db, &["s1".to_string()], "{Publisher}/{Series} ({Year})", "{Series} #{Issue}", None, None, IssuePadding::Three).await.unwrap();
+
+        assert_eq!((summary.files_renamed, summary.folders_renamed), (0, 0));
+        assert!(!missing_root.exists(), "the missing Root Path is never created");
+        assert!(source.exists(), "the file stays where it was");
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
@@ -849,11 +734,68 @@ mod tests {
                 "{Imprint} - {Series} #{Issue}",
                 None,
                 None,
+                IssuePadding::Three,
             ).await.unwrap();
 
             assert_eq!((summary.files_renamed, summary.folders_renamed, summary.conflicts), (1, 1, 0));
             assert!(root.join(expected_folder).join(expected_file).exists(), "expected renamed file for {tag}");
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    // #244: Standardize pads by the issue_number_padding setting, and an unknown year leaves no
+    // "(0000)" behind - the same name an import of the same issue gets.
+    #[tokio::test]
+    async fn bulk_rename_pads_by_the_setting_and_leaves_no_0000_for_an_unknown_year() {
+        for (tag, padding, expected) in [
+            ("pad_none", IssuePadding::None, ["Batman #3.cbz", "Batman #1A.cbz", "Batman #0.5.cbz"]),
+            ("pad_two", IssuePadding::Two, ["Batman #03.cbz", "Batman #01A.cbz", "Batman #00.5.cbz"]),
+            ("pad_three", IssuePadding::Three, ["Batman #003.cbz", "Batman #001A.cbz", "Batman #000.5.cbz"]),
+        ] {
+            let (db, root) = rename_fixture(tag).await;
+            let root_str = root.to_string_lossy().replace('\\', "/");
+            let inbox = root.join("inbox");
+            fs::create_dir_all(&inbox).unwrap();
+            sqlx::query(r#"INSERT INTO "Library" (id, path, "isDefault", "isManga") VALUES ('lib_1', $1, 1, 0)"#).bind(&root_str).execute(&db.pool).await.unwrap();
+            sqlx::query(r#"INSERT INTO "Series" (id, name, publisher, year, "folderPath", "libraryId", "isManga") VALUES ('s1', 'Batman', 'DC Comics', 0, $1, 'lib_1', 0)"#)
+                .bind(inbox.to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+            for (id, number, file) in [("i3", "003", "b3.cbz"), ("i1a", "1A", "b1a.cbz"), ("ihalf", "½", "bhalf.cbz")] {
+                fs::write(inbox.join(file), b"data").unwrap();
+                sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", name, number, "filePath") VALUES ($1, 's1', NULL, $2, $3)"#)
+                    .bind(id).bind(number).bind(inbox.join(file).to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+            }
+
+            let summary = run_bulk_rename(&db, &["s1".to_string()], "{Publisher}/{Series} ({Year})", "{Series} #{Issue} ({IssueYear})", None, None, padding).await.unwrap();
+
+            assert_eq!(summary.files_renamed, 3, "{tag}");
+            let target = root.join("DC Comics").join("Batman");
+            for name in expected {
+                assert!(target.join(name).exists(), "{tag}: expected {name}");
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    // A folder pattern that climbs out of the library (an admin's typo) skips the series instead
+    // of building a folder beside the library.
+    #[tokio::test]
+    async fn bulk_rename_never_builds_a_folder_outside_the_library() {
+        let (db, base) = rename_fixture("climb").await;
+        let root = base.join("library");
+        let inbox = root.join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(inbox.join("b1.cbz"), b"data").unwrap();
+        sqlx::query(r#"INSERT INTO "Library" (id, path, "isDefault", "isManga") VALUES ('lib_1', $1, 1, 0)"#).bind(root.to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Series" (id, name, publisher, year, "folderPath", "libraryId", "isManga") VALUES ('s1', 'Batman', 'DC Comics', 2016, $1, 'lib_1', 0)"#)
+            .bind(inbox.to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query(r#"INSERT INTO "Issue" (id, "seriesId", name, number, "filePath") VALUES ('i1', 's1', NULL, '1', $1)"#)
+            .bind(inbox.join("b1.cbz").to_string_lossy().to_string()).execute(&db.pool).await.unwrap();
+
+        let summary = run_bulk_rename(&db, &["s1".to_string()], "../{Series}", "{Series} #{Issue}", None, None, IssuePadding::Three).await.unwrap();
+
+        assert_eq!((summary.files_renamed, summary.folders_renamed), (0, 0));
+        assert!(!base.join("Batman").exists(), "nothing built beside the library");
+        assert!(inbox.join("b1.cbz").exists(), "the file stays where it was");
+        let _ = fs::remove_dir_all(&base);
     }
 }

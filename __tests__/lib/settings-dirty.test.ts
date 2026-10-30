@@ -6,7 +6,7 @@
 // tab trigger. Keys the settings page doesn't own (e.g. the Jobs page's *_schedule keys, which
 // ride along in the config bag) must never light a dot.
 import { describe, it, expect } from 'vitest';
-import { computeDirtyTabs } from '@/app/admin/settings/tabs/dirty';
+import { computeDirtyTabs, requestedSettingsTab } from '@/app/admin/settings/tabs/dirty';
 
 const emptySnapshot = () => ({
     config: {} as Record<string, any>,
@@ -41,6 +41,8 @@ describe('lib: settings per-tab dirty tracking', () => {
         expect(computeDirtyTabs(withConfig({ oidc_enabled: 'true' }), withConfig({}))).toEqual(['access']);
         expect(computeDirtyTabs(withConfig({ smtp_host: 'smtp.x' }), withConfig({}))).toEqual(['notifications']);
         expect(computeDirtyTabs(withConfig({ folder_naming_pattern: '{Series}' }), withConfig({}))).toEqual(['library']);
+        expect(computeDirtyTabs(withConfig({ collected_file_naming_pattern: '{Series} v{Issue}' }), withConfig({}))).toEqual(['library']);
+        expect(computeDirtyTabs(withConfig({ issue_number_padding: 'none' }), withConfig({}))).toEqual(['library']);
         expect(computeDirtyTabs(withConfig({ prowlarr_url: 'http://p' }), withConfig({}))).toEqual(['search']);
     });
 
@@ -99,5 +101,20 @@ describe('lib: settings per-tab dirty tracking', () => {
         cur.configuredWebhooks = [{ id: 'w1' }];
         const init = withConfig({ cv_api_key: 'old' });
         expect(computeDirtyTabs(cur, init)).toEqual(['metadata', 'notifications', 'media-servers', 'access', 'system']);
+    });
+});
+
+// `?tab=<value>` opens a settings tab directly - the first-run checklist links to Library & Files,
+// Metadata and Search & Indexers. Anything that isn't a tab is ignored (the page keeps Metadata).
+describe('requestedSettingsTab', () => {
+    it('returns the tab a link asks for', () => {
+        expect(requestedSettingsTab('?tab=library')).toBe('library');
+        expect(requestedSettingsTab('?foo=1&tab=search')).toBe('search');
+    });
+
+    it('ignores a missing or unknown tab', () => {
+        expect(requestedSettingsTab('')).toBeNull();
+        expect(requestedSettingsTab('?tab=')).toBeNull();
+        expect(requestedSettingsTab('?tab=nope')).toBeNull();
     });
 });
